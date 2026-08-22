@@ -95,8 +95,8 @@ model          = "qwen3:32b"
 context_window = 131072              # 压缩触发阈值依赖它
 
 [models.deepseek]                    # 云端备选，Ctrl+P 切换
-base_url       = "https://api.deepseek.com/v1"
-model          = "deepseek-chat"
+base_url       = "https://api.deepseek.com"
+model          = "deepseek-v4-flash"
 api_key_env    = "DEEPSEEK_API_KEY"  # 可选；本地端点可不设
 context_window = 131072
 
