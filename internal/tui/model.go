@@ -46,7 +46,7 @@ type Model struct {
 	width     int
 	input     InputLine
 	busy      bool
-	stream    strings.Builder // 当前流式块（可变区）
+	stream    *strings.Builder // 当前流式块（可变区）
 	thinking  bool
 	usage     *provider.Usage
 	modelName string
@@ -61,7 +61,7 @@ type Model struct {
 }
 
 func New(deps Deps) Model {
-	return Model{deps: deps, modelName: deps.ModelName}
+	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}}
 }
 
 // InputText 返回当前输入内容（测试用）。
