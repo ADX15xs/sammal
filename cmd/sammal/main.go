@@ -42,6 +42,13 @@ func main() {
 
 // run 完整装配并运行：stdin/stdout 作为参数注入，端到端测试由此驱动。
 func run(stdin io.Reader, stdout io.Writer, configPath string) error {
+	// 先解析 -config 参数为实际路径：空参 = 系统默认。.env 必须与
+	// config.toml 同目录查找，若把空串直接传给 EnvFile 会解析成
+	// 相对当前工作目录的 .env，导致默认配置下密钥全部「找不到」。
+	configPath, err := config.ResolvePath(configPath)
+	if err != nil {
+		return err
+	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err

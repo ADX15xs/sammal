@@ -39,6 +39,16 @@ func DefaultPath() (string, error) {
 	return filepath.Join(dir, "sammal", "config.toml"), nil
 }
 
+// ResolvePath 解析配置路径参数：空串 = 系统默认路径。config.toml 与
+// .env 的目录解析必须都经由它，避免空串直接进入 EnvFile 变成相对
+// 当前工作目录的地址。
+func ResolvePath(flag string) (string, error) {
+	if flag != "" {
+		return flag, nil
+	}
+	return DefaultPath()
+}
+
 // Load 从 path 读取配置；path 为空时使用系统默认路径。
 func Load(path string) (*Config, error) {
 	if path == "" {

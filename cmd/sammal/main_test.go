@@ -212,3 +212,79 @@ func apiKeyOf(specs []agent.ModelSpec, name string) string {
 	}
 	return ""
 }
+
+// 默认路径分支：空 configPath 时 .env 必须与系统默认 config.toml
+// 同目录（%APPDATA%\sammal\.env），而不是相对当前工作目录。
+func TestEndToEndDefaultConfigReadsDotenv(t *testing.T) {
+	var authHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	defer srv.Close()
+
+	// 系统默认配置目录重定向。
+	cfgDir := t.TempDir()
+	t.Setenv("APPDATA", cfgDir)
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	t.Setenv("LOCALAPPDATA", filepath.Join(t.TempDir(), "data"))
+
+	home := filepath.Join(cfgDir, "sammal")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(home, "config.toml"), []byte(fmt.Sprintf(`
+default_model = "cloud"
+
+[models.cloud]
+base_url = %q
+model = "cloud-model"
+api_key_env = "TEST_DOTENV_KEY"
+context_window = 8192
+`, srv.URL+"/v1")), 0o644)
+	os.WriteFile(filepath.Join(home, ".env"), []byte("TEST_DOTENV_KEY=from-dotenv\n"), 0o644)
+
+	work := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(work); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	var out bytes.Buffer
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- run(pr, &out, "") }() // 空 configPath = 默认路径分支
+
+	pw.Write([]byte("hi\r"))
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String(), "ok") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+	pw.Write([]byte("\x03"))
+	pw.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run 未退出")
+	}
+
+	if authHeader != "Bearer from-dotenv" {
+		t.Errorf("默认路径下 .env 未生效: Authorization = %q", authHeader)
+	}
+	if strings.Contains(out.String(), "[!] ") {
+		t.Errorf("不应出现缺失密钥提示:\n%s", out.String())
+	}
+}
