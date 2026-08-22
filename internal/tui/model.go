@@ -331,7 +331,10 @@ func (m Model) rememberInput(text string) {
 	m.histDepth = 0
 }
 
+// applyAgentEvent 处理一个 agent 事件。每个事件后必须重新挂起监听
+// （listenAgent 是一次性 Cmd），否则事件流在首个事件后中断。
 func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
 	switch ev := ev.(type) {
 	case agent.TurnStartedEvent:
 		m.busy = true
@@ -347,18 +350,19 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.thinking = false
 
 	case agent.ToolCallEvent:
-		return m, tea.Println(dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
+		cmd = tea.Println(dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
 
 	case agent.ToolResultEvent:
-		return m, tea.Println(dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
+		cmd = tea.Println(dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
 
 	case agent.MessageFinalEvent:
 		m.stream.Reset()
 		m.thinking = false
 		if ev.Interrupted {
-			return m, tea.Println(dim(renderInterrupted(ev.Text)))
+			cmd = tea.Println(dim(renderInterrupted(ev.Text)))
+		} else {
+			cmd = tea.Println(ev.Text)
 		}
-		return m, tea.Println(ev.Text)
 
 	case agent.TurnEndedEvent:
 		m.busy = false
@@ -366,24 +370,20 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if ev.Usage != nil {
 			m.usage = ev.Usage
 		}
-		switch ev.StopReason {
-		case agent.StopAborted:
-			return m, tea.Println(dim("（已中止）"))
-		case agent.StopError:
-			return m, nil
+		if ev.StopReason == agent.StopAborted {
+			cmd = tea.Println(dim("（已中止）"))
 		}
 
 	case agent.StatusEvent:
-		return m, tea.Println(dim("| " + ev.Text))
+		cmd = tea.Println(dim("| " + ev.Text))
 
 	case agent.ModelSwitchedEvent:
 		m.modelName = ev.Name
-		return m, nil
 
 	case agent.ErrorEvent:
-		return m, tea.Println(errStyle(ev.Err.Error()))
+		cmd = tea.Println(errStyle(ev.Err.Error()))
 	}
-	return m, nil
+	return m, tea.Batch(listenAgent(m.deps.Events), cmd)
 }
 
 const (

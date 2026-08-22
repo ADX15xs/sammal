@@ -71,9 +71,69 @@ core 与 tui 分离不是为了未来扩展，而是三个当下必然：事件�
 | 压缩配方 | 0.8 触发 / 0.16 尾部 | 0.8 触发 / 0.16 尾部 | 同配方（三方收敛点） |
 | 生长方式 | repolint 棘轮管理存量债 | 微内核插件化（227 包） | 不变量测试 + DEBT.md 显式记账 |
 
-## 快速开始（规划中）
+## 快速开始
 
-项目处于规格阶段，尚无可执行版本。开发里程碑 M0–M4 见 [docs/SPEC.md](docs/SPEC.md) 第 9 章。
+### 安装
+
+从 [Releases](../../releases) 下载对应平台产物（Windows / macOS / Linux × amd64 / arm64，纯 Go 静态单二进制），或自行构建：
+
+```bash
+git clone <repo> && cd sammal
+go build -o sammal ./cmd/sammal      # 或 goreleaser release --snapshot --clean（低内存机器加 --parallelism 1）
+```
+
+### 配置
+
+创建 `~/.config/sammal/config.toml`（Windows：`%APPDATA%\sammal\config.toml`）：
+
+```toml
+default_model = "qwen3-local"        # 日常启动即用
+
+[models.qwen3-local]                 # 本地 Ollama 主力
+base_url       = "http://localhost:11434/v1"
+model          = "qwen3:32b"
+context_window = 131072              # 压缩触发阈值依赖它
+
+[models.deepseek]                    # 云端备选，Ctrl+P 切换
+base_url       = "https://api.deepseek.com/v1"
+model          = "deepseek-chat"
+api_key_env    = "DEEPSEEK_API_KEY"  # 可选；本地端点可不设
+context_window = 131072
+
+[ui]
+editor = ""                          # Ctrl+E 默认 $VISUAL/$EDITOR，可强制指定
+```
+
+在配置文件所在目录的任意子目录运行 `sammal`，会话与快照存储在
+`~/.local/share/sammal/sessions/`（Windows：`%LOCALAPPDATA%\sammal\sessions\`）。
+
+### 键位
+
+| 键 | 行为 |
+|---|---|
+| `Enter` | 发送输入 |
+| `Esc` | 中止当前生成（部分内容标记中断后保留） |
+| `Ctrl+C` | 生成中 = 中止；空闲空输入 = 退出 |
+| `Ctrl+P` | 模型选择器（模糊过滤，Enter 切换） |
+| `Ctrl+E` | `$EDITOR` 编辑长输入（多行/粘贴大段的主路径） |
+| `↑` / `↓`（输入空时） | 翻阅历史输入 |
+
+### 命令
+
+```
+/model [name]  切换模型；无参列出（历史完整保留，KV 缓存如实重建）
+/new           开新会话
+/resume [n]    恢复历史会话；无参列出
+/branch        从当前 turn 分叉探索
+/compact       手动触发上下文压缩
+/rewind [n]    回滚代码与对话到 turn n 之前（仅文件写操作，不含 bash 副作用）
+/help          命令自述
+```
+
+### 终端兼容矩阵
+
+承诺：Windows Terminal、iTerm2、主流 Linux 终端（GNOME Terminal / Konsole / Alacritty / kitty）。
+明确不承诺：conhost、mintty、Warp、Termux——渲染异常记 [DEBT.md](DEBT.md) 不修。
 
 ## 名字的由来
 

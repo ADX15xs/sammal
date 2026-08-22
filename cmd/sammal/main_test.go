@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"sammal/internal/config"
 )
@@ -66,5 +72,89 @@ func TestModelSpecsSorted(t *testing.T) {
 	}
 	if specs[1].Name != "beta" {
 		t.Errorf("spec1 = %+v", specs[1])
+	}
+}
+
+// 端到端：httptest 假模型服务 → run() 全装配（config/TUI/agent/provider/
+// session）→ 输入管道发送 → 断言回复与日志落盘。
+func TestEndToEndRun(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		for _, s := range []string{"端", "到", "端"} {
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", s)
+			fl.Flush()
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":3}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		fl.Flush()
+	}))
+	defer srv.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+default_model = "fake"
+
+[models.fake]
+base_url = %q
+model = "fake-model"
+context_window = 8192
+`, srv.URL+"/v1")), 0o644)
+
+	work := t.TempDir()
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(work); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	// 数据目录重定向到临时区，避免污染真实会话存储。
+	dataRoot := filepath.Join(t.TempDir(), "data")
+	t.Setenv("LOCALAPPDATA", dataRoot)
+	t.Setenv("XDG_DATA_HOME", dataRoot)
+
+	var out bytes.Buffer
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(pr, &out, cfgPath)
+	}()
+
+	// 发送消息，等回复完成后再 EOF 退出，避免与 agent 写盘竞态。
+	pw.Write([]byte("hello\r"))
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String(), "端到端") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond) // 等 turn/end 落盘
+	pw.Write([]byte("\x03"))           // 空闲 + 空输入 → 退出
+	pw.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Logf("输出内容：\n%q", out.String())
+		t.Fatal("run 未退出")
+	}
+
+	if !strings.Contains(out.String(), "端到端") {
+		t.Errorf("输出缺少回复:\n%s", out.String())
+	}
+	sessions, err := filepath.Glob(filepath.Join(dataRoot, "sammal", "sessions", "*", "*", "session.jsonl"))
+	if err != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %v err = %v", sessions, err)
+	}
+	data, _ := os.ReadFile(sessions[0])
+	for _, want := range []string{`"type":"user/message"`, `"type":"assistant/message"`, `"type":"turn/end"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("日志缺 %s:\n%s", want, data)
+		}
 	}
 }

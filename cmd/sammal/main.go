@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/term"
 
 	"sammal/internal/agent"
 	"sammal/internal/checkpoint"
@@ -22,27 +24,41 @@ import (
 	"sammal/internal/tui"
 )
 
+// version 由 goreleaser 注入（-ldflags -X main.version=...）。
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "", "配置文件路径（默认 ~/.config/sammal/config.toml）")
+	showVersion := flag.Bool("version", false, "打印版本并退出")
 	flag.Parse()
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
+	if *showVersion {
+		fmt.Printf("sammal %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
+	if err := run(os.Stdin, os.Stdout, *configPath); err != nil {
 		fatal(err)
+	}
+}
+
+// run 完整装配并运行：stdin/stdout 作为参数注入，端到端测试由此驱动。
+func run(stdin io.Reader, stdout io.Writer, configPath string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
 	}
 	modelName, modelCfg, err := cfg.Resolve("")
 	if err != nil {
-		fatal(err)
+		return err
 	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
-		fatal(err)
+		return err
 	}
 	facts := agent.FactsFromEnv(cwd)
 	root, err := session.DataRoot()
 	if err != nil {
-		fatal(fmt.Errorf("定位数据目录失败：%w", err))
+		return fmt.Errorf("定位数据目录失败：%w", err)
 	}
 
 	rootCtx, cancelRoot := context.WithCancel(context.Background())
@@ -57,7 +73,7 @@ func main() {
 		Shell:   facts.Shell,
 	})
 	if err != nil {
-		fatal(fmt.Errorf("创建会话失败：%w", err))
+		return fmt.Errorf("创建会话失败：%w", err)
 	}
 	defer sess.Close()
 
@@ -82,6 +98,11 @@ func main() {
 		Models:        modelSpecs(cfg),
 	})
 
+	opts := []tea.ProgramOption{tea.WithInput(stdin), tea.WithOutput(stdout)}
+	// 管道/重定向输出拿不到窗口尺寸，渲染器会整面空白；补默认尺寸。
+	if f, ok := stdout.(*os.File); !ok || !term.IsTerminal(f.Fd()) {
+		opts = append(opts, tea.WithWindowSize(80, 24))
+	}
 	p := tea.NewProgram(tui.New(tui.Deps{
 		ModelName: modelName,
 		Events:    ag.Events(),
@@ -90,11 +111,12 @@ func main() {
 		Slash:     ag.Slash,
 		Models:    ag.ModelNames,
 		EditorCmd: editorCommand(cfg.UI.Editor),
-	}))
+	}), opts...)
 	if _, err := p.Run(); err != nil {
-		fatal(fmt.Errorf("启动 TUI 失败：%w", err))
+		return fmt.Errorf("启动 TUI 失败：%w", err)
 	}
 	cancelRoot()
+	return nil
 }
 
 func fatal(err error) {
@@ -126,7 +148,7 @@ func sortedModelNames(cfg *config.Config) []string {
 	return names
 }
 
-// editorCommand 解析 Ctrl+P 长输入编辑器：[ui].editor > $VISUAL > $EDITOR
+// editorCommand 解析 Ctrl+E 长输入编辑器：[ui].editor > $VISUAL > $EDITOR
 // > 平台默认。带参数的配置按空白切分。
 func editorCommand(configured string) func(string) (*exec.Cmd, error) {
 	return func(path string) (*exec.Cmd, error) {
