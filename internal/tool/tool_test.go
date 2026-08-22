@@ -257,3 +257,36 @@ func TestRegistryDefsStable(t *testing.T) {
 		t.Errorf("read schema 非法 JSON: %v", err)
 	}
 }
+
+// PowerShell 执行路径端到端（Windows 上 powershell.exe 为系统内置；
+// 有 pwsh 时优先）：验证 -NoProfile/-NonInteractive 调用、输出、
+// 非零退出码与超时杀进程——降级后模型侧真正吃到的就是这个路径。
+func TestBashToolPowerShellPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("仅 Windows 验证 PowerShell 路径")
+	}
+	if _, err := exec.LookPath("powershell.exe"); err != nil {
+		t.Skip("无 powershell.exe")
+	}
+	r := NewRegistry(&BashTool{WorkDir: t.TempDir(), Shell: "powershell"})
+
+	res := runTool(t, r, "bash", `{"command":"Write-Output 'PS-HELLO'; exit 3"}`)
+	if strings.TrimSpace(res.Output) != "PS-HELLO" {
+		t.Errorf("output = %q", res.Output)
+	}
+	if code, _ := asInt(res.Extra["exitCode"]); code != 3 {
+		t.Errorf("exitCode = %+v", res.Extra)
+	}
+	if res.Err != "" {
+		t.Errorf("非零退出不应是工具错误: %s", res.Err)
+	}
+
+	// 超时杀进程：Start-Sleep 超过时限被 kill，部分输出保留。
+	res = runTool(t, r, "bash", `{"command":"Write-Output 'started'; Start-Sleep 30","timeout_seconds":1}`)
+	if res.Err == "" || !strings.Contains(res.Err, "timed out") {
+		t.Errorf("超时应报错: %+v", res)
+	}
+	if !strings.Contains(res.Output, "started") {
+		t.Errorf("应保留部分输出: %q", res.Output)
+	}
+}
