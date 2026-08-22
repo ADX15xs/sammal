@@ -13,14 +13,16 @@ import (
 
 	"sammal/internal/agent"
 	"sammal/internal/provider"
+	"sammal/internal/tool"
 )
 
-// Deps 是 TUI 与 core 的全部接线：事件流订阅、发送、中止。
+// Deps 是 TUI 与 core 的全部接线：事件流订阅、发送、中止、slash 命令。
 type Deps struct {
 	ModelName string
 	Events    <-chan agent.Event
 	Send      func(text string)
 	Abort     func()
+	Slash     func(text string) []string
 }
 
 type Model struct {
@@ -88,6 +90,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		text := m.input.String()
 		m.input.Clear()
 		m.rememberInput(text)
+		if strings.HasPrefix(text, "/") {
+			lines := m.deps.Slash(text)
+			return m, printLines(lines)
+		}
 		m.busy = true
 		m.stream.Reset()
 		m.deps.Send(text)
@@ -147,6 +153,13 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 type quitArmExpiredMsg struct{}
 
+func printLines(lines []string) tea.Cmd {
+	if len(lines) == 0 {
+		return nil
+	}
+	return tea.Println(strings.Join(lines, "\n"))
+}
+
 func (m Model) loadHistory() {
 	if m.histDepth == 0 {
 		m.input.Clear()
@@ -178,6 +191,12 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.StreamRestartedEvent:
 		m.stream.Reset()
 		m.thinking = false
+
+	case agent.ToolCallEvent:
+		return m, tea.Println(dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
+
+	case agent.ToolResultEvent:
+		return m, tea.Println(dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
 
 	case agent.MessageFinalEvent:
 		m.stream.Reset()
