@@ -50,6 +50,7 @@ type TurnEndedEvent struct {
 }
 type ErrorEvent struct{ Err error }
 type StatusEvent struct{ Text string }
+type ModelSwitchedEvent struct{ Name string }
 
 func (TurnStartedEvent) eventType()     {}
 func (TextDeltaEvent) eventType()       {}
@@ -61,6 +62,7 @@ func (StreamRestartedEvent) eventType() {}
 func (TurnEndedEvent) eventType()       {}
 func (ErrorEvent) eventType()           {}
 func (StatusEvent) eventType()          {}
+func (ModelSwitchedEvent) eventType()   {}
 
 // StopReason 常量。
 const (
@@ -76,6 +78,14 @@ const (
 	eventsBuffer     = 256
 )
 
+// ModelSpec 是一个可切换模型的运行装配（/model 与 Ctrl+P 的数据源）。
+type ModelSpec struct {
+	Name    string // 配置键（用户可见名）
+	ModelID string // 发给端点的 model 字符串
+	Client  provider.Provider
+	Window  int
+}
+
 // Config 装配 Agent 的全部依赖。
 type Config struct {
 	Root          context.Context
@@ -86,6 +96,7 @@ type Config struct {
 	System        string
 	DataRoot      string // /new /resume /branch 创建/打开会话的根目录
 	ContextWindow int    // compaction 触发阈值依赖（0 = 不压缩）
+	Models        []ModelSpec
 }
 
 type Agent struct {
@@ -98,6 +109,11 @@ type Agent struct {
 	dataRoot string
 	window   int
 
+	model      string // 当前请求使用的 model ID
+	modelName  string // 当前模型配置键
+	models     map[string]ModelSpec
+	modelNames []string
+
 	events chan Event
 	inbox  chan string
 
@@ -108,23 +124,62 @@ type Agent struct {
 }
 
 func New(cfg Config) *Agent {
-	return &Agent{
-		root:     cfg.Root,
-		prov:     cfg.Provider,
-		sess:     cfg.Session,
-		reg:      cfg.Registry,
-		cp:       cfg.Checkpoints,
-		system:   cfg.System,
-		dataRoot: cfg.DataRoot,
-		window:   cfg.ContextWindow,
-		events:   make(chan Event, eventsBuffer),
-		inbox:    make(chan string, 16),
+	a := &Agent{
+		root:      cfg.Root,
+		prov:      cfg.Provider,
+		sess:      cfg.Session,
+		reg:       cfg.Registry,
+		cp:        cfg.Checkpoints,
+		system:    cfg.System,
+		dataRoot:  cfg.DataRoot,
+		window:    cfg.ContextWindow,
+		model:     cfg.Session.Header().Model,
+		modelName: firstModelName(cfg),
+		events:    make(chan Event, eventsBuffer),
+		inbox:     make(chan string, 16),
 	}
+	a.models = make(map[string]ModelSpec, len(cfg.Models))
+	for _, m := range cfg.Models {
+		a.models[m.Name] = m
+		a.modelNames = append(a.modelNames, m.Name)
+	}
+	return a
 }
 
-func (a *Agent) Model() string             { return a.sess.Header().Model }
+func firstModelName(cfg Config) string {
+	if len(cfg.Models) > 0 {
+		return cfg.Models[0].Name
+	}
+	return cfg.Session.Header().Model
+}
+
+func (a *Agent) Model() string             { return a.model }
 func (a *Agent) Events() <-chan Event      { return a.events }
 func (a *Agent) Session() *session.Session { return a.sess }
+
+// ModelNames 返回可切换的模型名（含当前），按配置序。
+func (a *Agent) ModelNames() []string { return a.modelNames }
+
+// switchModel 切换模型：历史完整保留（carried），provider 与窗口随切；
+// 模型隔离意味着 KV 缓存必然重建——如实提示（M3 切换语义）。
+func (a *Agent) switchModel(name string) ([]string, error) {
+	if a.Running() {
+		return nil, errors.New("生成中不能切换模型，请先 Esc 中止")
+	}
+	spec, ok := a.models[name]
+	if !ok {
+		return nil, fmt.Errorf("未定义的模型 %q", name)
+	}
+	if name == a.modelName {
+		return []string{fmt.Sprintf("已在使用 %s", name)}, nil
+	}
+	a.prov = spec.Client
+	a.window = spec.Window
+	a.modelName = name
+	a.model = spec.ModelID
+	a.emit(ModelSwitchedEvent{Name: name})
+	return []string{fmt.Sprintf("已切换到 %s：历史完整保留；模型隔离，KV 缓存已重建", name)}, nil
+}
 
 // Steering 把生成期间的用户插话排入收件箱；在下一个 step 边界吸收为
 // user 消息（不注入进行中的请求）。
@@ -201,7 +256,7 @@ func (a *Agent) runSteps(ctx context.Context) (string, *provider.Usage) {
 		}
 
 		req := provider.Request{
-			Model:    a.sess.Header().Model,
+			Model:    a.model,
 			System:   a.system,
 			Messages: a.sess.DeriveMessages(),
 			Tools:    a.reg.Defs(),
@@ -475,7 +530,7 @@ func (a *Agent) compact(ctx context.Context) error {
 		return errors.New("遮蔽区间为空")
 	}
 	req := provider.Request{
-		Model:    a.sess.Header().Model,
+		Model:    a.model,
 		System:   a.system,
 		Tools:    a.reg.Defs(),
 		Messages: append(masked, provider.Message{Role: "user", Content: compaction.SummaryInstruction}),
@@ -613,7 +668,7 @@ func (a *Agent) Slash(input string) []string {
 	switch fields[0] {
 	case "/help":
 		return []string{
-			"/model [name] 切换模型（无参打开选择器是 M3 交互；带参直接切）",
+			"/model [name] 切换模型；无参列出可用模型（Ctrl+P 打开选择器）",
 			"/new          开新会话",
 			"/resume [n]   恢复历史会话；无参列出",
 			"/branch       从当前 turn 分叉探索",
@@ -621,6 +676,23 @@ func (a *Agent) Slash(input string) []string {
 			"/rewind [n]   回滚代码与对话到 turn n 之前；无参列出可回滚的 turn",
 			"/help         命令自述",
 		}
+	case "/model":
+		if len(fields) == 1 {
+			lines := []string{"可用模型（* = 当前）："}
+			for _, name := range a.modelNames {
+				mark := "  "
+				if name == a.modelName {
+					mark = "* "
+				}
+				lines = append(lines, mark+name)
+			}
+			return lines
+		}
+		out, err := a.switchModel(fields[1])
+		if err != nil {
+			return []string{"切换失败：" + err.Error()}
+		}
+		return out
 	case "/rewind":
 		if len(fields) == 1 {
 			return a.listRewindable()

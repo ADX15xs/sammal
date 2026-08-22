@@ -6,6 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
+	"sort"
+	"strings"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -75,6 +79,7 @@ func main() {
 		System:        agent.BuildSystemPrompt(facts),
 		DataRoot:      root,
 		ContextWindow: modelCfg.ContextWindow,
+		Models:        modelSpecs(cfg),
 	})
 
 	p := tea.NewProgram(tui.New(tui.Deps{
@@ -83,6 +88,8 @@ func main() {
 		Send:      ag.Submit,
 		Abort:     ag.Abort,
 		Slash:     ag.Slash,
+		Models:    ag.ModelNames,
+		EditorCmd: editorCommand(cfg.UI.Editor),
 	}))
 	if _, err := p.Run(); err != nil {
 		fatal(fmt.Errorf("启动 TUI 失败：%w", err))
@@ -93,4 +100,51 @@ func main() {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "sammal:", err)
 	os.Exit(1)
+}
+
+// modelSpecs 按配置顺序装配全部可切换模型。
+func modelSpecs(cfg *config.Config) []agent.ModelSpec {
+	var specs []agent.ModelSpec
+	for _, name := range sortedModelNames(cfg) {
+		m := cfg.Models[name]
+		specs = append(specs, agent.ModelSpec{
+			Name:    name,
+			ModelID: m.Model,
+			Client:  provider.NewClient(m.BaseURL, os.Getenv(m.APIKeyEnv)),
+			Window:  m.ContextWindow,
+		})
+	}
+	return specs
+}
+
+func sortedModelNames(cfg *config.Config) []string {
+	names := make([]string, 0, len(cfg.Models))
+	for name := range cfg.Models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// editorCommand 解析 Ctrl+P 长输入编辑器：[ui].editor > $VISUAL > $EDITOR
+// > 平台默认。带参数的配置按空白切分。
+func editorCommand(configured string) func(string) (*exec.Cmd, error) {
+	return func(path string) (*exec.Cmd, error) {
+		cmdline := configured
+		if cmdline == "" {
+			cmdline = os.Getenv("VISUAL")
+		}
+		if cmdline == "" {
+			cmdline = os.Getenv("EDITOR")
+		}
+		if cmdline == "" {
+			if runtime.GOOS == "windows" {
+				cmdline = "notepad"
+			} else {
+				cmdline = "vi"
+			}
+		}
+		fields := strings.Fields(cmdline)
+		return exec.Command(fields[0], append(fields[1:], path)...), nil
+	}
 }
