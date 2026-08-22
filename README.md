@@ -104,6 +104,16 @@ context_window = 131072
 editor = ""                          # Ctrl+E 默认 $VISUAL/$EDITOR，可强制指定
 ```
 
+密钥不必设成 Windows 全局环境变量——在配置同目录放一个 `.env` 即可：
+
+```
+# %APPDATA%\sammal\.env（Linux/macOS: ~/.config/sammal/.env）
+DEEPSEEK_API_KEY=sk-xxxx
+```
+
+同名进程环境变量始终优先于 `.env`（CI/会话注入不被覆盖）；
+配置了 `api_key_env` 而两处都没有值时，启动时会提示写入位置。
+
 在配置文件所在目录的任意子目录运行 `sammal`，会话与快照存储在
 `~/.local/share/sammal/sessions/`（Windows：`%LOCALAPPDATA%\sammal\sessions\`）。
 

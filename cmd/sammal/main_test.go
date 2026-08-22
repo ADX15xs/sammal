@@ -12,11 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"sammal/internal/agent"
 	"sammal/internal/config"
 	"sammal/internal/provider"
 )
 
-func loadTestConfig(t *testing.T) *config.Config {
+func loadTestConfig(t *testing.T) (*config.Config, string) {
 	t.Helper()
 	toml := `
 default_model = "alpha"
@@ -38,7 +39,7 @@ model = "model-b"
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cfg
+	return cfg, path
 }
 
 func TestEditorCommandResolution(t *testing.T) {
@@ -63,8 +64,8 @@ func TestEditorCommandResolution(t *testing.T) {
 }
 
 func TestModelSpecsSorted(t *testing.T) {
-	cfg := loadTestConfig(t)
-	specs := modelSpecs(cfg)
+	cfg, _ := loadTestConfig(t)
+	specs := modelSpecs(cfg, nil)
 	if len(specs) != 2 {
 		t.Fatalf("specs = %d", len(specs))
 	}
@@ -160,37 +161,54 @@ context_window = 8192
 	}
 }
 
-// api_key_env 的完整装配：环境变量 → Client.APIKey（发请求时落
-// Authorization，见 provider 测试）；缺失时产生启动提示。
+// api_key_env 的完整装配：进程环境变量 → Client.APIKey（发请求时落
+// Authorization，见 provider 测试）；.env 兜底；两者皆缺时提示。
 func TestAPIKeyEnvWiring(t *testing.T) {
-	cfg := loadTestConfig(t) // alpha/beta 均无 api_key_env
+	cfg, cfgPath := loadTestConfig(t) // alpha/beta 均无 api_key_env
+	secrets := config.LoadEnvFile(cfgPath)
+	envPath := config.EnvFile(cfgPath)
 
 	// 缺 env：无提示。
-	if hints := missingAPIKeyHints(cfg); len(hints) != 0 {
+	if hints := missingAPIKeyHints(cfg, secrets, envPath); len(hints) != 0 {
 		t.Errorf("无 api_key_env 不应提示: %v", hints)
 	}
 
-	// 配置 api_key_env 且环境变量存在：带入 Client.APIKey。
+	// 配置 api_key_env 且环境变量存在：环境变量优先。
 	cfg.Models["beta"] = config.Model{
 		BaseURL: "http://x/v1", Model: "m", APIKeyEnv: "TEST_API_KEY",
 	}
-	t.Setenv("TEST_API_KEY", "k-secret")
-	specs := modelSpecs(cfg)
-	beta := specs[0]
-	if beta.Name == "alpha" {
-		beta = specs[1]
-	}
-	if beta.Name != "beta" {
-		t.Fatalf("specs = %+v", specs)
-	}
-	if beta.Client.(*provider.Client).APIKey != "k-secret" {
-		t.Errorf("APIKey = %q", beta.Client.(*provider.Client).APIKey)
+	t.Setenv("TEST_API_KEY", "k-env")
+	specs := modelSpecs(cfg, secrets)
+	if apiKeyOf(specs, "beta") != "k-env" {
+		t.Errorf("env 优先路径 APIKey = %q", apiKeyOf(specs, "beta"))
 	}
 
-	// 配置了 api_key_env 但环境变量缺失：启动提示到位。
+	// 环境变量缺失、.env 兜底：写 %APPDATA%\sammal\.env 即生效。
 	os.Unsetenv("TEST_API_KEY")
-	hints := missingAPIKeyHints(cfg)
-	if len(hints) != 1 || !strings.Contains(hints[0], "TEST_API_KEY") {
+	os.WriteFile(envPath, []byte("TEST_API_KEY=k-dotenv\n"), 0o644)
+	secrets = config.LoadEnvFile(cfgPath)
+	specs = modelSpecs(cfg, secrets)
+	if apiKeyOf(specs, "beta") != "k-dotenv" {
+		t.Errorf(".env 兜底 APIKey = %q", apiKeyOf(specs, "beta"))
+	}
+	if hints := missingAPIKeyHints(cfg, secrets, envPath); len(hints) != 0 {
+		t.Errorf(".env 已提供不应提示: %v", hints)
+	}
+
+	// 两者皆缺：提示到位，且文案指明 .env 写入位置。
+	os.Remove(envPath)
+	secrets = config.LoadEnvFile(cfgPath)
+	hints := missingAPIKeyHints(cfg, secrets, envPath)
+	if len(hints) != 1 || !strings.Contains(hints[0], "TEST_API_KEY") || !strings.Contains(hints[0], ".env") {
 		t.Errorf("hints = %v", hints)
 	}
+}
+
+func apiKeyOf(specs []agent.ModelSpec, name string) string {
+	for _, s := range specs {
+		if s.Name == name {
+			return s.Client.(*provider.Client).APIKey
+		}
+	}
+	return ""
 }
