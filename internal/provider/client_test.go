@@ -371,3 +371,44 @@ func TestRequestWireFormat(t *testing.T) {
 }
 
 func jsonRaw(s string) []byte { return []byte(s) }
+
+// APIKeyEnv → Authorization 头的完整链路锁定：有 key 发 Bearer，
+// 无 key 不发该头（本地端点无需鉴权）。
+func TestStreamAuthorizationHeader(t *testing.T) {
+	var gotHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "secret-token-123")
+	ch, err := c.Stream(context.Background(), Request{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+	if gotHeader != "Bearer secret-token-123" {
+		t.Errorf("Authorization = %q", gotHeader)
+	}
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv2.Close()
+
+	c2 := NewClient(srv2.URL, "") // 本地端点无 key
+	ch2, err := c2.Stream(context.Background(), Request{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch2 {
+	}
+	if gotHeader != "" {
+		t.Errorf("无 key 不应发 Authorization, got %q", gotHeader)
+	}
+}

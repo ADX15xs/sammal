@@ -104,13 +104,14 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 		opts = append(opts, tea.WithWindowSize(80, 24))
 	}
 	p := tea.NewProgram(tui.New(tui.Deps{
-		ModelName: modelName,
-		Events:    ag.Events(),
-		Send:      ag.Submit,
-		Abort:     ag.Abort,
-		Slash:     ag.Slash,
-		Models:    ag.ModelNames,
-		EditorCmd: editorCommand(cfg.UI.Editor),
+		ModelName:    modelName,
+		Events:       ag.Events(),
+		Send:         ag.Submit,
+		Abort:        ag.Abort,
+		Slash:        ag.Slash,
+		Models:       ag.ModelNames,
+		EditorCmd:    editorCommand(cfg.UI.Editor),
+		StartupHints: missingAPIKeyHints(cfg),
 	}), opts...)
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("启动 TUI 失败：%w", err)
@@ -122,6 +123,19 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "sammal:", err)
 	os.Exit(1)
+}
+
+// missingAPIKeyHints 检查每个模型的 api_key_env：配置了但环境变量
+// 未设置时生成启动提示（本地端点 api_key_env 留空则不提示）。
+func missingAPIKeyHints(cfg *config.Config) []string {
+	var names []string
+	for _, name := range sortedModelNames(cfg) {
+		m := cfg.Models[name]
+		if m.APIKeyEnv != "" && os.Getenv(m.APIKeyEnv) == "" {
+			names = append(names, fmt.Sprintf("%s: 环境变量 %s 未设置，该模型的请求不会携带鉴权", name, m.APIKeyEnv))
+		}
+	}
+	return names
 }
 
 // modelSpecs 按配置顺序装配全部可切换模型。

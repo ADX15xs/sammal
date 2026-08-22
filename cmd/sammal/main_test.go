@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sammal/internal/config"
+	"sammal/internal/provider"
 )
 
 func loadTestConfig(t *testing.T) *config.Config {
@@ -156,5 +157,40 @@ context_window = 8192
 		if !strings.Contains(string(data), want) {
 			t.Errorf("日志缺 %s:\n%s", want, data)
 		}
+	}
+}
+
+// api_key_env 的完整装配：环境变量 → Client.APIKey（发请求时落
+// Authorization，见 provider 测试）；缺失时产生启动提示。
+func TestAPIKeyEnvWiring(t *testing.T) {
+	cfg := loadTestConfig(t) // alpha/beta 均无 api_key_env
+
+	// 缺 env：无提示。
+	if hints := missingAPIKeyHints(cfg); len(hints) != 0 {
+		t.Errorf("无 api_key_env 不应提示: %v", hints)
+	}
+
+	// 配置 api_key_env 且环境变量存在：带入 Client.APIKey。
+	cfg.Models["beta"] = config.Model{
+		BaseURL: "http://x/v1", Model: "m", APIKeyEnv: "TEST_API_KEY",
+	}
+	t.Setenv("TEST_API_KEY", "k-secret")
+	specs := modelSpecs(cfg)
+	beta := specs[0]
+	if beta.Name == "alpha" {
+		beta = specs[1]
+	}
+	if beta.Name != "beta" {
+		t.Fatalf("specs = %+v", specs)
+	}
+	if beta.Client.(*provider.Client).APIKey != "k-secret" {
+		t.Errorf("APIKey = %q", beta.Client.(*provider.Client).APIKey)
+	}
+
+	// 配置了 api_key_env 但环境变量缺失：启动提示到位。
+	os.Unsetenv("TEST_API_KEY")
+	hints := missingAPIKeyHints(cfg)
+	if len(hints) != 1 || !strings.Contains(hints[0], "TEST_API_KEY") {
+		t.Errorf("hints = %v", hints)
 	}
 }

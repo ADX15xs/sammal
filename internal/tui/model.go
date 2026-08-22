@@ -29,6 +29,8 @@ type Deps struct {
 	Slash     func(text string) []string
 	Models    func() []string
 	EditorCmd func(path string) (*exec.Cmd, error)
+	// StartupHints 启动即打印的提示行（滚动区常驻，如 api_key_env 缺失警告）。
+	StartupHints []string
 }
 
 // popupKind 弹窗状态集中管理（第 6.7 节：避开 Reasonix 的 nil 链互斥）。
@@ -66,6 +68,10 @@ func New(deps Deps) Model {
 func (m Model) InputText() string { return m.input.String() }
 
 func (m Model) Init() tea.Cmd {
+	if len(m.deps.StartupHints) > 0 {
+		return tea.Batch(listenAgent(m.deps.Events),
+			tea.Println(dim("⚠ "+strings.Join(m.deps.StartupHints, "\n  "))))
+	}
 	return listenAgent(m.deps.Events)
 }
 
