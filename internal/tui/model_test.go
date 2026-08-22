@@ -2,6 +2,7 @@ package tui
 
 import (
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -70,5 +71,27 @@ func TestTUISmokeHeadless(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("program 未退出")
+	}
+}
+
+// 防回归：UI 固定件（输入框、状态行、列表前缀、提示标记）不得使用
+// 东亚二义宽度字符——同一字符在宽/窄终端渲染列宽不同，光标与换行
+// 计算会错位（本次曾被 ⚠ 违反，见 git 历史）。中文内容文案不受限，
+// 列表只含横排固定的 UI 符号。
+func TestNoAmbiguousUIGlyphs(t *testing.T) {
+	violations := []string{}
+	for _, file := range []string{"model.go", "input.go"} {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range data {
+			if _, bad := map[rune]bool{'⚠': true, '›': true, '⋮': true, '●': true, '│': true, '❯': true, '⏎': true}[rune(r)]; bad {
+				violations = append(violations, file+": "+string(r))
+			}
+		}
+	}
+	if len(violations) > 0 {
+		t.Fatalf("UI 固定件含二义宽度字符: %v", violations)
 	}
 }

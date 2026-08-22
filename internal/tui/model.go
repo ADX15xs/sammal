@@ -70,7 +70,7 @@ func (m Model) InputText() string { return m.input.String() }
 func (m Model) Init() tea.Cmd {
 	if len(m.deps.StartupHints) > 0 {
 		return tea.Batch(listenAgent(m.deps.Events),
-			tea.Println(dim("⚠ "+strings.Join(m.deps.StartupHints, "\n  "))))
+			tea.Println(dim("[!] "+strings.Join(m.deps.StartupHints, "\n  "))))
 	}
 	return listenAgent(m.deps.Events)
 }
