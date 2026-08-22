@@ -57,14 +57,16 @@ func TestCreateOpenRoundtrip(t *testing.T) {
 func StopReasonForTest() string { return "completed" }
 
 // 尾部不完整行（崩溃残迹）被丢弃，有效尾部保留（I3 的基础）。
+// 日志以闭合 turn 结尾，隔离「残缺行丢弃」与「未闭合 turn 恢复」两个行为。
 func TestOpenDropsIncompleteTail(t *testing.T) {
 	s := newSession(t)
 	s.Append(TypeUserMessage, UserMessageData{Text: "hi"})
+	s.EndTurn("completed")
 	s.Close()
 
 	path := s.Path()
 	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
-	f.WriteString(`{"seq":3,"ts":"...","type":"assistant/mess`) // 半行
+	f.WriteString(`{"seq":4,"ts":"...","type":"assistant/mess`) // 半行
 	f.Close()
 
 	reopened, err := Open(path)
@@ -73,12 +75,82 @@ func TestOpenDropsIncompleteTail(t *testing.T) {
 	}
 	defer reopened.Close()
 	for _, env := range reopened.Events() {
-		if env.Seq == 3 {
+		if env.Seq == 4 {
 			t.Error("残缺行不应载入")
 		}
 	}
-	if reopened.seq != 2 {
+	if reopened.seq != 3 {
 		t.Errorf("seq = %d", reopened.seq)
+	}
+}
+
+// I3 崩溃恢复：kill -9 场景——悬挂 chunk、悬挂 tool/call、缺失 turn/end，
+// 重开后全部获得合成闭合事件，投影与「未崩溃的等价日志」一致。
+func TestCrashRecoverySynthesizesClosures(t *testing.T) {
+	// 先构造「崩溃版」日志。
+	crashed := newSession(t)
+	crashed.Append(TypeUserMessage, UserMessageData{Text: "q"})
+	crashed.Append(TypeAssistantMessage, AssistantMessageData{
+		Text: "calling",
+		ToolCalls: []provider.ToolCall{{
+			ID: "c1", Type: provider.ToolTypeFunction,
+			Function: provider.FunctionCall{Name: "read", Arguments: `{"path":"a"}`},
+		}},
+	})
+	crashed.Append(TypeToolCall, ToolCallData{ID: "c1", Name: "read", Args: []byte(`{"path":"a"}`)})
+	// 悬挂 chunk：第二 step 流到一半
+	crashed.Append(TypeAssistantChunk, AssistantChunkData{Delta: "par"})
+	crashed.Append(TypeAssistantChunk, AssistantChunkData{Delta: "tial"})
+	crashed.Close()
+
+	// 「等价净版」：同样的前缀 + 显式中断语义。
+	clean := newSession(t)
+	clean.Append(TypeUserMessage, UserMessageData{Text: "q"})
+	clean.Append(TypeAssistantMessage, AssistantMessageData{
+		Text: "calling",
+		ToolCalls: []provider.ToolCall{{
+			ID: "c1", Type: provider.ToolTypeFunction,
+			Function: provider.FunctionCall{Name: "read", Arguments: `{"path":"a"}`},
+		}},
+	})
+	clean.Append(TypeToolCall, ToolCallData{ID: "c1", Name: "read", Args: []byte(`{"path":"a"}`)})
+	clean.Append(TypeToolResult, ToolResultData{
+		ID: "c1", Canonical: tool.Result{Err: "interrupted by crash"}, Synthetic: true,
+	})
+	clean.Append(TypeAssistantMessage, AssistantMessageData{Text: "partial", Interrupted: true, Synthetic: true})
+	clean.EndTurn("crash-recovered")
+	clean.Close()
+
+	recovered, err := Open(crashed.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+
+	got := recovered.DeriveMessages()
+	want := clean.DeriveMessages()
+	if len(got) != len(want) {
+		t.Fatalf("恢复后投影 = %+v, want %+v", got, want)
+	}
+	for i := range got {
+		if got[i].Role != want[i].Role || got[i].Content != want[i].Content || got[i].ToolCallID != want[i].ToolCallID {
+			t.Errorf("消息 %d: got %+v want %+v", i, got[i], want[i])
+		}
+	}
+	if recovered.Turn() != clean.Turn() {
+		t.Errorf("turn: got %d want %d", recovered.Turn(), clean.Turn())
+	}
+
+	// 合成事件已落盘：再次重开是幂等的（不再追加）。
+	count := len(recovered.Events())
+	recovered.Close()
+	again, err := Open(crashed.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if len(again.Events()) != count {
+		t.Errorf("恢复不幂等: %d != %d", len(again.Events()), count)
 	}
 }
 

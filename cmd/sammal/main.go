@@ -67,12 +67,14 @@ func main() {
 	)
 
 	ag := agent.New(agent.Config{
-		Root:        rootCtx,
-		Provider:    provider.NewClient(modelCfg.BaseURL, os.Getenv(modelCfg.APIKeyEnv)),
-		Session:     sess,
-		Registry:    registry,
-		Checkpoints: checkpoint.New(sess.Dir(), cwd),
-		System:      agent.BuildSystemPrompt(facts),
+		Root:          rootCtx,
+		Provider:      provider.NewClient(modelCfg.BaseURL, os.Getenv(modelCfg.APIKeyEnv)),
+		Session:       sess,
+		Registry:      registry,
+		Checkpoints:   checkpoint.New(sess.Dir(), cwd),
+		System:        agent.BuildSystemPrompt(facts),
+		DataRoot:      root,
+		ContextWindow: modelCfg.ContextWindow,
 	})
 
 	p := tea.NewProgram(tui.New(tui.Deps{

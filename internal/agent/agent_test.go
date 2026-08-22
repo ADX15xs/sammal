@@ -108,6 +108,7 @@ func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture
 		Registry:    reg,
 		Checkpoints: cp,
 		System:      BuildSystemPrompt(facts),
+		DataRoot:    root,
 	})
 	return &fixture{ag: ag, sess: sess, reg: reg, cp: cp, work: work}
 }
@@ -440,7 +441,7 @@ func TestRewindRollsBackFilesAndConversation(t *testing.T) {
 func TestSlashHelp(t *testing.T) {
 	fx := newFixture(t, &fakeProvider{})
 	out := fx.ag.Slash("/help")
-	if len(out) == 0 || !strings.Contains(out[0], "/rewind") {
+	if len(out) == 0 || !strings.Contains(strings.Join(out, "\n"), "/rewind") {
 		t.Errorf("/help = %v", out)
 	}
 	out = fx.ag.Slash("/nope")

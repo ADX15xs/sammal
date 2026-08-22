@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
+	"strings"
 	"time"
 
 	"sammal/internal/provider"
@@ -58,6 +60,7 @@ type AssistantMessageData struct {
 	Text        string              `json:"text"`
 	ToolCalls   []provider.ToolCall `json:"toolCalls,omitempty"`
 	Interrupted bool                `json:"interrupted"`
+	Synthetic   bool                `json:"synthetic,omitempty"` // 崩溃恢复时自 chunk 合成
 }
 
 type ToolCallData struct {
@@ -89,6 +92,7 @@ type CompactionData struct {
 type TurnEndData struct {
 	Turn       int    `json:"turn"`
 	StopReason string `json:"stopReason"`
+	Synthetic  bool   `json:"synthetic,omitempty"` // 崩溃恢复补发的闭合事件
 }
 
 // modelToolBudget 是 deriveMessages 对工具结果的投影预算（I5 的截断
@@ -156,17 +160,18 @@ func Create(root string, h Header) (*Session, error) {
 	return s, nil
 }
 
-// Open 打开既有会话并载入事件（崩溃恢复语义见 Recover）。
+// Open 打开既有会话：载入事件、丢弃不完整尾部、为未闭合的 turn/step/
+// tool 补发合成闭合事件（I3 崩溃恢复）。
 func Open(path string) (*Session, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{path: path}
+	s := &Session{path: path, turn: 1}
 	for _, line := range splitLines(data) {
 		var env Envelope
 		if err := json.Unmarshal(line, &env); err != nil {
-			break // 尾部不完整行：丢弃（I3 崩溃恢复的「有效尾部」）
+			break // 尾部不完整行：丢弃（I3 的「有效尾部」）
 		}
 		if env.Type == TypeSessionHeader {
 			if err := json.Unmarshal(env.Data, &s.header); err != nil {
@@ -189,8 +194,69 @@ func Open(path string) (*Session, error) {
 		return nil, err
 	}
 	s.file = f
+	s.recoverTail()
 	return s, nil
 }
+
+// recoverTail 为崩溃留下的未闭合状态补发合成事件：悬挂的 tool/call 补
+// 合成错误结果；已流出的 chunk 无定稿时合成 interrupted 消息；最后补
+// turn/end（stopReason = crash-recovered）。合成事件落日志，保证重放
+// 与 resume 状态一致（I3）。
+func (s *Session) recoverTail() {
+	turnOpen := false
+	var chunkText strings.Builder
+	pendingTools := []sessionPendingTool{}
+
+	for _, env := range s.events {
+		switch env.Type {
+		case TypeUserMessage:
+			turnOpen = true
+		case TypeAssistantChunk:
+			var d AssistantChunkData
+			json.Unmarshal(env.Data, &d)
+			chunkText.WriteString(d.Delta)
+		case TypeAssistantMessage:
+			chunkText.Reset()
+		case TypeToolCall:
+			var d ToolCallData
+			json.Unmarshal(env.Data, &d)
+			pendingTools = append(pendingTools, sessionPendingTool{id: d.ID, name: d.Name})
+		case TypeToolResult:
+			var d ToolResultData
+			json.Unmarshal(env.Data, &d)
+			for i, p := range pendingTools {
+				if p.id == d.ID {
+					pendingTools = append(pendingTools[:i], pendingTools[i+1:]...)
+					break
+				}
+			}
+		case TypeTurnEnd:
+			turnOpen = false
+			chunkText.Reset()
+			pendingTools = pendingTools[:0]
+		}
+	}
+
+	if !turnOpen {
+		return
+	}
+	for _, p := range pendingTools {
+		s.Append(TypeToolResult, ToolResultData{
+			ID:        p.id,
+			Canonical: tool.Result{Err: "interrupted by crash"},
+			Synthetic: true,
+		})
+	}
+	if text := chunkText.String(); text != "" {
+		s.Append(TypeAssistantMessage, AssistantMessageData{
+			Text: text, Interrupted: true, Synthetic: true,
+		})
+	}
+	s.Append(TypeTurnEnd, TurnEndData{Turn: s.turn, StopReason: "crash-recovered", Synthetic: true})
+	s.turn++
+}
+
+type sessionPendingTool struct{ id, name string }
 
 func splitLines(data []byte) [][]byte {
 	var out [][]byte
@@ -254,51 +320,86 @@ func (s *Session) EndTurn(stopReason string) error {
 // projector 从事件流增量投影模型历史；DeriveMessages 与 I1 重放共用，
 // 保证「当时的请求」与「现在的投影」用同一套语义。
 type projector struct {
-	msgs     []provider.Message
-	summary  string
-	keptFrom int
+	msgs    []taggedMessage
+	summary string
+	turn    int // 已闭合的 turn 数；进行中的 turn = turn+1
 }
 
+type taggedMessage struct {
+	msg  provider.Message
+	turn int // 消息所属 turn（1 起）
+	seq  int
+}
+
+// 剪枝配方（第 6.6 节第 1 步）：旧 turn 的工具结果投影超过阈值时截为
+// 头+尾。「旧」只依请求时刻已知的 turn 结构（当前与上一 turn 之外），
+// 重放确定性由此保证。
+const (
+	pruneThreshold = 8192
+	pruneHead      = 4096
+	pruneTail      = 1024
+)
+
 func (p *projector) apply(env Envelope) {
+	cur := p.turn + 1
 	switch env.Type {
+	case TypeTurnEnd:
+		p.turn++
 	case TypeCompactionHappened:
+		// compaction 事件在日志中位于保留尾部之后：按 seq 过滤已应用
+		// 的消息，保留 keptFrom 起的原文，遮蔽区间交给 summary。
 		var cd CompactionData
 		json.Unmarshal(env.Data, &cd)
 		p.summary = cd.Summary
-		p.keptFrom = cd.KeptFrom
-		p.msgs = nil
-	case TypeUserMessage:
-		if env.Seq < p.keptFrom {
-			return
+		kept := p.msgs[:0]
+		for _, tm := range p.msgs {
+			if tm.seq >= cd.KeptFrom {
+				kept = append(kept, tm)
+			}
 		}
+		p.msgs = kept
+	case TypeUserMessage:
 		var d UserMessageData
 		json.Unmarshal(env.Data, &d)
-		p.msgs = append(p.msgs, provider.Message{Role: "user", Content: d.Text})
+		p.msgs = append(p.msgs, taggedMessage{msg: provider.Message{Role: "user", Content: d.Text}, turn: cur, seq: env.Seq})
 	case TypeAssistantMessage:
-		if env.Seq < p.keptFrom {
-			return
-		}
 		var d AssistantMessageData
 		json.Unmarshal(env.Data, &d)
-		p.msgs = append(p.msgs, provider.Message{Role: "assistant", Content: d.Text, ToolCalls: d.ToolCalls})
+		p.msgs = append(p.msgs, taggedMessage{
+			msg:  provider.Message{Role: "assistant", Content: d.Text, ToolCalls: d.ToolCalls},
+			turn: cur, seq: env.Seq,
+		})
 	case TypeToolResult:
-		if env.Seq < p.keptFrom {
-			return
-		}
 		var d ToolResultData
 		json.Unmarshal(env.Data, &d)
-		p.msgs = append(p.msgs, provider.Message{Role: "tool", ToolCallID: d.ID, Content: tool.ForModel(d.Canonical, modelToolBudget)})
+		p.msgs = append(p.msgs, taggedMessage{
+			msg: provider.Message{
+				Role: "tool", ToolCallID: d.ID,
+				Content: tool.ForModel(d.Canonical, modelToolBudget),
+			},
+			turn: cur, seq: env.Seq,
+		})
 	}
 }
 
+// messages 返回当前投影快照；对旧 turn 的超限工具结果应用剪枝。
 func (p *projector) messages() []provider.Message {
-	if p.summary == "" {
-		return p.msgs
+	out := make([]provider.Message, 0, len(p.msgs))
+	if p.summary != "" {
+		out = append(out, provider.Message{
+			Role:    "user",
+			Content: "<compacted-summary>\n" + p.summary + "\n</compacted-summary>",
+		})
 	}
-	return append([]provider.Message{{
-		Role:    "user",
-		Content: "<compacted-summary>\n" + p.summary + "\n</compacted-summary>",
-	}}, p.msgs...)
+	for _, tm := range p.msgs {
+		if tm.msg.Role == "tool" && tm.turn <= p.turn-1 && len(tm.msg.Content) > pruneThreshold {
+			tm.msg.Content = tm.msg.Content[:pruneHead] +
+				fmt.Sprintf("\n...[pruned %d chars]...\n", len(tm.msg.Content)-pruneHead-pruneTail) +
+				tm.msg.Content[len(tm.msg.Content)-pruneTail:]
+		}
+		out = append(out, tm.msg)
+	}
+	return out
 }
 
 // DeriveMessages 从日志投影模型历史（resume/compaction/回放共用）。
@@ -306,6 +407,19 @@ func (p *projector) messages() []provider.Message {
 func (s *Session) DeriveMessages() []provider.Message {
 	p := &projector{}
 	for _, env := range s.events {
+		p.apply(env)
+	}
+	return p.messages()
+}
+
+// MessagesUpTo 返回 seq < limit 事件的投影（压缩摘要请求重建遮蔽区间用，
+// 与 DeriveMessages 同一投影器语义）。
+func (s *Session) MessagesUpTo(limit int) []provider.Message {
+	p := &projector{}
+	for _, env := range s.events {
+		if env.Seq >= limit {
+			break
+		}
 		p.apply(env)
 	}
 	return p.messages()
@@ -378,6 +492,94 @@ func (s *Session) TruncateBeforeTurn(turn int) error {
 	}
 	s.turn = turn
 	return nil
+}
+
+// Transcript 返回会话转录（resume 时回放给 TUI 的投影，I3：与重放
+// 同一来源）。工具结果用 ForTUI 摘要；chunk 不参与。
+func (s *Session) Transcript() []string {
+	var lines []string
+	for _, env := range s.events {
+		switch env.Type {
+		case TypeUserMessage:
+			var d UserMessageData
+			json.Unmarshal(env.Data, &d)
+			lines = append(lines, "> "+d.Text)
+		case TypeAssistantMessage:
+			var d AssistantMessageData
+			json.Unmarshal(env.Data, &d)
+			for _, tc := range d.ToolCalls {
+				lines = append(lines, dimLine("-> "+tc.Function.Name))
+			}
+			if d.Text != "" {
+				mark := ""
+				if d.Interrupted {
+					mark = "（中断）"
+				}
+				lines = append(lines, trimTrailing(d.Text)+mark)
+			}
+		case TypeToolResult:
+			var d ToolResultData
+			json.Unmarshal(env.Data, &d)
+			lines = append(lines, dimLine("<- "+tool.ForTUI(d.Canonical)))
+		case TypeCompactionHappened:
+			lines = append(lines, dimLine("[compaction] 上下文已压缩"))
+		}
+	}
+	return lines
+}
+
+func dimLine(s string) string { return "| " + s }
+
+func trimTrailing(s string) string { return strings.TrimRight(s, "\n") }
+
+// SessionInfo 是会话列表条目。
+type SessionInfo struct {
+	ID      string
+	Created string
+	Turns   int
+	Path    string
+}
+
+// ListSessions 列出 cwd 对应的会话（按修改时间降序）。
+func ListSessions(root, cwd string) ([]SessionInfo, error) {
+	dir := filepath.Join(root, "sessions", NormalizeCwd(cwd))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	type withMtime struct {
+		info SessionInfo
+		mt   int64
+	}
+	var out []withMtime
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, e.Name(), "session.jsonl")
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		s, err := Open(path)
+		if err != nil {
+			continue
+		}
+		out = append(out, withMtime{
+			info: SessionInfo{ID: s.Header().ID, Created: s.Header().Created, Turns: s.Turn() - 1, Path: path},
+			mt:   fi.ModTime().UnixMilli(),
+		})
+		s.Close()
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].mt > out[j].mt })
+	infos := make([]SessionInfo, len(out))
+	for i, w := range out {
+		infos[i] = w.info
+	}
+	return infos, nil
 }
 
 // Close 关闭日志文件。
