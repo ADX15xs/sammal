@@ -282,6 +282,76 @@ func TestI2AdjacentTurnPrefix(t *testing.T) {
 	}
 }
 
+// bigResultTool 返回大于 pruneThreshold（8KB）的内容，用于 I2 剪枝边界测试。
+type bigResultTool struct {
+	size int
+}
+
+func (t *bigResultTool) Name() string            { return "big" }
+func (t *bigResultTool) Description() string     { return "returns large result" }
+func (t *bigResultTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object","properties":{},"required":[]}`) }
+func (t *bigResultTool) ReadOnly() bool          { return true }
+func (t *bigResultTool) Execute(ctx context.Context, args json.RawMessage) (tool.Result, error) {
+	return tool.Result{Output: strings.Repeat("x", t.size)}, nil
+}
+
+func findLastToolResult(msgs []provider.Message) *provider.Message {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "tool" {
+			return &msgs[i]
+		}
+	}
+	return nil
+}
+
+// TestI2CrossTurnToolResultPruning 验证投影器跨 turn 剪枝行为：
+// turn N 的超大工具结果在 turn N+1 完整、turn N+2 被截断。
+// 这是 I2 前缀边界中唯一非单调变化处（见 SPEC I2 附 剪枝豁免区）。
+func TestI2CrossTurnToolResultPruning(t *testing.T) {
+	fp := &fakeProvider{streams: [][]provider.Chunk{
+		toolCallChunks("c1", "big", `{}`), // T1 step 1: call big
+		textChunks("t1-final"),            // T1 step 2: final
+		textChunks("t2-final"),            // T2: final
+		textChunks("t3-final"),            // T3: final
+	}}
+	big := &bigResultTool{size: 12000} // > 8KB pruneThreshold
+	fx := newFixture(t, fp, big)
+	events := fx.ag.Events()
+
+	for _, q := range []string{"t1", "t2", "t3"} {
+		go fx.ag.Run(context.Background(), q)
+		drainEvents(t, events, turnEnded)
+	}
+
+	if len(fp.calls) != 4 {
+		t.Fatalf("expected 4 calls, got %d", len(fp.calls))
+	}
+
+	// T2 request（calls[2]）：turn 1 的工具结果应完整（仅 1 turn 前，未触及剪枝条件）。
+	t2Tool := findLastToolResult(fp.calls[2].Messages)
+	if t2Tool == nil {
+		t.Fatal("T2 request: no tool result found")
+	}
+	if len(t2Tool.Content) < 11000 {
+		t.Fatalf("T2: tool result 应完整，但只有 %d 字符", len(t2Tool.Content))
+	}
+	if !strings.Contains(t2Tool.Content, strings.Repeat("x", 100)) {
+		t.Fatal("T2: tool result 不应含截断标记")
+	}
+
+	// T3 request（calls[3]）：turn 1 的工具结果应被截断（2 turn 前 + 超 8KB）。
+	t3Tool := findLastToolResult(fp.calls[3].Messages)
+	if t3Tool == nil {
+		t.Fatal("T3 request: no tool result found")
+	}
+	if !strings.Contains(t3Tool.Content, "[pruned") {
+		t.Fatalf("T3: tool result 应含截断标记 [pruned]，但内容为 %q", t3Tool.Content)
+	}
+	if len(t3Tool.Content) >= 10000 {
+		t.Fatalf("T3: tool result 应被截断，但仍有 %d 字符", len(t3Tool.Content))
+	}
+}
+
 // slowTool 在执行期间阻塞，用于触发工具阶段的中止。
 type slowTool struct {
 	delay   time.Duration

@@ -65,6 +65,18 @@ Sammal 是一个随需求生长、始终满足六条不变量（第 2 章）、�
 - **测试**：系统提示词与工具 schema 序列化有 golden bytes 测试；同一会话相邻两轮请求的公共前缀长度 = 上一轮请求全长
 - **推论**：模式切换类功能不得增删工具目录；模型切换必然重建 KV 缓存（按模型隔离），属预期行为，文档如实陈述，不宣称"100% 命中率"
 
+#### I2 附：前缀边界定义
+
+"请求前缀"由以下部分构成，会话内字节级不变：
+
+- **系统提示词**：`agent.BuildSystemPrompt` 的输入来自 `SessionHeader`（cwd/os/shell/date），会话首拍定格，resume 时从 header 重建，字节一致
+- **工具目录**：`tool.Registry.Defs()` 返回各工具的 `Name`/`Description`/`Schema` 常量。`BashTool.Schema()` 的 shellNote 插值是唯一允许的动态项，定格于会话创建
+- **消息历史**：`session.DeriveMessages()` 通过 `projector` 确定性投影日志。turn 间的工具结果投影受剪枝策略影响（见下文豁免区）
+
+**注 —— 剪枝豁免区**：`session.go` 中 `projector.messages()` 对超过 `pruneThreshold`（8KB）的旧 turn 工具结果做头尾截断，**是唯一允许的前缀非单调变化**。新增剪枝路径须过 I1 重放测试。
+
+**新增请求类型模式**：`agent/commands.go:compact()` 展示了如何构造一个复用前缀缓存的请求（逐字重放 + 尾部追加指令）。新增类似请求应遵循此模式。
+
 ### I3 会话可从日志完整重建
 
 resume、branch、compaction、TUI 重绘、回放全部是同一份事件日志的投影，不维护影子状态。

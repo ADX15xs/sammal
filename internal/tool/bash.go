@@ -30,6 +30,8 @@ func (t *BashTool) Description() string {
 }
 
 func (t *BashTool) Schema() json.RawMessage {
+	// I2 NOTE: shellNote 是唯一允许的动态插值，定格于会话创建。
+	// 其他工具 schema 不得引入此模式——新增动态字段会击穿 I2 前缀稳定性。
 	shellNote := "commands run in bash"
 	if t.Shell == "powershell" {
 		shellNote = "IMPORTANT: commands run in PowerShell. Use PowerShell syntax; do not use bash syntax; chain with ; not &&"
