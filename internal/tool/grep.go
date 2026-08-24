@@ -23,6 +23,9 @@ const (
 	grepMaxResults = 200
 	grepFileCap    = 10 * 1024 * 1024
 	grepResultCap  = 64 * 1024
+	// 取消的搜索必须显式标注：静默返回空/部分输出会被模型当作
+	// 完整结论（"无命中"），进而发起更大范围的重搜。
+	grepAbortedNote = "...[aborted by user]\n"
 )
 
 func (t *GrepTool) Name() string   { return "grep" }
@@ -91,6 +94,9 @@ func (t *GrepTool) runRipgrep(ctx context.Context, rg, pattern, base, glob strin
 		}
 		// 退出码 1 = 无命中，正常。
 	}
+	if ctx.Err() != nil {
+		return buf.String() + grepAbortedNote, true
+	}
 	return buf.String(), buf.truncated
 }
 
@@ -102,6 +108,7 @@ func (t *GrepTool) grepGo(ctx context.Context, pattern, base, glob string) (stri
 		globRe = globToRegexp(glob)
 	}
 	matches := 0
+	aborted := false
 	var out bytes.Buffer
 	root := base
 	info, err := os.Stat(base)
@@ -112,6 +119,10 @@ func (t *GrepTool) grepGo(ctx context.Context, pattern, base, glob string) (stri
 		root = filepath.Dir(base)
 	}
 	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			aborted = true
+			return filepath.SkipAll
+		}
 		if err != nil || out.Len() >= grepResultCap || matches >= grepMaxResults {
 			return filepath.SkipAll
 		}
@@ -138,7 +149,10 @@ func (t *GrepTool) grepGo(ctx context.Context, pattern, base, glob string) (stri
 		}
 		return nil
 	})
-	return out.String(), matches >= grepMaxResults
+	if aborted {
+		out.WriteString(grepAbortedNote)
+	}
+	return out.String(), matches >= grepMaxResults || aborted
 }
 
 func grepFile(path string, re *regexp.Regexp) (match string, truncated bool) {

@@ -190,6 +190,27 @@ func TestGrep(t *testing.T) {
 	}
 }
 
+// 取消的搜索不得静默返回空/部分输出——模型会把"无输出"当完整结论，
+// 进而发起更大范围的重搜。Esc 中止依赖 ctx 一路传到 grep 实现。
+func TestGrepCanceledContextMarked(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello\n"), 0o644)
+	tl := &GrepTool{WorkDir: dir}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res, err := tl.Execute(ctx, json.RawMessage(`{"pattern":"hello"}`))
+	if err != nil {
+		t.Fatalf("infra error: %v", err)
+	}
+	if !strings.Contains(res.Output, "[aborted") {
+		t.Errorf("取消结果应带标注: %q", res.Output)
+	}
+	if !res.Truncated {
+		t.Error("取消结果应标记 truncated")
+	}
+}
+
 func TestGlob(t *testing.T) {
 	r, dir := testRegistry(t)
 	os.MkdirAll(filepath.Join(dir, "x", "y"), 0o755)
