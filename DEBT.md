@@ -11,3 +11,4 @@
 | internal/tool/bash.go | PowerShell **执行路径**已自动化验证（powershell.exe/pwsh 端到端：输出、非零退出码、超时杀进程，见 TestBashToolPowerShellPath）。剩余未覆盖：本机 System32 存在 WSL bash.exe，exec.LookPath("bash") 恒命中，「PATH 无 bash → 降级」检测分支不可达 | 在无 bash 的 Windows 实机触发一次降级（或该分支由 3 行 fallback 与 prompt golden 互补覆盖，评估可接受） | 首个无 bash 的 Windows 实机出现时 |
 | internal/tool/grep.go | rg 委托与纯 Go 后备的正则方言存在细微差异（rg 为 Rust regex 语法，后备为 RE2）；常见模式两者一致 | 遇到实际分歧模式时在 schema description 中声明方言边界，或统一为仅 RE2 | 按需（首个实际分歧出现时） |
 | internal/agent/agent.go | 压缩只在 turn 开始触发：单个 turn 内多 step 工具环撑爆上下文时不自动恢复（请求会收到上下文溢出错误，turn 以 error 结束；下一 turn 开始时自动压缩后可重试） | 溢出分类（InterruptContextOverflow）已就绪；实测出现该场景再加「溢出 → turn 内压缩重试」 | 按需（首个实际溢出出现时） |
+| internal/provider/chunk.go | 限流信号识别面收敛：头部只认标准 Retry-After（整数秒/HTTP-date）与常见 x-ratelimit-reset（unix 秒/RFC3339），其余变体格式（如 Go duration 串 "6m30s"、各家自定义头）退化为盲指数退避；配额窗口判档依赖响应体英文特征串，非英文报错可能漏判成普通限流 | 遇到实际端点时按其格式扩展 parseRetryAfter / quotaMarkers | 按需（首个未识别格式实际影响重试效果时） |

@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -371,6 +372,119 @@ func TestRequestWireFormat(t *testing.T) {
 }
 
 func jsonRaw(s string) []byte { return []byte(s) }
+
+// --- 限流 / 服务端错误分类（第 6.1 节三档：限流重试、5xx 重试、配额快速失败）---
+
+func statusHandler(status int, body string, header map[string]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for k, v := range header {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, body)
+	}
+}
+
+func TestStreamRateLimitWithRetryAfterSeconds(t *testing.T) {
+	srv := httptest.NewServer(statusHandler(http.StatusTooManyRequests,
+		`{"error":{"message":"rate limit exceeded"}}`, map[string]string{"Retry-After": "12"}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "")
+	_, err := c.Stream(context.Background(), Request{Model: "m"})
+	var se *StreamInterruptedError
+	if !errors.As(err, &se) || se.Kind != InterruptRateLimit || se.RetryAfter != 12*time.Second {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestStreamRateLimitWithHTTPDate(t *testing.T) {
+	reset := time.Now().Add(90 * time.Second).UTC().Format(http.TimeFormat)
+	srv := httptest.NewServer(statusHandler(http.StatusTooManyRequests, `{"error":{}}`,
+		map[string]string{"Retry-After": reset}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "")
+	_, err := c.Stream(context.Background(), Request{Model: "m"})
+	var se *StreamInterruptedError
+	if !errors.As(err, &se) || se.Kind != InterruptRateLimit {
+		t.Fatalf("err = %v", err)
+	}
+	if se.RetryAfter < 60*time.Second || se.RetryAfter > 90*time.Second {
+		t.Fatalf("RetryAfter = %v, want ~(90s - elapsed)", se.RetryAfter)
+	}
+}
+
+func TestStreamRateLimitNoHeader(t *testing.T) {
+	srv := httptest.NewServer(statusHandler(http.StatusTooManyRequests, `{"error":{}}`, nil))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "")
+	_, err := c.Stream(context.Background(), Request{Model: "m"})
+	var se *StreamInterruptedError
+	if !errors.As(err, &se) || se.Kind != InterruptRateLimit || se.RetryAfter != 0 {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// 订阅制 coding/token plan 用量窗口耗尽：429 且响应体命中配额特征，
+// 归为配额窗口（agent 侧快速失败，不烧重试预算）。
+func TestStreamQuotaMarkerClassification(t *testing.T) {
+	srv := httptest.NewServer(statusHandler(http.StatusTooManyRequests,
+		`{"error":{"type":"usage_limit_reached","message":"You have hit your usage limit. Your 5-hour window resets soon."}}`, nil))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "")
+	_, err := c.Stream(context.Background(), Request{Model: "m"})
+	var se *StreamInterruptedError
+	if !errors.As(err, &se) || se.Kind != InterruptQuota {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestStreamServerErrorClassification(t *testing.T) {
+	srv := httptest.NewServer(statusHandler(http.StatusServiceUnavailable, `upstream gone`, nil))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "")
+	_, err := c.Stream(context.Background(), Request{Model: "m"})
+	var se *StreamInterruptedError
+	if !errors.As(err, &se) || se.Kind != InterruptServerError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	futureDate := now.Add(30 * time.Second)
+	pastDate := now.Add(-time.Hour)
+
+	tests := []struct {
+		name   string
+		header map[string][]string
+		want   time.Duration
+	}{
+		{"无头部", nil, 0},
+		{"秒数", map[string][]string{"Retry-After": {"12"}}, 12 * time.Second},
+		{"带空白的秒数", map[string][]string{"Retry-After": {" 7 "}}, 7 * time.Second},
+		{"HTTP日期", map[string][]string{"Retry-After": {futureDate.Format(http.TimeFormat)}}, 30 * time.Second},
+		{"过去的HTTP日期", map[string][]string{"Retry-After": {pastDate.Format(http.TimeFormat)}}, 0},
+		{"垃圾值", map[string][]string{"Retry-After": {"soon"}}, 0},
+		{"reset的unix秒", map[string][]string{"X-Ratelimit-Reset": {fmt.Sprint(futureDate.Unix())}}, 30 * time.Second},
+		{"reset的RFC3339", map[string][]string{"X-Ratelimit-Reset": {futureDate.Format(time.RFC3339)}}, 30 * time.Second},
+		{"reset过去时点", map[string][]string{"X-Ratelimit-Reset": {fmt.Sprint(pastDate.Unix())}}, 0},
+		{"reset垃圾值", map[string][]string{"X-Ratelimit-Reset": {"6m30s"}}, 0},
+		{"RetryAfter优先", map[string][]string{"Retry-After": {"5"}, "X-Ratelimit-Reset": {fmt.Sprint(futureDate.Unix())}}, 5 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseRetryAfter(http.Header(tt.header), now)
+			if got < tt.want-time.Second || got > tt.want+time.Second {
+				t.Errorf("parseRetryAfter = %v, want ≈%v", got, tt.want)
+			}
+		})
+	}
+}
 
 // APIKeyEnv → Authorization 头的完整链路锁定：有 key 发 Bearer，
 // 无 key 不发该头（本地端点无需鉴权）。

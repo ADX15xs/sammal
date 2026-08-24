@@ -124,7 +124,7 @@ func (c *Client) Stream(ctx context.Context, req Request) (<-chan Chunk, error) 
 		defer resp.Body.Close()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		cancel(nil)
-		return nil, classifyHTTPError(resp.StatusCode, errBody)
+		return nil, classifyHTTPError(resp.StatusCode, errBody, parseRetryAfter(resp.Header, time.Now()))
 	}
 
 	ch := make(chan Chunk, 16)

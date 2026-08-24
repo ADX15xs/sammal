@@ -19,12 +19,20 @@ import (
 
 // fakeProvider 是 Provider 的测试替身（引入接口的第二个当前实现）。
 type fakeProvider struct {
-	streams [][]provider.Chunk
-	calls   []provider.Request
+	streams  [][]provider.Chunk
+	syncErrs []error // 按 Stream 调用序弹出的同步错误；nil 元素 = 本次不出错，落到 streams
+	calls    []provider.Request
 }
 
 func (f *fakeProvider) Stream(ctx context.Context, req provider.Request) (<-chan provider.Chunk, error) {
 	f.calls = append(f.calls, req)
+	if len(f.syncErrs) > 0 {
+		err := f.syncErrs[0]
+		f.syncErrs = f.syncErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(f.streams) == 0 {
 		return nil, &provider.StreamInterruptedError{Kind: provider.InterruptProtocol, Err: errors.New("no scripted stream")}
 	}
@@ -287,10 +295,12 @@ type bigResultTool struct {
 	size int
 }
 
-func (t *bigResultTool) Name() string            { return "big" }
-func (t *bigResultTool) Description() string     { return "returns large result" }
-func (t *bigResultTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object","properties":{},"required":[]}`) }
-func (t *bigResultTool) ReadOnly() bool          { return true }
+func (t *bigResultTool) Name() string        { return "big" }
+func (t *bigResultTool) Description() string { return "returns large result" }
+func (t *bigResultTool) Schema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{},"required":[]}`)
+}
+func (t *bigResultTool) ReadOnly() bool { return true }
 func (t *bigResultTool) Execute(ctx context.Context, args json.RawMessage) (tool.Result, error) {
 	return tool.Result{Output: strings.Repeat("x", t.size)}, nil
 }

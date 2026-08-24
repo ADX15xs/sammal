@@ -6,8 +6,44 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
+
+// parseRetryAfter 把限流重试信号头解析为时长；无法识别一律返回 0。
+// 认识标准 Retry-After（整数秒 / HTTP-date）与常见 x-ratelimit-reset
+// （unix 秒 / RFC3339）；其余变体格式繁多，不做脆弱解析（DEBT）。
+func parseRetryAfter(header http.Header, now time.Time) time.Duration {
+	var d time.Duration
+	if v := header.Get("Retry-After"); v != "" {
+		if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			d = time.Duration(secs) * time.Second
+		} else if t, err := http.ParseTime(v); err == nil {
+			d = t.Sub(now)
+		}
+		return clampFuture(d)
+	}
+	if v := header.Get("X-Ratelimit-Reset"); v != "" {
+		v = strings.TrimSpace(v)
+		if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+			d = time.Unix(secs, 0).Sub(now)
+		} else if t, err := time.Parse(time.RFC3339, v); err == nil {
+			d = t.Sub(now)
+		}
+		return clampFuture(d)
+	}
+	return 0
+}
+
+// clampFuture 只保留「未来」语义的等待：过去时点视为可立即重试。
+func clampFuture(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	return d
+}
 
 // Chunk 是规范化后的流式增量。Err 非空的 Chunk 是最后一帧，标志流中断。
 type Chunk struct {
@@ -70,16 +106,21 @@ const (
 	InterruptStall
 	InterruptProtocol
 	InterruptContextOverflow
+	InterruptRateLimit   // HTTP 429：瞬时限流，可短等待重试
+	InterruptServerError // HTTP 5xx：服务端瞬断，可重试
+	InterruptQuota       // 429 且命中配额特征（订阅 plan 用量窗口耗尽）：等待无意义
 )
 
 // ErrStalled 是看门狗超时的 cancel cause。
 var ErrStalled = errors.New("stream stalled: no chunk within watchdog timeout")
 
-// StreamInterruptedError 流中断；Network/Stall 可在 step 边界重连，
-// Protocol 上抛用户，ContextOverflow 触发压缩后重试。
+// StreamInterruptedError 流中断；Network/Stall/RateLimit/ServerError 可在
+// step 边界重连，Protocol/Quota 上抛用户，ContextOverflow 触发压缩后重试。
+// RetryAfter 是端点要求等待的时长（0 = 未告知），仅限流类携带。
 type StreamInterruptedError struct {
-	Kind InterruptKind
-	Err  error
+	Kind       InterruptKind
+	Err        error
+	RetryAfter time.Duration
 }
 
 func (e *StreamInterruptedError) Error() string {
@@ -88,11 +129,18 @@ func (e *StreamInterruptedError) Error() string {
 		InterruptStall:           "流停滞",
 		InterruptProtocol:        "协议错误",
 		InterruptContextOverflow: "上下文溢出",
+		InterruptRateLimit:       "限流",
+		InterruptServerError:     "服务端错误",
+		InterruptQuota:           "配额窗口",
 	}[e.Kind]
+	msg := fmt.Sprintf("流中断（%s）", kind)
 	if e.Err != nil {
-		return fmt.Sprintf("流中断（%s）：%s", kind, e.Err)
+		msg += fmt.Sprintf("：%s", e.Err)
 	}
-	return fmt.Sprintf("流中断（%s）", kind)
+	if e.RetryAfter > 0 {
+		msg += fmt.Sprintf("；要求等待 %s 后重试", e.RetryAfter)
+	}
+	return msg
 }
 
 func (e *StreamInterruptedError) Unwrap() error { return e.Err }
@@ -109,12 +157,28 @@ var overflowMarkers = []string{
 	"too long", "exceeds the maximum",
 }
 
-func classifyHTTPError(status int, body []byte) error {
+// quotaMarkers 订阅制（coding/token plan）端点用量窗口耗尽的 429 响应特征。
+var quotaMarkers = []string{
+	"usage limit", "usage_limit", "limit reached", "quota exceeded",
+}
+
+func classifyHTTPError(status int, body []byte, retryAfter time.Duration) error {
 	lower := strings.ToLower(string(body))
 	for _, m := range overflowMarkers {
 		if status == 400 && strings.Contains(lower, m) {
 			return &StreamInterruptedError{Kind: InterruptContextOverflow, Err: fmt.Errorf("HTTP %d: %s", status, excerpt(body))}
 		}
+	}
+	if status == http.StatusTooManyRequests {
+		for _, m := range quotaMarkers {
+			if strings.Contains(lower, m) {
+				return &StreamInterruptedError{Kind: InterruptQuota, Err: fmt.Errorf("HTTP %d: %s", status, excerpt(body)), RetryAfter: retryAfter}
+			}
+		}
+		return &StreamInterruptedError{Kind: InterruptRateLimit, Err: fmt.Errorf("HTTP %d: %s", status, excerpt(body)), RetryAfter: retryAfter}
+	}
+	if status >= 500 {
+		return &StreamInterruptedError{Kind: InterruptServerError, Err: fmt.Errorf("HTTP %d: %s", status, excerpt(body)), RetryAfter: retryAfter}
 	}
 	return &StreamInterruptedError{Kind: InterruptProtocol, Err: fmt.Errorf("HTTP %d: %s", status, excerpt(body))}
 }

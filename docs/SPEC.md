@@ -242,7 +242,8 @@ type Chunk struct {
 关键设计：
 
 - 端点：`POST {base_url}/chat/completions`，`stream: true`，`stream_options.include_usage` 恒开
-- **SSE 停滞看门狗**：默认 300s 无 chunk 判定停滞，抛 `StreamInterruptedError`（区分网络错误 / 协议错误 / 上下文溢出），仅在 step 边界重连
+- **SSE 停滞看门狗**：默认 300s 无 chunk 判定停滞，抛 `StreamInterruptedError`（区分网络错误 / 流停滞 / 协议错误 / 上下文溢出 / 限流 / 服务端错误 / 配额窗口），仅在 step 边界重连
+- **非 200 分类**（`classifyHTTPError`）：429 且响应体命中配额特征串（usage limit / limit reached 等）→ **配额窗口**；其余 429 → **限流**；5xx → **服务端错误**；400+溢出特征 → **上下文溢出**；其余 → 协议错误。限流/服务端错误附带 `RetryAfter`：解析 `Retry-After`（整数秒 / HTTP-date），best-effort 兼容 `x-ratelimit-reset`（unix 秒 / RFC3339）；过去时点与无法识别的格式一律视为未告知
 - `Usage` 透出 `prompt_cache_hit_tokens`（DeepSeek 系）与 `cached_tokens`（OpenAI 系），供 I2 的可观测指标
 - 请求体序列化确定性（字段顺序稳定），支撑 I2 的前缀比对测试
 
@@ -272,6 +273,7 @@ loop:
 关键设计：
 
 - **消息收件箱**：生成期间用户输入进入队列（不丢弃、不注入进行中的请求），在下一个 step 边界吸收——用户可以随时插话纠偏
+- **断流分类重连**：网络/停滞/限流/服务端错误在 step 边界重连，重试同一请求（逐字节一致，I2/KV 缓存友好）。退避 = max(1s 指数增长, Retry-After)，单次等待上限 60s；要求等待超过 60s 即订阅 plan 的用量窗口（小时级），立即放弃重试并注明恢复时间点；429 命中配额特征串同样直接上抛。重试预算按模型配置（`retry_max`，用户故事：免费端点与付费端点限额差异大，本地 Ollama 保持快速失败、免费云端多熬几次）
 - **中止语义**：`Esc` 触发 AbortSignal 贯穿流与工具执行；已产出部分内容标记 `interrupted` 存为 assistant 消息；**未执行的工具调用写入合成错误结果**（"aborted before execution"），保证 I1/I3 可重放
 - **无 max-steps**：循环跑到模型自己停（token 压力由 compaction 兜底）；若实测需要上限，作为 DEBT 记账后加
 - v1 工具顺序执行；并行执行（有界池 + 按序提交结果，dsh 方案）是明确的生长点，不在 v1 设计
@@ -416,6 +418,12 @@ model         = "deepseek-chat"
 api_key_env   = "DEEPSEEK_API_KEY"
 context_window = 131072
 
+[models.free-api]                    # 用户故事：免费云端端点限额严格，多熬几次限流
+base_url      = "https://free-relay.example.com/v1"
+model         = "free-chat"
+api_key_env   = "FREE_API_KEY"
+retry_max     = 6                    # 断流重连上限；缺省 3（退避曲线为代码常量，不进配置）
+
 [ui]
 editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDITOR，可强制指定
 ```
@@ -537,3 +545,4 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-08-23 | I2 测试表述细化：「相邻请求公共前缀 = 上一请求全长」改为「system、工具目录与历史消息逐条序列化字节一致 + 请求体序列化确定性」 | JSON 嵌套结构（messages 数组闭括号）使整请求字节前缀按字面必然分叉；逐消息稳定才是服务端 token 前缀（KV 缓存）覆盖的内容，不变量本身不变 |
 | 2026-08-23 | request/header 事件数据增加 model 字段（规格 6.5.2 最小示例之外） | 会话中途切模型（M3）后重放逐字节比对需要当时请求所用的模型名；I1 要求的必然推论 |
 | 2026-08-23 | 配置面新增 secrets 能力（7.2 之外）：config.toml 同目录 `.env`（Windows `%APPDATA%\sammal\.env`）作为 `api_key_env` 的值兜底；同名进程环境变量优先 | 用户故事：Windows 调全局环境变量成本高；`.env` 跟随配置目录、不入日志、不占会话。优先序沿 dotenv 惯例（显式注入不被覆盖），本地端点不受影响 |
+| 2026-08-24 | 断流分类扩展与限流应对：新增限流（429）/服务端错误（5xx）/配额窗口三档分类，429/5xx 纳入 step 边界重连（1s 指数退避、尊重 Retry-After、单次等待上限 60s）；配额特征或超限等待快速失败并注明恢复时间点；配置面每模型新增可选 `retry_max`（缺省 3） | 用户故事：线上 API 与免费端点 429 太常见，固定 1s×3 盲等熬不过分钟级配额窗口；coding/token plan 类订阅有 5 小时用量窗口，小时级等待循环重试无意义，应报恢复时间让用户自行重发。曲线常量不进配置（收敛原则），仅次数随端点差异可调 |
