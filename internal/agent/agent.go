@@ -126,8 +126,12 @@ type Agent struct {
 }
 
 func New(cfg Config) *Agent {
+	root := cfg.Root
+	if root == nil { // 测试与库形态兜底；main 恒传可取消的 rootCtx
+		root = context.Background()
+	}
 	a := &Agent{
-		root:      cfg.Root,
+		root:      root,
 		prov:      cfg.Provider,
 		sess:      cfg.Session,
 		reg:       cfg.Registry,
@@ -239,6 +243,8 @@ func (a *Agent) Run(parent context.Context, userMsg string) {
 	a.absorbInbox()
 	if err := a.sess.Append(session.TypeUserMessage, session.UserMessageData{Text: userMsg}); err != nil {
 		a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
+		// 无 TurnStarted 也要有 TurnEnded：消费端以本事件解除 busy。
+		a.emit(TurnEndedEvent{StopReason: StopError})
 		return
 	}
 	a.emit(TurnStartedEvent{})
@@ -287,10 +293,22 @@ func (a *Agent) runSteps(ctx context.Context) (string, *provider.Usage) {
 		if len(toolCalls) == 0 {
 			return StopCompleted, usage
 		}
-		if aborted := a.executeTools(ctx, msg.ToolCalls); aborted {
-			return StopAborted, usage
+		if stop := a.executeTools(ctx, msg.ToolCalls); stop != "" {
+			return stop, usage
 		}
 	}
+}
+
+// appendFatal 写日志并在失败时上报：日志已坏时继续执行只会产出不可重放
+// 的状态（I1），调用方应在首个写失败处终止当前 turn。磁盘满等持久性故障
+// 无法在 turn 内自愈，快速失败优于带病续跑。
+func (a *Agent) appendFatal(evType string, data any) error {
+	if err := a.sess.Append(evType, data); err != nil {
+		err = fmt.Errorf("日志写入失败：%w", err)
+		a.emit(ErrorEvent{Err: err})
+		return err
+	}
+	return nil
 }
 
 // absorbInbox 清空收件箱：把生成期间的用户插话吸收为 user 消息。
@@ -298,7 +316,9 @@ func (a *Agent) absorbInbox() {
 	for {
 		select {
 		case msg := <-a.inbox:
-			a.sess.Append(session.TypeUserMessage, session.UserMessageData{Text: msg})
+			if a.appendFatal(session.TypeUserMessage, session.UserMessageData{Text: msg}) != nil {
+				return // 失败已上报；本请求不含该插话（未落盘即模型不可见）
+			}
 			a.emit(StatusEvent{Text: "已吸收插话，将随下一请求发送"})
 		default:
 			return
@@ -380,19 +400,23 @@ func (a *Agent) finalizePartial(text string, toolCalls []provider.ToolCall) prov
 		return provider.Message{}
 	}
 	msg := provider.Message{Role: "assistant", Content: text, ToolCalls: toolCalls}
-	a.sess.Append(session.TypeAssistantMessage, session.AssistantMessageData{
+	if a.appendFatal(session.TypeAssistantMessage, session.AssistantMessageData{
 		Text: text, ToolCalls: toolCalls, Interrupted: true,
-	})
+	}) != nil {
+		return msg // 失败已上报；返回值仅供本轮收尾，日志以磁盘为准
+	}
 	a.emit(MessageFinalEvent{Text: text, Interrupted: true, Usage: nil})
 	return msg
 }
 
 // executeTools 顺序执行工具调用（v1 不并行）；每个 call/result 落日志。
-// 中止时未执行的调用写入合成错误结果（"aborted before execution"），
-// 保证 I1/I3 可重放。返回是否被中止。
-func (a *Agent) executeTools(ctx context.Context, calls []provider.ToolCall) bool {
+// 中止时未执行的调用写入合成错误结果（"aborted before execution"），保证
+// I1/I3 可重放。日志写失败同样给剩余调用补合成结果（活跃投影不得悬空
+// tool_calls），并终止 turn——返回 "aborted" / StopError，"" 则继续循环。
+func (a *Agent) executeTools(ctx context.Context, calls []provider.ToolCall) string {
+	logFailed := false
 	for _, tc := range calls {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || logFailed {
 			a.logToolResult(session.ToolResultData{
 				ID:        tc.ID,
 				Canonical: tool.Result{Err: "aborted before execution"},
@@ -402,13 +426,26 @@ func (a *Agent) executeTools(ctx context.Context, calls []provider.ToolCall) boo
 		}
 
 		args := json.RawMessage(tc.Function.Arguments)
-		a.sess.Append(session.TypeToolCall, session.ToolCallData{ID: tc.ID, Name: tc.Function.Name, Args: args})
+		if a.appendFatal(session.TypeToolCall, session.ToolCallData{ID: tc.ID, Name: tc.Function.Name, Args: args}) != nil {
+			logFailed = true // 剩余调用补合成结果后终止 turn
+			continue
+		}
 		a.emit(ToolCallEvent{ID: tc.ID, Name: tc.Function.Name, ArgsSummary: argsSummary(args)})
 
 		res := a.runTool(ctx, tc.Function.Name, args)
-		a.logToolResult(session.ToolResultData{ID: tc.ID, Canonical: res}, tc.Function.Name)
+		if a.appendFatal(session.TypeToolResult, session.ToolResultData{ID: tc.ID, Canonical: res}) != nil {
+			logFailed = true
+			continue
+		}
+		a.emit(ToolResultEvent{ID: tc.ID, Name: tc.Function.Name, Result: res})
 	}
-	return ctx.Err() != nil
+	if logFailed {
+		return StopError
+	}
+	if ctx.Err() != nil {
+		return StopAborted
+	}
+	return ""
 }
 
 func (a *Agent) runTool(ctx context.Context, name string, args json.RawMessage) tool.Result {
@@ -425,7 +462,7 @@ func (a *Agent) runTool(ctx context.Context, name string, args json.RawMessage) 
 }
 
 func (a *Agent) logToolResult(d session.ToolResultData, name string) {
-	a.sess.Append(session.TypeToolResult, d)
+	a.sess.Append(session.TypeToolResult, d) // 合成补写尽力而为；失败由 I3 崩溃恢复兜底
 	a.emit(ToolResultEvent{ID: d.ID, Name: name, Result: d.Canonical})
 }
 
@@ -562,6 +599,12 @@ func appendToolDelta(calls []provider.ToolCall, d *provider.ToolCallDelta) []pro
 	return calls
 }
 
+// emit 投递事件。root 取消后允许丢弃事件：一切落盘都先于对应 emit 完成，
+// 丢弃不损日志（I1），只是放弃已无人消费的通知；否则消费端停止后
+// Submit/Slash 等同步调用方会把自己冻死在发送上。
 func (a *Agent) emit(ev Event) {
-	a.events <- ev
+	select {
+	case a.events <- ev:
+	case <-a.root.Done():
+	}
 }

@@ -12,3 +12,7 @@
 | internal/tool/grep.go | rg 委托与纯 Go 后备的正则方言存在细微差异（rg 为 Rust regex 语法，后备为 RE2）；常见模式两者一致 | 遇到实际分歧模式时在 schema description 中声明方言边界，或统一为仅 RE2 | 按需（首个实际分歧出现时） |
 | internal/agent/agent.go | 压缩只在 turn 开始触发：单个 turn 内多 step 工具环撑爆上下文时不自动恢复（请求会收到上下文溢出错误，turn 以 error 结束；下一 turn 开始时自动压缩后可重试） | 溢出分类（InterruptContextOverflow）已就绪；实测出现该场景再加「溢出 → turn 内压缩重试」 | 按需（首个实际溢出出现时） |
 | internal/provider/chunk.go | 限流信号识别面收敛：头部只认标准 Retry-After（整数秒/HTTP-date）与常见 x-ratelimit-reset（unix 秒/RFC3339），其余变体格式（如 Go duration 串 "6m30s"、各家自定义头）退化为盲指数退避；配额窗口判档依赖响应体英文特征串，非英文报错可能漏判成普通限流 | 遇到实际端点时按其格式扩展 parseRetryAfter / quotaMarkers | 按需（首个未识别格式实际影响重试效果时） |
+| internal/agent/agent.go | Usage（含 prompt_cache_hit_tokens / cached_tokens）只透出 TUI 显示当前轮，不落日志：无法从日志回答会话级/跨轮缓存命中率，成功标准 #3 只兑现了实时半边 | 给 assistant/message 或 turn/end 事件补 usage 字段（I1「模型可见=已写入日志」的自然延伸），TUI 改读事件即可 | 按需（需要会话级命中率审计或跨轮指标时） |
+| internal/agent/agent.go runSteps | turn 内无 step 数软上限，压缩只在 turn 开始触发：模型失控循环调用工具时会一直烧到上下文溢出才停（大窗口端点损失放大） | 先加软阈值 StatusEvent 提醒；实测出现失控再加溢出后 turn 内压缩重试或硬上限 | 按需（首个实际失控出现时） |
+| internal/agent/agent.go captureBeforeWrite | 快照捕获按 `{path}` 参数启发式识别写类工具：未来新增参数不含 path 的写工具会被静默漏快照（/rewind 盲区扩大且无告警） | Tool 接口加显式声明（如 SnapshotTargets 方法）替代启发式解析 | 首个非 path 参数的写工具进入注册表时 |
+| internal/tool/tool_test.go | bash/grep 测试用真实 sleep 脚本化并发行为，整包 ~32s：拖慢开发反馈环，不影响正确性 | 用 channel 同步或轮询断言替代定时 sleep | 下次大改 tool 包时顺手 |
