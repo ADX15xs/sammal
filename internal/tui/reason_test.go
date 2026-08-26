@@ -194,3 +194,87 @@ func stripANSI(s string) string {
 	}
 	return b.String()
 }
+
+// 全状态矩阵：驱动 Model 走完 turn 生命周期的每个阶段，断言各阶段
+// 状态栏的段构成（headless，无需真实终端）。
+func TestStatusLineLifecycleMatrix(t *testing.T) {
+	const win = 1000
+	newModel := func() Model {
+		return New(Deps{ModelName: "qwen3", ContextWindow: win})
+	}
+	wide := func(m Model) Model { m.width = 120; return m } // 全段可见的宽度
+
+	// 阶段 1：冷启动（无 usage、空闲）——只有模型名。
+	m := wide(newModel())
+	if s := stripANSI(m.statusLine()); strings.TrimSpace(s) != "qwen3" {
+		t.Fatalf("冷启动 = %q, 只要模型名", s)
+	}
+
+	// 阶段 2：Enter 后 TurnStarted 前——生成中标记（无计时）。
+	m.busy = true
+	s := stripANSI(m.statusLine())
+	if !strings.Contains(s, "* 生成中") {
+		t.Fatalf("Enter 后 = %q, 应含 * 生成中", s)
+	}
+	if strings.Contains(s, "ctx") || strings.Contains(s, "工具") {
+		t.Fatalf("尚无数据不应出现 ctx/工具段: %q", s)
+	}
+
+	// 阶段 3：TurnStarted——计时器出现。
+	m = applyEvent(t, m, agent.TurnStartedEvent{})
+	if !strings.HasSuffix(stripANSI(m.statusLine()), "0s") {
+		t.Fatalf("TurnStarted 后应显示计时: %q", stripANSI(m.statusLine()))
+	}
+
+	// 阶段 4：思考流式中——思考行带计时（视窗内），状态栏不变。
+	m = applyEvent(t, m, agent.ReasonDeltaEvent{Text: "想"})
+	lines := m.streamBlockLines(80)
+	if len(lines) != 1 || !strings.Contains(lines[0], "想") {
+		t.Fatalf("思考行缺失: %v", lines)
+	}
+
+	// 阶段 5：第一个 step 定稿——in/out 与 ctx 出现；工具数未出现。
+	m = applyEvent(t, m,
+		agent.MessageFinalEvent{Text: "", Usage: &provider.Usage{PromptTokens: 500}},
+	)
+	s = stripANSI(m.statusLine())
+	for _, want := range []string{"in 500 out 0", "ctx 50%"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("首 step 后缺 %q: %q", want, s)
+		}
+	}
+	if strings.Contains(s, "工具") {
+		t.Errorf("无工具调用不应有工具段: %q", s)
+	}
+
+	// 阶段 6：工具环中——工具计数随 ToolCallEvent 增长。
+	m = applyEvent(t, m,
+		agent.ToolCallEvent{Name: "read"},
+		agent.ToolCallEvent{Name: "grep"},
+	)
+	if s := stripANSI(m.statusLine()); !strings.Contains(s, "工具 2") {
+		t.Fatalf("两次调用后 = %q, 应含 工具 2", s)
+	}
+	// 工具环中途 ctx% 已按新 step 的 usage 刷新（MessageFinal 更新过）。
+	m.usage = &provider.Usage{PromptTokens: 900}
+	if s := m.ctxPart(); !strings.Contains(s, ansiRed) {
+		t.Errorf("90%% 应红色预警: %q", s)
+	}
+
+	// 阶段 7：turn 结束——busy 段与工具段消失，usage 保留（阶段 6 设的 900）。
+	m = applyEvent(t, m, agent.TurnEndedEvent{StopReason: agent.StopCompleted})
+	s = stripANSI(m.statusLine())
+	if strings.Contains(s, "生成中") || strings.Contains(s, "工具") || strings.HasSuffix(strings.TrimSpace(s), "0s") {
+		t.Errorf("结束后仍残留 busy 段: %q", s)
+	}
+	if !strings.Contains(s, "ctx 90%") {
+		t.Errorf("结束后 usage 应保留: %q", s)
+	}
+
+	// 阶段 8：切模型——usage 重置回纯模型名，等新窗口首个 usage。
+	m = applyEvent(t, m, agent.ModelSwitchedEvent{Name: "glm4", Window: 2000})
+	m = wide(m)
+	if s := stripANSI(m.statusLine()); strings.TrimSpace(s) != "glm4" {
+		t.Fatalf("切换后 = %q, usage 应重置", s)
+	}
+}
