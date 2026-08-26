@@ -223,3 +223,38 @@ func TestNormalizeCwd(t *testing.T) {
 		t.Errorf("NormalizeCwd = %q", got)
 	}
 }
+
+// reasoning chunk 只落盘不投影：DeriveMessages 与崩溃恢复都不消费它。
+func TestReasoningChunksExcludedFromProjection(t *testing.T) {
+	s := newSession(t)
+	s.Append(TypeUserMessage, UserMessageData{Text: "q"})
+	s.Append(TypeAssistantChunk, AssistantChunkData{Delta: "想一半", Kind: ChunkReasoning})
+	s.Append(TypeAssistantChunk, AssistantChunkData{Delta: "答案", Kind: ChunkText})
+	s.Append(TypeAssistantMessage, AssistantMessageData{Text: "答案"})
+	s.EndTurn(StopReasonForTest())
+
+	msgs := s.DeriveMessages()
+	if len(msgs) != 2 {
+		t.Fatalf("msgs = %d: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Content != "q" || msgs[1].Content != "答案" {
+		t.Errorf("投影内容 = %+v", msgs)
+	}
+
+	// 崩溃恢复：悬挂的 reasoning chunk 不得被合成为 interrupted 消息。
+	crashed := newSession(t)
+	crashed.Append(TypeUserMessage, UserMessageData{Text: "q2"})
+	crashed.Append(TypeAssistantChunk, AssistantChunkData{Delta: "只有思考", Kind: ChunkReasoning})
+	crashed.Close()
+
+	recovered, err := Open(crashed.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	for _, env := range recovered.Events() {
+		if env.Type == TypeAssistantMessage {
+			t.Errorf("纯思考悬挂不应合成 assistant/message: %+v", env)
+		}
+	}
+}

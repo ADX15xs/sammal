@@ -115,14 +115,15 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 		opts = append(opts, tea.WithWindowSize(80, 24))
 	}
 	p := tea.NewProgram(tui.New(tui.Deps{
-		ModelName:    modelName,
-		Events:       ag.Events(),
-		Send:         ag.Submit,
-		Abort:        ag.Abort,
-		Slash:        ag.Slash,
-		Models:       ag.ModelNames,
-		EditorCmd:    editorCommand(cfg.UI.Editor),
-		StartupHints: missingAPIKeyHints(cfg, secrets, config.EnvFile(configPath)),
+		ModelName:     modelName,
+		Events:        ag.Events(),
+		Send:          ag.Submit,
+		Abort:         ag.Abort,
+		Slash:         ag.Slash,
+		Models:        ag.ModelNames,
+		EditorCmd:     editorCommand(cfg.UI.Editor),
+		ContextWindow: modelCfg.ContextWindow,
+		StartupHints:  missingAPIKeyHints(cfg, secrets, config.EnvFile(configPath)),
 	}), opts...)
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("启动 TUI 失败：%w", err)

@@ -232,7 +232,7 @@ type Provider interface {
 
 type Chunk struct {
     TextDelta    string          // 文本增量
-    ReasonDelta  string          // reasoning_content / reasoning 双字段兼容
+    ReasonDelta  string          // reasoning_content / reasoning 双字段兼容；落日志不投影（8.3）
     ToolCallDelta ToolCallDelta  // tool_calls 增量（按 index 聚合）
     Usage        *Usage          // finish 前保证送达；透出缓存命中字段
     FinishReason string
@@ -339,7 +339,7 @@ func ForTUI(r Result) string
 // 事件类型（envelope 统一：seq / ts / type / data）
 session/header                          // 会话身份与初始预设
 user/message        {"text":"..."}
-assistant/chunk     {"delta":"..."}     // 流式增量（UI 保真）
+assistant/chunk     {"delta":"...","kind":"text|reasoning"}  // 流式增量（UI 保真）；reasoning 落日志不投影
 assistant/message   {"text":"...","toolCalls":[...],"interrupted":false}
 tool/call           {"id":"...","name":"edit","args":{...}}
 tool/result         {"id":"...","canonical":{...}}     // I5：canonical 入日志
@@ -466,8 +466,9 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 ### 8.3 流式渲染行为
 
 - 文本/思考增量：只更新"当前流式块"（可变区），定稿时一次性追加进滚动缓冲区
+- 思考（reasoning）：只渲染**最新一行**暗色文字 + 计时器（缓解等待焦虑的最小口子，dsh 方案）；思考块闭合即整行撤出视窗，不留摘要。全文经 `assistant/chunk kind=reasoning` 落日志（人类回看），**不进模型投影**——发给模型的历史不含思考
 - 工具调用：`tool/call` 到达时输出一行摘要（工具名 + 参数摘要）；`tool/result` 到达时追加投影（截断至可读长度）
-- 状态行：当前模型、token 用量、缓存命中指标（I2 的可观测出口）
+- 状态行：当前模型、token 用量、缓存命中指标（I2 的可观测出口）、上下文窗口占用 `ctx %`（≥70% 黄、≥80% 压缩触发线红）、生成中显示 turn 计时与本轮工具调用数。空间不足时按丢弃优先级从右往左裁剪：ctx → in/out → cache → 计时器 → 工具数；模型名与生成中标记永不丢
 
 ---
 

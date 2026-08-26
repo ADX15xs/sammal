@@ -52,8 +52,15 @@ type UserMessageData struct {
 	Text string `json:"text"`
 }
 
+// chunk kind 常量：assistant/chunk 的流增量类别。空值 = text（旧日志兼容）。
+const (
+	ChunkText      = "text"
+	ChunkReasoning = "reasoning"
+)
+
 type AssistantChunkData struct {
 	Delta string `json:"delta"`
+	Kind  string `json:"kind,omitempty"` // text | reasoning（思考只落盘，不进模型投影）
 }
 
 type AssistantMessageData struct {
@@ -214,6 +221,9 @@ func (s *Session) recoverTail() {
 		case TypeAssistantChunk:
 			var d AssistantChunkData
 			json.Unmarshal(env.Data, &d)
+			if d.Kind == ChunkReasoning {
+				continue // 思考增量不进投影：模型可见内容不含思考（I1/I5）
+			}
 			chunkText.WriteString(d.Delta)
 		case TypeAssistantMessage:
 			chunkText.Reset()
@@ -358,6 +368,12 @@ func (p *projector) apply(env Envelope) {
 			}
 		}
 		p.msgs = kept
+	case TypeAssistantChunk:
+		var d AssistantChunkData
+		json.Unmarshal(env.Data, &d)
+		if d.Kind == ChunkReasoning {
+			return // 思考增量只落盘不投影：发给模型的历史不含思考（I5）
+		}
 	case TypeUserMessage:
 		var d UserMessageData
 		json.Unmarshal(env.Data, &d)

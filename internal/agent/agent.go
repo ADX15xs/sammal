@@ -31,6 +31,9 @@ type MessageFinalEvent struct {
 	Interrupted bool
 	Usage       *provider.Usage
 }
+// ReasonFinalEvent 标志思考块闭合（文本答案开始或 step 结束）：TUI 据此
+// 把流式思考行撤出视窗。不携带全文——全文已随增量流出，只落日志。
+type ReasonFinalEvent struct{}
 type ToolCallEvent struct {
 	ID          string
 	Name        string
@@ -48,11 +51,15 @@ type TurnEndedEvent struct {
 }
 type ErrorEvent struct{ Err error }
 type StatusEvent struct{ Text string }
-type ModelSwitchedEvent struct{ Name string }
+type ModelSwitchedEvent struct {
+	Name   string
+	Window int // 切换后的上下文窗口（TUI 状态栏 ctx% 用；0 = 未知）
+}
 
 func (TurnStartedEvent) eventType()     {}
 func (TextDeltaEvent) eventType()       {}
 func (ReasonDeltaEvent) eventType()     {}
+func (ReasonFinalEvent) eventType()     {}
 func (MessageFinalEvent) eventType()    {}
 func (ToolCallEvent) eventType()        {}
 func (ToolResultEvent) eventType()      {}
@@ -185,7 +192,7 @@ func (a *Agent) switchModel(name string) ([]string, error) {
 	a.retries = spec.Retries
 	a.modelName = name
 	a.model = spec.ModelID
-	a.emit(ModelSwitchedEvent{Name: name})
+	a.emit(ModelSwitchedEvent{Name: name, Window: spec.Window})
 	return []string{fmt.Sprintf("已切换到 %s：历史完整保留；模型隔离，KV 缓存已重建", name)}, nil
 }
 
@@ -351,6 +358,7 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 		}
 
 		var streamErr error
+		reasoningOpen := false
 	consume:
 		for ck := range ch {
 			switch {
@@ -358,16 +366,27 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 				streamErr = ck.Err
 				break consume
 			case ck.TextDelta != "":
+				if reasoningOpen {
+					reasoningOpen = false
+					a.emit(ReasonFinalEvent{})
+				}
 				text.WriteString(ck.TextDelta)
 				a.emit(TextDeltaEvent{Text: ck.TextDelta})
-				a.sess.Append(session.TypeAssistantChunk, session.AssistantChunkData{Delta: ck.TextDelta})
+				a.sess.Append(session.TypeAssistantChunk, session.AssistantChunkData{Delta: ck.TextDelta, Kind: session.ChunkText})
 			case ck.ReasonDelta != "":
+				reasoningOpen = true
 				a.emit(ReasonDeltaEvent{Text: ck.ReasonDelta})
+				// 思考增量只落盘（人类回看），不进模型投影——发给模型的
+				// assistant/message 不含 reasoning_content（I5 分离）。
+				a.sess.Append(session.TypeAssistantChunk, session.AssistantChunkData{Delta: ck.ReasonDelta, Kind: session.ChunkReasoning})
 			case ck.ToolCallDelta != nil:
 				toolCalls = appendToolDelta(toolCalls, ck.ToolCallDelta)
 			case ck.Usage != nil:
 				usage = ck.Usage
 			}
+		}
+		if reasoningOpen {
+			a.emit(ReasonFinalEvent{})
 		}
 
 		if streamErr == nil {

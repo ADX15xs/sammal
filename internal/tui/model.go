@@ -15,6 +15,7 @@ import (
 	"github.com/rivo/uniseg"
 
 	"sammal/internal/agent"
+	"sammal/internal/compaction"
 	"sammal/internal/provider"
 	"sammal/internal/tool"
 )
@@ -29,6 +30,9 @@ type Deps struct {
 	Slash     func(text string) []string
 	Models    func() []string
 	EditorCmd func(path string) (*exec.Cmd, error)
+	// ContextWindow 当前模型的上下文窗口（token）；0 = 未知，状态栏不显示
+	// ctx 百分比。
+	ContextWindow int
 	// StartupHints 启动即打印的提示行（滚动区常驻，如 api_key_env 缺失警告）。
 	StartupHints []string
 }
@@ -48,8 +52,15 @@ type Model struct {
 	busy      bool
 	stream    *strings.Builder // 当前流式块（可变区）
 	thinking  bool
+	reason    string // 思考最新行（流式展示用，定稿即弃）
 	usage     *provider.Usage
 	modelName string
+
+	turnStart    time.Time // 当前 turn 开始时刻（0 = 无进行中 turn）
+	toolCalls    int       // 本轮已执行的工具调用数（生成中显示）
+	windowTokens int       // 上下文窗口大小（0 = 不显示 ctx%）
+	ctxWarned    bool      // ctx ≥ 压缩阈值时只告警一次
+	tickArmed    bool      // 心跳去重：至多一个未触发的 turnTick
 
 	history   []string
 	histDepth int // 0 = 实时输入；>0 = 正在翻阅的第 N 条历史
@@ -61,7 +72,7 @@ type Model struct {
 }
 
 func New(deps Deps) Model {
-	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}}
+	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}, windowTokens: deps.ContextWindow}
 }
 
 // InputText 返回当前输入内容（测试用）。
@@ -77,6 +88,7 @@ func (m Model) Init() tea.Cmd {
 
 type agentEventMsg struct{ ev agent.Event }
 type agentClosedMsg struct{}
+type turnTickMsg struct{} // 生成中的每秒心跳：刷新计时器/思考行动画
 
 func listenAgent(ch <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
@@ -103,6 +115,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentEventMsg:
 		return m.applyAgentEvent(msg.ev)
+
+	case turnTickMsg:
+		return m.turnTick()
 
 	case editorDoneMsg:
 		return m.editorDone(msg)
@@ -344,18 +359,35 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	switch ev := ev.(type) {
 	case agent.TurnStartedEvent:
 		m.busy = true
+		m.turnStart = time.Now()
+		m.toolCalls = 0
+		m.ctxWarned = false
+		cmd = m.armTick()
 
 	case agent.TextDeltaEvent:
+		if m.thinking {
+			// 文本开始：思考行即刻让位（ReasonFinal 已保证，此处兜底）。
+			m.thinking = false
+			m.reason = ""
+		}
 		m.stream.WriteString(ev.Text)
 
 	case agent.ReasonDeltaEvent:
 		m.thinking = true
+		m.reason = lastLine(ev.Text)
+		cmd = m.armTick()
+
+	case agent.ReasonFinalEvent:
+		m.thinking = false
+		m.reason = ""
 
 	case agent.StreamRestartedEvent:
 		m.stream.Reset()
 		m.thinking = false
+		m.reason = ""
 
 	case agent.ToolCallEvent:
+		m.toolCalls++
 		cmd = tea.Println(dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
 
 	case agent.ToolResultEvent:
@@ -364,6 +396,10 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.MessageFinalEvent:
 		m.stream.Reset()
 		m.thinking = false
+		m.reason = ""
+		if ev.Usage != nil {
+			m.usage = ev.Usage // 多 step 工具环中 ctx% 随每个 step 更新
+		}
 		if ev.Interrupted {
 			cmd = tea.Println(dim(renderInterrupted(ev.Text)))
 		} else {
@@ -373,18 +409,29 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.TurnEndedEvent:
 		m.busy = false
 		m.thinking = false
+		m.reason = ""
+		m.turnStart = time.Time{}
 		if ev.Usage != nil {
 			m.usage = ev.Usage
+		}
+		var warn tea.Cmd
+		if ev.StopReason != agent.StopAborted {
+			warn = m.warnContextPressure()
 		}
 		if ev.StopReason == agent.StopAborted {
 			cmd = tea.Println(dim("（已中止）"))
 		}
+		cmd = tea.Batch(listenAgent(m.deps.Events), cmd, warn)
+		return m, cmd
 
 	case agent.StatusEvent:
 		cmd = tea.Println(dim("| " + ev.Text))
 
 	case agent.ModelSwitchedEvent:
 		m.modelName = ev.Name
+		m.windowTokens = ev.Window
+		m.usage = nil        // 新窗口下旧百分比无意义，等首个 usage 重建
+		m.ctxWarned = false
 
 	case agent.ErrorEvent:
 		cmd = tea.Println(errStyle(ev.Err.Error()))
@@ -392,11 +439,58 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(listenAgent(m.deps.Events), cmd)
 }
 
+// armTick 生成中挂一个每秒心跳，驱动计时器与思考行的刷新。
+// tickArmed 去重：事件高频到达时（每个 reasoning 增量都会尝试挂表），
+// 保证任意时刻至多一个未触发的 tick，否则定时器指数堆积。
+func (m Model) armTick() tea.Cmd {
+	if !m.busy || m.tickArmed {
+		return nil
+	}
+	m.tickArmed = true
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return turnTickMsg{} })
+}
+
+// turnTick 心跳：busy 期间自续，空闲时终止。
+func (m Model) turnTick() (tea.Model, tea.Cmd) {
+	m.tickArmed = false
+	if !m.busy {
+		return m, nil
+	}
+	return m, m.armTick()
+}
+
+// warnContextPressure 投影逼近压缩触发线时提示一次（把「下一轮要压缩、
+// 会变慢且缓存重建」提前解释给用户）。TurnEnded 时判定，一轮只报一次。
+func (m Model) warnContextPressure() tea.Cmd {
+	if m.windowTokens <= 0 || m.usage == nil {
+		return nil
+	}
+	if r := float64(m.usage.PromptTokens) / float64(m.windowTokens); r >= compaction.TriggerRatio && !m.ctxWarned {
+		m.ctxWarned = true
+		return tea.Println(dim(fmt.Sprintf("| 上下文已达窗口 %d%%（压缩触发线 %d%%）：下一轮可能自动压缩并重建 KV 缓存",
+			int(r*100), int(compaction.TriggerRatio*100))))
+	}
+	return nil
+}
+
+// lastLine 返回文本最后一个非空行（思考流式只展示最新一行）。
+func lastLine(s string) string {
+	s = strings.TrimRight(s, "\n")
+	if i := strings.LastIndex(s, "\n"); i >= 0 {
+		s = s[i+1:]
+	}
+	return s
+}
+
 const (
-	ansiDim   = "\x1b[2m"
-	ansiCyan  = "\x1b[36m"
-	ansiRed   = "\x1b[31m"
-	ansiReset = "\x1b[0m"
+	ansiDim    = "\x1b[2m"
+	ansiCyan   = "\x1b[36m"
+	ansiRed    = "\x1b[31m"
+	ansiYellow = "\x1b[33m"
+	ansiReset  = "\x1b[0m"
+
+	// warnRatio ctx% 变黄预警线（压缩触发线 compaction.TriggerRatio 变红）。
+	warnRatio = 0.7
 )
 
 func dim(s string) string      { return ansiDim + s + ansiReset }
@@ -479,7 +573,21 @@ func (m Model) pickerLines(width int) []string {
 func (m Model) streamBlockLines(width int) []string {
 	var lines []string
 	if m.thinking {
-		lines = append(lines, dim("- 思考中..."))
+		// 思考只展示最新一行（dsh 方案）：恒定一行的自绘面 + 跳动的计时
+		// 数字就是「还活着」的口子。定稿即从视窗丢弃，全文在日志里。
+		line := "- 思考中"
+		if m.turnStart.After(time.Time{}) {
+			line = fmt.Sprintf("- 思考中 %s", formatElapsed(time.Since(m.turnStart)))
+		}
+		if m.reason != "" {
+			candidate := line + " | " + strings.ReplaceAll(m.reason, "\t", " ")
+			if w := widthOf(candidate); w > width-2 {
+				candidate = clipLine(candidate, width-1)
+			}
+			lines = append(lines, dim(candidate))
+		} else {
+			lines = append(lines, dim(clipLine(line, width-1)))
+		}
 	}
 	text := m.stream.String()
 	if text == "" {
@@ -502,18 +610,98 @@ func (m Model) streamBlockLines(width int) []string {
 	return lines
 }
 
+// formatElapsed 把时长渲染为紧凑形式（38s / 2m14s / 1h02m）。
+func formatElapsed(d time.Duration) string {
+	d = d.Round(time.Second)
+	s := int(d.Seconds())
+	switch {
+	case s < 60:
+		return fmt.Sprintf("%ds", s)
+	case s < 3600:
+		return fmt.Sprintf("%dm%02ds", s/60, s%60)
+	default:
+		return fmt.Sprintf("%dh%02dm", s/3600, (s%3600)/60)
+	}
+}
+
+// statusSeg 是状态栏的一个显示段。
+type statusSeg struct {
+	text string // 已着色的最终文本
+	pri  int    // 丢弃优先级：越大越先丢
+}
+
+// statusLine 状态栏。空间不足时按优先级从右往左丢弃：ctx → in/out →
+// cache → 计时器 → 工具数（模型名与生成中标记永不丢）。
 func (m Model) statusLine() string {
-	parts := []string{m.deps.ModelName}
+	segs := []statusSeg{{text: m.modelName}}
 	if m.usage != nil {
-		parts = append(parts, fmt.Sprintf("in %d out %d", m.usage.PromptTokens, m.usage.CompletionTokens))
-		if r := m.usage.CacheHitRatio(); r >= 0 {
-			parts = append(parts, fmt.Sprintf("cache %d%%", int(r*100)))
+		segs = append(segs,
+			statusSeg{text: fmt.Sprintf("in %d out %d", m.usage.PromptTokens, m.usage.CompletionTokens), pri: 2},
+			statusSeg{text: m.cachePart(), pri: 3},
+			statusSeg{text: m.ctxPart(), pri: 1},
+		)
+	}
+	if m.busy && m.toolCalls > 0 {
+		segs = append(segs, statusSeg{text: fmt.Sprintf("工具 %d", m.toolCalls), pri: 5})
+	}
+	if m.busy && m.turnStart.After(time.Time{}) {
+		segs = append(segs, statusSeg{text: "* " + formatElapsed(time.Since(m.turnStart)), pri: 4})
+	} else if m.busy {
+		segs = append(segs, statusSeg{text: "* 生成中"})
+	}
+
+	width := m.width
+	if width < 20 {
+		width = 20
+	}
+	const separator = " | "
+	budget := width - 3 // 行首空格 + 安全边距
+	for widthOf(strings.Join(segTexts(segs), separator)) > budget && len(segs) > 1 {
+		drop := -1
+		for i := len(segs) - 1; i >= 1; i-- { // segs[0] 模型名永不丢；并列时丢更靠右的
+			if drop == -1 || segs[i].pri >= segs[drop].pri {
+				drop = i
+			}
 		}
+		segs = append(segs[:drop], segs[drop+1:]...)
 	}
-	if m.busy {
-		parts = append(parts, "* 生成中")
+	return dim(" " + strings.Join(segTexts(segs), separator))
+}
+
+func segTexts(segs []statusSeg) []string {
+	out := make([]string, len(segs))
+	for i, s := range segs {
+		out[i] = s.text
 	}
-	return dim(" " + strings.Join(parts, " | "))
+	return out
+}
+
+// cachePart 缓存命中率段（无数据返回空串）。
+func (m Model) cachePart() string {
+	if r := m.usage.CacheHitRatio(); r >= 0 {
+		return fmt.Sprintf("cache %d%%", int(r*100))
+	}
+	return ""
+}
+
+// ctxPart 上下文窗口占用百分比；逼近压缩触发线时变色预警。
+// 无 usage 或未知窗口时返回空串（调用方过滤）。
+// 变色段自带完整包裹（color+reset），嵌入外层 dim 文本时会终止 dim——
+// 有意为之：预警色必须盖过 dim。
+func (m Model) ctxPart() string {
+	if m.windowTokens <= 0 || m.usage == nil || m.usage.PromptTokens <= 0 {
+		return ""
+	}
+	r := float64(m.usage.PromptTokens) / float64(m.windowTokens)
+	pct := fmt.Sprintf("ctx %d%%", int(r*100))
+	switch {
+	case r >= compaction.TriggerRatio:
+		return ansiRed + pct + ansiReset
+	case r >= warnRatio:
+		return ansiYellow + pct + ansiReset
+	default:
+		return pct
+	}
 }
 
 // clipLine 超宽行截断到 width（按显示宽度，避免宽字符截半）。
