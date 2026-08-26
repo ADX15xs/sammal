@@ -137,6 +137,7 @@ func New(cfg Config) *Agent {
 	if root == nil { // 测试与库形态兜底；main 恒传可取消的 rootCtx
 		root = context.Background()
 	}
+	modelID, modelName := resolveModel(cfg)
 	a := &Agent{
 		root:      root,
 		prov:      cfg.Provider,
@@ -147,8 +148,8 @@ func New(cfg Config) *Agent {
 		dataRoot:  cfg.DataRoot,
 		window:    cfg.ContextWindow,
 		retries:   cfg.Retries,
-		model:     cfg.Session.Header().Model,
-		modelName: currentModelName(cfg),
+		model:     modelID,
+		modelName: modelName,
 		events:    make(chan Event, eventsBuffer),
 		inbox:     make(chan string, 16),
 	}
@@ -160,18 +161,20 @@ func New(cfg Config) *Agent {
 	return a
 }
 
-func currentModelName(cfg Config) string {
-	sessionModel := cfg.Session.Header().Model
-	if len(cfg.Models) > 0 {
-		for _, m := range cfg.Models {
-			if m.ModelID == sessionModel {
-				return m.Name
-			}
+// resolveModel 依据 session header 记录的模型配置键，还原 (端点 model,
+// 配置键)。配置键是唯一身份：同一端点 model 字符串可被多个配置复用（如
+// 多个中转站都转发 deepseek-v4-flash），按 ModelID 反查必然歧义。
+func resolveModel(cfg Config) (modelID, modelName string) {
+	name := cfg.Session.Header().Model
+	for _, m := range cfg.Models {
+		if m.Name == name {
+			return m.ModelID, m.Name
 		}
-		// 兜底：session model 不在配置列表中，返回第一个配置模型
-		return cfg.Models[0].Name
 	}
-	return sessionModel
+	if len(cfg.Models) > 0 { // 兜底：旧会话或配置改名，取第一个配置模型
+		return cfg.Models[0].ModelID, cfg.Models[0].Name
+	}
+	return name, name
 }
 
 func (a *Agent) Model() string             { return a.model }

@@ -74,7 +74,7 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	sess, err := session.Create(root, session.Header{
 		ID:      session.NewID(),
 		Cwd:     cwd,
-		Model:   modelCfg.Model,
+		Model:   modelName,
 		Created: facts.Date + "T00:00:00Z",
 		OS:      facts.OS,
 		Shell:   facts.Shell,

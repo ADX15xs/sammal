@@ -3,10 +3,14 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"sammal/internal/provider"
+	"sammal/internal/session"
+	"sammal/internal/tool"
 )
 
 // M3 切换语义：历史 carried、请求 model ID 随切、KV 重建如实提示、
@@ -105,5 +109,44 @@ func TestModelList(t *testing.T) {
 	out = fx.ag.Slash("/model nope")
 	if len(out) != 1 || !strings.Contains(out[0], "未定义") {
 		t.Fatalf("未定义模型输出 = %v", out)
+	}
+}
+
+// 同名端点 model（如 deepseek 与 sensenova-dsv4f 都转发 deepseek-v4-flash）
+// 时，按 ModelID 反查会歧义；会话 header 记录配置键，启动即还原正确身份。
+func TestModelNameResolvesByConfigKey(t *testing.T) {
+	dir := t.TempDir()
+	work := filepath.Join(dir, "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, "data")
+	facts := PromptFacts{Cwd: work, OS: "linux", Shell: "sh", Date: "2026-08-23"}
+	sess, err := session.Create(root, session.Header{
+		ID: session.NewID(), Cwd: work, Model: "beta", // header 记录配置键
+		Created: "2026-08-23T00:00:00Z", OS: facts.OS, Shell: facts.Shell,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	fp := &fakeProvider{}
+	ag := New(Config{
+		Root: context.Background(), Provider: fp, Session: sess,
+		Registry: tool.NewRegistry(), System: BuildSystemPrompt(facts),
+		Models: []ModelSpec{
+			{Name: "alpha", ModelID: "shared", Client: fp},
+			{Name: "beta", ModelID: "shared", Client: fp},
+		},
+	})
+	if ag.Model() != "shared" {
+		t.Errorf("端点 model = %q", ag.Model())
+	}
+	if out := ag.Slash("/model"); !strings.Contains(strings.Join(out, "\n"), "* beta") {
+		t.Errorf("/model 列表 = %v", out)
+	}
+	if out := ag.Slash("/model alpha"); len(out) != 1 || !strings.Contains(out[0], "已切换") {
+		t.Errorf("切换 alpha = %v", out)
 	}
 }
