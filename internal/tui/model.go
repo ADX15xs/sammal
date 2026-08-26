@@ -627,7 +627,7 @@ func formatElapsed(d time.Duration) string {
 // statusSeg 是状态栏的一个显示段。
 type statusSeg struct {
 	text string // 已着色的最终文本
-	pri  int    // 丢弃优先级：越大越先丢
+	pri  int    // 丢弃优先级：越大越先丢；负值 = 永不丢（模型名、生成中标记）
 }
 
 // statusLine 状态栏。空间不足时按优先级从右往左丢弃：ctx → in/out →
@@ -647,7 +647,7 @@ func (m Model) statusLine() string {
 	if m.busy && m.turnStart.After(time.Time{}) {
 		segs = append(segs, statusSeg{text: "* " + formatElapsed(time.Since(m.turnStart)), pri: 4})
 	} else if m.busy {
-		segs = append(segs, statusSeg{text: "* 生成中"})
+		segs = append(segs, statusSeg{text: "* 生成中", pri: -1}) // 负优先级 = 永不丢
 	}
 
 	width := m.width
@@ -659,9 +659,15 @@ func (m Model) statusLine() string {
 	for widthOf(strings.Join(segTexts(segs), separator)) > budget && len(segs) > 1 {
 		drop := -1
 		for i := len(segs) - 1; i >= 1; i-- { // segs[0] 模型名永不丢；并列时丢更靠右的
+			if segs[i].pri < 0 {
+				continue // 负优先级段（生成中标记）不可丢弃
+			}
 			if drop == -1 || segs[i].pri >= segs[drop].pri {
 				drop = i
 			}
+		}
+		if drop == -1 { // 只剩不可丢段：放弃裁剪，宁可溢出也不丢语义
+			break
 		}
 		segs = append(segs[:drop], segs[drop+1:]...)
 	}

@@ -133,6 +133,15 @@ func TestStatusLineDropOrder(t *testing.T) {
 	if strings.Contains(narrow, "工具") {
 		t.Errorf("窄终端应先丢工具数: %q", narrow)
 	}
+
+	// 空闲段（无 turnStart）的生成中标记永不被裁剪丢弃。
+	m.busy = true
+	m.turnStart = time.Time{}
+	m.width = 16 // 只够 " model | * 生成中"
+	idle := stripANSI(m.statusLine())
+	if !strings.Contains(idle, "* 生成中") {
+		t.Errorf("极窄下生成中标记不应被丢弃: %q", idle)
+	}
 }
 
 func stripANSI(s string) string {
