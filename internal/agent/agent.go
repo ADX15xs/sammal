@@ -148,7 +148,7 @@ func New(cfg Config) *Agent {
 		window:    cfg.ContextWindow,
 		retries:   cfg.Retries,
 		model:     cfg.Session.Header().Model,
-		modelName: firstModelName(cfg),
+		modelName: currentModelName(cfg),
 		events:    make(chan Event, eventsBuffer),
 		inbox:     make(chan string, 16),
 	}
@@ -160,11 +160,18 @@ func New(cfg Config) *Agent {
 	return a
 }
 
-func firstModelName(cfg Config) string {
+func currentModelName(cfg Config) string {
+	sessionModel := cfg.Session.Header().Model
 	if len(cfg.Models) > 0 {
+		for _, m := range cfg.Models {
+			if m.ModelID == sessionModel {
+				return m.Name
+			}
+		}
+		// 兜底：session model 不在配置列表中，返回第一个配置模型
 		return cfg.Models[0].Name
 	}
-	return cfg.Session.Header().Model
+	return sessionModel
 }
 
 func (a *Agent) Model() string             { return a.model }
