@@ -52,7 +52,8 @@ type Model struct {
 	busy      bool
 	stream    *strings.Builder // 当前流式块（可变区）
 	thinking  bool
-	reason    string // 思考最新行（流式展示用，定稿即弃）
+	reason    strings.Builder // 思考累积文本（定稿即弃，只取最新行渲染）
+	reasonCur string          // 当前未闭合行的缓存（增量里无换行时也要能显示）
 	usage     *provider.Usage
 	modelName string
 
@@ -368,23 +369,23 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if m.thinking {
 			// 文本开始：思考行即刻让位（ReasonFinal 已保证，此处兜底）。
 			m.thinking = false
-			m.reason = ""
+			m.resetReason()
 		}
 		m.stream.WriteString(ev.Text)
 
 	case agent.ReasonDeltaEvent:
 		m.thinking = true
-		m.reason = lastLine(ev.Text)
+		m.appendReason(ev.Text)
 		cmd = m.armTick()
 
 	case agent.ReasonFinalEvent:
 		m.thinking = false
-		m.reason = ""
+		m.resetReason()
 
 	case agent.StreamRestartedEvent:
 		m.stream.Reset()
 		m.thinking = false
-		m.reason = ""
+		m.resetReason()
 
 	case agent.ToolCallEvent:
 		m.toolCalls++
@@ -396,7 +397,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.MessageFinalEvent:
 		m.stream.Reset()
 		m.thinking = false
-		m.reason = ""
+		m.resetReason()
 		if ev.Usage != nil {
 			m.usage = ev.Usage // 多 step 工具环中 ctx% 随每个 step 更新
 		}
@@ -409,7 +410,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.TurnEndedEvent:
 		m.busy = false
 		m.thinking = false
-		m.reason = ""
+		m.resetReason()
 		m.turnStart = time.Time{}
 		if ev.Usage != nil {
 			m.usage = ev.Usage
@@ -439,8 +440,36 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(listenAgent(m.deps.Events), cmd)
 }
 
-// armTick 生成中挂一个每秒心跳，驱动计时器与思考行的刷新。
-// tickArmed 去重：事件高频到达时（每个 reasoning 增量都会尝试挂表），
+// appendReason 追加思考增量并维护「当前行」缓存：增量按 token 到达，
+// 大多不含换行——只有换行时才把缓存行落定、开新行。渲染取当前行，
+// 所以同一行内的每个 token 都能看到流畅的逐词增长（而非只闪最后一个）。
+func (m *Model) appendReason(delta string) {
+	for {
+		if i := strings.IndexByte(delta, '\n'); i >= 0 {
+			m.reasonCur = "" // 行闭合，开新行
+			delta = delta[i+1:]
+			continue
+		}
+		m.reasonCur += delta
+		return
+	}
+}
+
+func (m *Model) resetReason() {
+	m.reason.Reset()
+	m.reasonCur = ""
+}
+
+// reasonLine 当前正在书写的思考行（无内容时回退到累积文本的最后一行，
+// 覆盖首块增量前有历史行的边界）。
+func (m Model) reasonLine() string {
+	if m.reasonCur != "" {
+		return m.reasonCur
+	}
+	return lastLine(m.reason.String())
+}
+
+// armTick 生成中挂一个每秒心跳，驱动计时器与思考行的刷新。// tickArmed 去重：事件高频到达时（每个 reasoning 增量都会尝试挂表），
 // 保证任意时刻至多一个未触发的 tick，否则定时器指数堆积。
 func (m Model) armTick() tea.Cmd {
 	if !m.busy || m.tickArmed {
@@ -579,8 +608,8 @@ func (m Model) streamBlockLines(width int) []string {
 		if m.turnStart.After(time.Time{}) {
 			line = fmt.Sprintf("- 思考中 %s", formatElapsed(time.Since(m.turnStart)))
 		}
-		if m.reason != "" {
-			candidate := line + " | " + strings.ReplaceAll(m.reason, "\t", " ")
+		if cur := m.reasonLine(); cur != "" {
+			candidate := line + " | " + strings.ReplaceAll(cur, "\t", " ")
 			if w := widthOf(candidate); w > width-2 {
 				candidate = clipLine(candidate, width-1)
 			}
@@ -655,23 +684,30 @@ func (m Model) statusLine() string {
 		width = 20
 	}
 	const separator = " | "
-	budget := width - 3 // 行首空格 + 安全边距
+	segs = dropToFit(segs, width-3) // 行首空格 + 安全边距
+	return dim(" " + strings.Join(segTexts(segs), separator))
+}
+
+// dropToFit 超预算时按优先级从右往左逐段丢弃（负优先级段不可丢），
+// 直到塞下或只剩不可丢段——宁可溢出不丢语义。
+func dropToFit(segs []statusSeg, budget int) []statusSeg {
+	const separator = " | "
 	for widthOf(strings.Join(segTexts(segs), separator)) > budget && len(segs) > 1 {
 		drop := -1
 		for i := len(segs) - 1; i >= 1; i-- { // segs[0] 模型名永不丢；并列时丢更靠右的
 			if segs[i].pri < 0 {
-				continue // 负优先级段（生成中标记）不可丢弃
+				continue // 负优先级段不可丢弃
 			}
 			if drop == -1 || segs[i].pri >= segs[drop].pri {
 				drop = i
 			}
 		}
-		if drop == -1 { // 只剩不可丢段：放弃裁剪，宁可溢出也不丢语义
+		if drop == -1 {
 			break
 		}
 		segs = append(segs[:drop], segs[drop+1:]...)
 	}
-	return dim(" " + strings.Join(segTexts(segs), separator))
+	return segs
 }
 
 func segTexts(segs []statusSeg) []string {

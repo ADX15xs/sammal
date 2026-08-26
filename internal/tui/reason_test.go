@@ -38,7 +38,7 @@ func TestReasoningStreamsSingleLineThenDrops(t *testing.T) {
 	m = applyEvent(t, m, agent.ReasonDeltaEvent{Text: "\n第二行思考"})
 	if lines := m.streamBlockLines(m.width); len(lines) != 1 ||
 		!strings.Contains(lines[0], "第二行思考") || strings.Contains(lines[0], "第一行") {
-		t.Fatalf("应只显示最新一行: %q", lines)
+		t.Fatalf("应只显示当前行: %q", lines)
 	}
 
 	m = applyEvent(t, m,
@@ -50,6 +50,43 @@ func TestReasoningStreamsSingleLineThenDrops(t *testing.T) {
 	}
 	if lines := m.streamBlockLines(m.width); len(lines) != 1 || lines[0] != "答案" {
 		t.Fatalf("思考行应撤出视窗，仅剩答案: %q", lines)
+	}
+}
+
+// 逐 token 增长：增量大多不含换行，当前行必须累积显示（而非只闪最后
+// 一个 token）——回归 TestReasoningTokenGrowth 修的 bug。
+func TestReasoningTokenGrowth(t *testing.T) {
+	m := New(Deps{ModelName: "m"})
+	m.width = 80
+	m = applyEvent(t, m, agent.TurnStartedEvent{})
+
+	tokens := []string{"用户", "在", "问", "天气", "，", "需要", "查询"}
+	for _, tk := range tokens {
+		m = applyEvent(t, m, agent.ReasonDeltaEvent{Text: tk})
+		lines := m.streamBlockLines(m.width)
+		if len(lines) != 1 {
+			t.Fatalf("token %q: 行数 = %d", tk, len(lines))
+		}
+		want := ""
+		for _, prev := range tokens {
+			want += prev
+			if prev == tk {
+				break
+			}
+		}
+		if !strings.Contains(lines[0], want) {
+			t.Fatalf("token %q: 应显示累积行 %q, got %q", tk, want, lines[0])
+		}
+	}
+
+	// 换行闭合旧行，新行从空开始累积。
+	m = applyEvent(t, m, agent.ReasonDeltaEvent{Text: "\n"})
+	if lines := m.streamBlockLines(m.width); strings.Contains(lines[0], "查询") {
+		t.Fatalf("换行后不应残留上一行内容: %q", lines[0])
+	}
+	m = applyEvent(t, m, agent.ReasonDeltaEvent{Text: "新的一行"})
+	if lines := m.streamBlockLines(m.width); !strings.Contains(lines[0], "新的一行") {
+		t.Fatalf("新行应正常累积: %q", lines[0])
 	}
 }
 
