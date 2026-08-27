@@ -133,7 +133,7 @@ func TestCrashRecoverySynthesizesClosures(t *testing.T) {
 		t.Fatalf("恢复后投影 = %+v, want %+v", got, want)
 	}
 	for i := range got {
-		if got[i].Role != want[i].Role || got[i].Content != want[i].Content || got[i].ToolCallID != want[i].ToolCallID {
+		if got[i].Role != want[i].Role || provider.ContentText(got[i].Content) != provider.ContentText(want[i].Content) || got[i].ToolCallID != want[i].ToolCallID {
 			t.Errorf("消息 %d: got %+v want %+v", i, got[i], want[i])
 		}
 	}
@@ -174,13 +174,13 @@ func TestDeriveMessagesProjection(t *testing.T) {
 	if len(msgs) != 4 {
 		t.Fatalf("msgs = %d: %+v", len(msgs), msgs)
 	}
-	if msgs[0].Content != "q1" || msgs[1].ToolCalls[0].ID != "c1" {
+	if provider.ContentText(msgs[0].Content) != "q1" || msgs[1].ToolCalls[0].ID != "c1" {
 		t.Errorf("msgs = %+v", msgs)
 	}
-	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "c1" || msgs[2].Content != "1\ta" {
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "c1" || provider.ContentText(msgs[2].Content) != "1\ta" {
 		t.Errorf("tool msg = %+v", msgs[2])
 	}
-	if msgs[3].Content != "done" {
+	if provider.ContentText(msgs[3].Content) != "done" {
 		t.Errorf("last msg = %+v", msgs[3])
 	}
 }
@@ -202,7 +202,7 @@ func TestTruncateBeforeTurn(t *testing.T) {
 		t.Errorf("turn = %d", s.Turn())
 	}
 	msgs := s.DeriveMessages()
-	if len(msgs) != 1 || msgs[0].Content != "t1u" {
+	if len(msgs) != 1 || provider.ContentText(msgs[0].Content) != "t1u" {
 		t.Fatalf("msgs = %+v", msgs)
 	}
 	// 截断后可继续追加，seq 单调不回退（截断后事件唯一编号的前提）。
@@ -237,7 +237,7 @@ func TestReasoningChunksExcludedFromProjection(t *testing.T) {
 	if len(msgs) != 2 {
 		t.Fatalf("msgs = %d: %+v", len(msgs), msgs)
 	}
-	if msgs[0].Content != "q" || msgs[1].Content != "答案" {
+	if provider.ContentText(msgs[0].Content) != "q" || provider.ContentText(msgs[1].Content) != "答案" {
 		t.Errorf("投影内容 = %+v", msgs)
 	}
 

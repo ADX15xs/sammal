@@ -32,7 +32,7 @@ func TestModelPickerHeadless(t *testing.T) {
 	var slashCalls []string
 	deps := Deps{
 		ModelName: "alpha",
-		Send:      func(string) {},
+		Send:      func(string, []string) {},
 		Abort:     func() {},
 		Slash: func(text string) []string {
 			mu.Lock()

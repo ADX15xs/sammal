@@ -5,6 +5,7 @@ package compaction
 
 import (
 	"encoding/json"
+
 	"github.com/mattn/go-runewidth"
 
 	"sammal/internal/provider"
@@ -53,7 +54,7 @@ func EstimateRequest(system string, tools []provider.ToolDef, msgs []provider.Me
 		total += EstimateTokens(t.Function.Description) + EstimateTokens(string(t.Function.Parameters))
 	}
 	for _, m := range msgs {
-		total += EstimateTokens(m.Content) + 8
+		total += EstimateTokens(provider.ContentText(m.Content)) + 8
 		for _, tc := range m.ToolCalls {
 			total += EstimateTokens(tc.Function.Name) + EstimateTokens(tc.Function.Arguments)
 		}

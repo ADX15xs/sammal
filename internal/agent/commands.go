@@ -67,7 +67,7 @@ func (a *Agent) compact(ctx context.Context) error {
 		Model:    a.model,
 		System:   a.system,
 		Tools:    a.reg.Defs(),
-		Messages: append(masked, provider.Message{Role: "user", Content: compaction.SummaryInstruction}),
+		Messages: append(masked, provider.Message{Role: "user", Content: provider.ContentFromText(compaction.SummaryInstruction)}),
 	}
 	a.emit(StatusEvent{Text: "上下文压缩中（遮蔽 seq " + fmt.Sprint(keptFrom-1) + " 之前）..."})
 
@@ -204,6 +204,7 @@ func (a *Agent) Slash(input string) []string {
 		return []string{
 			"/model [name] 切换模型；无参列出可用模型（Ctrl+P 打开选择器）",
 			"/new          开新会话",
+			"/attach <path> 附加图片后提交；无参列出，-clear 清空",
 			"/resume [n]   恢复历史会话；无参列出",
 			"/branch       从当前 turn 分叉探索",
 			"/compact      手动触发上下文压缩",

@@ -22,7 +22,7 @@ func TestTUISmokeHeadless(t *testing.T) {
 	deps := Deps{
 		ModelName: "test-model",
 		Events:    events,
-		Send: func(text string) {
+		Send: func(text string, images []string) {
 			mu.Lock()
 			sent = append(sent, text)
 			mu.Unlock()

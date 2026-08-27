@@ -4,14 +4,44 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 )
+
+// ContentPart 是多模态消息内容的一个片段。
+type ContentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *ImageURL `json:"image_url,omitempty"`
+}
+
+// ImageURL 表示图片 URL 或 base64 data URI。
+type ImageURL struct {
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"`
+}
 
 // Message 是模型历史的内存形态；序列化字段顺序即 JSON 键序（I2 依赖确定性）。
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role       string        `json:"role"`
+	Content    []ContentPart `json:"content"`
+	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+}
+
+// ContentFromText 把纯文本包装为单 text part 的 content 数组。
+func ContentFromText(s string) []ContentPart {
+	return []ContentPart{{Type: "text", Text: s}}
+}
+
+// ContentText 把 content 数组的 text part 拼接为单一字符串。
+func ContentText(parts []ContentPart) string {
+	var b strings.Builder
+	for _, p := range parts {
+		if p.Type == "text" {
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
 }
 
 // ToolCall 是聚合完成的工具调用（assistant 消息携带，或来自日志重放）。
@@ -51,7 +81,7 @@ type Request struct {
 
 type wireMessage struct {
 	Role       string         `json:"role"`
-	Content    string         `json:"content"`
+	Content    []ContentPart  `json:"content"`
 	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 }
@@ -81,7 +111,7 @@ type wireRequest struct {
 
 func toWireMessages(r Request) []wireMessage {
 	msgs := make([]wireMessage, 0, len(r.Messages)+1)
-	msgs = append(msgs, wireMessage{Role: "system", Content: r.System})
+	msgs = append(msgs, wireMessage{Role: "system", Content: ContentFromText(r.System)})
 	for _, m := range r.Messages {
 		wm := wireMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {

@@ -57,7 +57,7 @@ func TestCompactionTriggeredAndPrefixReplay(t *testing.T) {
 		}
 	}
 	last := summaryReq.Messages[len(summaryReq.Messages)-1]
-	if last.Role != "user" || !strings.Contains(last.Content, "结构化简报") {
+	if last.Role != "user" || !strings.Contains(provider.ContentText(last.Content), "结构化简报") {
 		t.Errorf("摘要指令缺失: %+v", last)
 	}
 
@@ -79,11 +79,11 @@ func TestCompactionTriggeredAndPrefixReplay(t *testing.T) {
 
 	// 压缩后请求以 <compacted-summary> 开头。
 	post := fp.calls[4]
-	if len(post.Messages) == 0 || !strings.HasPrefix(post.Messages[0].Content, "<compacted-summary>") {
+	if len(post.Messages) == 0 || !strings.HasPrefix(provider.ContentText(post.Messages[0].Content), "<compacted-summary>") {
 		t.Fatalf("压缩后首消息 = %+v", post.Messages[0])
 	}
-	if !strings.Contains(post.Messages[0].Content, "当前任务测试") {
-		t.Errorf("摘要内容未进入投影: %q", post.Messages[0].Content)
+	if !strings.Contains(provider.ContentText(post.Messages[0].Content), "当前任务测试") {
+		t.Errorf("摘要内容未进入投影: %q", provider.ContentText(post.Messages[0].Content))
 	}
 
 	// I1：压缩后重放哈希仍一致。
@@ -155,7 +155,7 @@ func TestNewResumeBranch(t *testing.T) {
 		t.Fatalf("恢复到了错误会话: %s", fx.ag.sess.Header().ID)
 	}
 	msgs := fx.ag.sess.DeriveMessages()
-	if len(msgs) != 2 || msgs[0].Content != "hello A" {
+	if len(msgs) != 2 || provider.ContentText(msgs[0].Content) != "hello A" {
 		t.Fatalf("恢复后历史 = %+v", msgs)
 	}
 
@@ -191,7 +191,7 @@ func TestCrashedSessionResumeContinues(t *testing.T) {
 	}
 	msgs := recovered.DeriveMessages()
 	// [user q, assistant partial(interrupted)]
-	if len(msgs) != 2 || msgs[1].Content != "partial" {
+	if len(msgs) != 2 || provider.ContentText(msgs[1].Content) != "partial" {
 		t.Fatalf("恢复后历史 = %+v", msgs)
 	}
 

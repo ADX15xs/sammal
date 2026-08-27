@@ -49,7 +49,8 @@ type Envelope struct {
 }
 
 type UserMessageData struct {
-	Text string `json:"text"`
+	Text   string   `json:"text"`
+	Images []string `json:"images,omitempty"` // 仅存文件名，不存 base64（避免 JSONL 膨胀）
 }
 
 // chunk kind 常量：assistant/chunk 的流增量类别。空值 = text（旧日志兼容）。
@@ -377,12 +378,12 @@ func (p *projector) apply(env Envelope) {
 	case TypeUserMessage:
 		var d UserMessageData
 		json.Unmarshal(env.Data, &d)
-		p.msgs = append(p.msgs, taggedMessage{msg: provider.Message{Role: "user", Content: d.Text}, turn: cur, seq: env.Seq})
+		p.msgs = append(p.msgs, taggedMessage{msg: provider.Message{Role: "user", Content: provider.ContentFromText(d.Text)}, turn: cur, seq: env.Seq})
 	case TypeAssistantMessage:
 		var d AssistantMessageData
 		json.Unmarshal(env.Data, &d)
 		p.msgs = append(p.msgs, taggedMessage{
-			msg:  provider.Message{Role: "assistant", Content: d.Text, ToolCalls: d.ToolCalls},
+			msg:  provider.Message{Role: "assistant", Content: provider.ContentFromText(d.Text), ToolCalls: d.ToolCalls},
 			turn: cur, seq: env.Seq,
 		})
 	case TypeToolResult:
@@ -391,7 +392,7 @@ func (p *projector) apply(env Envelope) {
 		p.msgs = append(p.msgs, taggedMessage{
 			msg: provider.Message{
 				Role: "tool", ToolCallID: d.ID,
-				Content: tool.ForModel(d.Canonical, modelToolBudget),
+				Content: provider.ContentFromText(tool.ForModel(d.Canonical, modelToolBudget)),
 			},
 			turn: cur, seq: env.Seq,
 		})
@@ -404,14 +405,18 @@ func (p *projector) messages() []provider.Message {
 	if p.summary != "" {
 		out = append(out, provider.Message{
 			Role:    "user",
-			Content: "<compacted-summary>\n" + p.summary + "\n</compacted-summary>",
+			Content: provider.ContentFromText("<compacted-summary>\n" + p.summary + "\n</compacted-summary>"),
 		})
 	}
 	for _, tm := range p.msgs {
-		if tm.msg.Role == "tool" && tm.turn <= p.turn-1 && len(tm.msg.Content) > pruneThreshold {
-			tm.msg.Content = tm.msg.Content[:pruneHead] +
-				fmt.Sprintf("\n...[pruned %d chars]...\n", len(tm.msg.Content)-pruneHead-pruneTail) +
-				tm.msg.Content[len(tm.msg.Content)-pruneTail:]
+		if tm.msg.Role == "tool" && tm.turn <= p.turn-1 {
+			// 工具结果恒为单 text part（投影自 ForModel），直接按字符串剪。
+			if s := provider.ContentText(tm.msg.Content); len(s) > pruneThreshold {
+				s = s[:pruneHead] +
+					fmt.Sprintf("\n...[pruned %d chars]...\n", len(s)-pruneHead-pruneTail) +
+					s[len(s)-pruneTail:]
+				tm.msg.Content = provider.ContentFromText(s)
+			}
 		}
 		out = append(out, tm.msg)
 	}

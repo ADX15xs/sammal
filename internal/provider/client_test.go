@@ -318,14 +318,14 @@ func TestRequestWireFormat(t *testing.T) {
 		Model:  "qwen3:32b",
 		System: "You are Sammal.",
 		Messages: []Message{
-			{Role: "user", Content: "hi"},
+			{Role: "user", Content: ContentFromText("hi")},
 			{Role: "assistant", ToolCalls: []ToolCall{{
 				ID:       "c1",
 				Type:     ToolTypeFunction,
 				Function: FunctionCall{Name: "read", Arguments: `{"path":"a"}`},
 			}}},
-			{Role: "tool", ToolCallID: "c1", Content: "1\ta"},
-			{Role: "user", Content: "go on"},
+			{Role: "tool", ToolCallID: "c1", Content: ContentFromText("1\ta")},
+			{Role: "user", Content: ContentFromText("go on")},
 		},
 		Tools: []ToolDef{{
 			Type: ToolTypeFunction,
@@ -344,11 +344,11 @@ func TestRequestWireFormat(t *testing.T) {
 	for range ch {
 	}
 
-	want := `{"model":"qwen3:32b","messages":[{"role":"system","content":"You are Sammal."},` +
-		`{"role":"user","content":"hi"},` +
-		`{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]},` +
-		`{"role":"tool","content":"1\ta","tool_call_id":"c1"},` +
-		`{"role":"user","content":"go on"}],` +
+	want := `{"model":"qwen3:32b","messages":[{"role":"system","content":[{"type":"text","text":"You are Sammal."}]},` +
+		`{"role":"user","content":[{"type":"text","text":"hi"}]},` +
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]},` +
+		`{"role":"tool","content":[{"type":"text","text":"1\ta"}],"tool_call_id":"c1"},` +
+		`{"role":"user","content":[{"type":"text","text":"go on"}]}],` +
 		`"tools":[{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object"}}}],` +
 		`"stream":true,"stream_options":{"include_usage":true}}`
 	if string(body) != want {
@@ -366,7 +366,7 @@ func TestRequestWireFormat(t *testing.T) {
 	if h1 != h2 || len(h1) != 64 {
 		t.Errorf("PrefixHash unstable: %s vs %s", h1, h2)
 	}
-	if !strings.HasPrefix(string(b1), `{"model":"qwen3:32b","messages":[{"role":"system","content":"You are Sammal."}`) {
+	if !strings.HasPrefix(string(b1), `{"model":"qwen3:32b","messages":[{"role":"system","content":[{"type":"text","text":"You are Sammal."}]}`) {
 		t.Error("static prefix must lead the body")
 	}
 }

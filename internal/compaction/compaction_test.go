@@ -25,7 +25,7 @@ func TestEstimateTokens(t *testing.T) {
 }
 
 func TestOverThreshold(t *testing.T) {
-	msgs := []provider.Message{{Role: "user", Content: strings.Repeat("a", 8000)}}
+	msgs := []provider.Message{{Role: "user", Content: provider.ContentFromText(strings.Repeat("a", 8000))}}
 	if !OverThreshold("sys", nil, msgs, 800) {
 		t.Error("8000 chars 应触发 800 窗口阈值")
 	}

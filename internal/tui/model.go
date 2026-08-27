@@ -25,7 +25,7 @@ import (
 type Deps struct {
 	ModelName string
 	Events    <-chan agent.Event
-	Send      func(text string)
+	Send      func(text string, images []string)
 	Abort     func()
 	Slash     func(text string) []string
 	Models    func() []string
@@ -66,6 +66,8 @@ type Model struct {
 	history   []string
 	histDepth int // 0 = 实时输入；>0 = 正在翻阅的第 N 条历史
 	quitArmed bool
+
+	pendingImages []string // 本次提交待携带的图片路径（/attach 累积，Submit 后清空）
 
 	popup            popupKind
 	pickerSel        int
@@ -140,20 +142,31 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.openEditor()
 	}
 	if msg.Code == tea.KeyEnter {
-		if m.input.Empty() {
+		if m.input.Empty() && len(m.pendingImages) == 0 {
 			return m, nil
 		}
 		text := m.input.String()
 		m.input.Clear()
-		m.rememberInput(text)
+		if text != "" {
+			m.rememberInput(text)
+		}
 		if strings.HasPrefix(text, "/") {
+			if lines, handled := m.handleSlash(text); handled {
+				return m, printLines(lines)
+			}
 			lines := m.deps.Slash(text)
 			return m, printLines(lines)
 		}
+		imgs := m.pendingImages
+		m.pendingImages = nil
 		m.busy = true
 		m.stream.Reset()
-		m.deps.Send(text)
-		return m, tea.Println(renderUserEcho(text))
+		m.deps.Send(text, imgs)
+		prompt := renderUserEcho(text)
+		if len(imgs) > 0 {
+			prompt += "\n" + dim(fmt.Sprintf("  📎 %s", imagesSummary(imgs)))
+		}
+		return m, tea.Println(prompt)
 	}
 	switch {
 	case msg.Code == tea.KeyEscape:
@@ -258,7 +271,84 @@ func (m Model) handlePopupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// filteredModels 按输入做子序列模糊过滤（大小写不敏感）。
+// handleSlash 处理不需要 agent 参与的 TUI 专属斜杠命令，返回 (输出行, 已处理)。
+// /attach 是典型例子：它操作 TUI 的 pendingImages，无需请求模型。
+func (m *Model) handleSlash(input string) ([]string, bool) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return nil, false
+	}
+	switch fields[0] {
+	case "/attach":
+		return m.slashAttach(fields), true
+	}
+	return nil, false
+}
+
+// slashAttach 处理 /attach 命令：
+// - /attach <path...>  注册图片路径（校验扩展名 + 文件存在）
+// - /attach（无参数）  列出当前 pending 图片
+// - /attach -clear     清空 pending 图片
+func (m *Model) slashAttach(fields []string) []string {
+	if len(fields) == 1 {
+		return m.listPendingImages()
+	}
+	switch fields[1] {
+	case "-clear":
+		m.pendingImages = nil
+		return []string{"已清空所有待发送图片"}
+	default:
+		var ok, bad int
+		for _, p := range fields[1:] {
+			ext := strings.ToLower(filepath.Ext(p))
+			if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".gif" && ext != ".webp" {
+				bad++
+				continue
+			}
+			if _, err := os.Stat(p); err != nil {
+				bad++
+				continue
+			}
+			m.pendingImages = append(m.pendingImages, p)
+			ok++
+		}
+		lines := []string{}
+		if ok > 0 {
+			lines = append(lines, fmt.Sprintf("已添加 %d 张图片", ok))
+		}
+		if bad > 0 {
+			lines = append(lines, fmt.Sprintf("%d 个路径无效（扩展名不支持或文件不存在）", bad))
+		}
+		return lines
+	}
+}
+
+func (m *Model) listPendingImages() []string {
+	if len(m.pendingImages) == 0 {
+		return []string{"暂无待发送图片"}
+	}
+	lines := []string{"待发送图片："}
+	for _, p := range m.pendingImages {
+		if info, err := os.Stat(p); err == nil {
+			lines = append(lines, fmt.Sprintf("  %s（%s）", filepath.Base(p), humanBytes(info.Size())))
+		} else {
+			lines = append(lines, "  "+filepath.Base(p))
+		}
+	}
+	return lines
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%d B", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(n)/1024/1024)
+	}
+}
+
 func (m Model) filteredModels() []string {
 	if m.deps.Models == nil {
 		return nil
@@ -431,7 +521,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.ModelSwitchedEvent:
 		m.modelName = ev.Name
 		m.windowTokens = ev.Window
-		m.usage = nil        // 新窗口下旧百分比无意义，等首个 usage 重建
+		m.usage = nil // 新窗口下旧百分比无意义，等首个 usage 重建
 		m.ctxWarned = false
 
 	case agent.ErrorEvent:
@@ -530,6 +620,17 @@ func renderUserEcho(text string) string {
 	lines := strings.Split(text, "\n")
 	lines[0] = ansiCyan + "> " + lines[0] + ansiReset
 	return strings.Join(lines, "\n")
+}
+
+// imagesSummary 把图片路径集合渲染为简短摘要（文件名 + 数量）。
+func imagesSummary(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	if len(paths) == 1 {
+		return filepath.Base(paths[0])
+	}
+	return fmt.Sprintf("%s +%d more", filepath.Base(paths[0]), len(paths)-1)
 }
 
 func renderInterrupted(text string) string {

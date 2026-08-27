@@ -74,10 +74,10 @@ func TestReasoningStreamsLoggedButNotProjected(t *testing.T) {
 	// 模型投影不含思考；I1 重放不受影响。
 	msgs := fx.sess.DeriveMessages()
 	last := msgs[len(msgs)-1]
-	if last.Role != "assistant" || last.Content != "答案" {
+	if last.Role != "assistant" || provider.ContentText(last.Content) != "答案" {
 		t.Fatalf("投影 assistant = %+v", last)
 	}
-	if strings.Contains(last.Content, "思考") {
+	if strings.Contains(provider.ContentText(last.Content), "思考") {
 		t.Error("投影混入思考内容")
 	}
 	pairs, err := fx.sess.ReplayRequestHashes(fx.system(), fx.reg.Defs())

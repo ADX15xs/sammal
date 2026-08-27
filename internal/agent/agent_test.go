@@ -342,10 +342,10 @@ func TestI2CrossTurnToolResultPruning(t *testing.T) {
 	if t2Tool == nil {
 		t.Fatal("T2 request: no tool result found")
 	}
-	if len(t2Tool.Content) < 11000 {
-		t.Fatalf("T2: tool result 应完整，但只有 %d 字符", len(t2Tool.Content))
+	if len(provider.ContentText(t2Tool.Content)) < 11000 {
+		t.Fatalf("T2: tool result 应完整，但只有 %d 字符", len(provider.ContentText(t2Tool.Content)))
 	}
-	if !strings.Contains(t2Tool.Content, strings.Repeat("x", 100)) {
+	if !strings.Contains(provider.ContentText(t2Tool.Content), strings.Repeat("x", 100)) {
 		t.Fatal("T2: tool result 不应含截断标记")
 	}
 
@@ -354,11 +354,11 @@ func TestI2CrossTurnToolResultPruning(t *testing.T) {
 	if t3Tool == nil {
 		t.Fatal("T3 request: no tool result found")
 	}
-	if !strings.Contains(t3Tool.Content, "[pruned") {
-		t.Fatalf("T3: tool result 应含截断标记 [pruned]，但内容为 %q", t3Tool.Content)
+	if !strings.Contains(provider.ContentText(t3Tool.Content), "[pruned") {
+		t.Fatalf("T3: tool result 应含截断标记 [pruned]，但内容为 %q", provider.ContentText(t3Tool.Content))
 	}
-	if len(t3Tool.Content) >= 10000 {
-		t.Fatalf("T3: tool result 应被截断，但仍有 %d 字符", len(t3Tool.Content))
+	if len(provider.ContentText(t3Tool.Content)) >= 10000 {
+		t.Fatalf("T3: tool result 应被截断，但仍有 %d 字符", len(provider.ContentText(t3Tool.Content)))
 	}
 }
 
@@ -471,7 +471,7 @@ func TestSteeringAbsorbedAtStepBoundary(t *testing.T) {
 	}
 	found := false
 	for _, msg := range fp.calls[1].Messages {
-		if msg.Role == "user" && strings.Contains(msg.Content, "PowerShell") {
+		if msg.Role == "user" && strings.Contains(provider.ContentText(msg.Content), "PowerShell") {
 			found = true
 		}
 	}
@@ -508,7 +508,7 @@ func TestRewindRollsBackFilesAndConversation(t *testing.T) {
 		t.Fatalf("回滚后 file = %q, want v1", data)
 	}
 	for _, msg := range fx.sess.DeriveMessages() {
-		if msg.Role == "user" && strings.Contains(msg.Content, "edit r.txt") {
+		if msg.Role == "user" && strings.Contains(provider.ContentText(msg.Content), "edit r.txt") {
 			t.Error("turn 1 的对话未截断")
 		}
 	}

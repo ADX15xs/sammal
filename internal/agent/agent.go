@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ type MessageFinalEvent struct {
 	Interrupted bool
 	Usage       *provider.Usage
 }
+
 // ReasonFinalEvent 标志思考块闭合（文本答案开始或 step 结束）：TUI 据此
 // 把流式思考行撤出视窗。不携带全文——全文已随增量流出，只落日志。
 type ReasonFinalEvent struct{}
@@ -117,6 +119,8 @@ type Agent struct {
 	dataRoot string
 	window   int
 	retries  int
+
+	pendingImages []string // 本次提交待携带的图片路径，Submit 写入，Run 开始时吸收
 
 	model      string // 当前请求使用的 model ID
 	modelName  string // 当前模型配置键
@@ -239,12 +243,14 @@ func (a *Agent) setRunning(cancel context.CancelFunc) {
 }
 
 // Submit 提交用户输入：空闲时开新 turn；生成中入收件箱，在下一个
-// step 边界吸收（第 6.2 节消息收件箱）。
-func (a *Agent) Submit(text string) {
+// step 边界吸收（第 6.2 节消息收件箱）。images 是随消息提交的图片路径。
+func (a *Agent) Submit(text string, images []string) {
 	if a.Running() {
+		// 生成中的插话只承载文本，图片静默丢弃（DEBT.md 已记账）。
 		a.Steering(text)
 		return
 	}
+	a.pendingImages = images
 	go a.Run(a.root, text)
 }
 
@@ -258,7 +264,9 @@ func (a *Agent) Run(parent context.Context, userMsg string) {
 	defer a.setRunning(nil)
 
 	a.absorbInbox()
-	if err := a.sess.Append(session.TypeUserMessage, session.UserMessageData{Text: userMsg}); err != nil {
+	imgs := a.pendingImages
+	a.pendingImages = nil
+	if err := a.sess.Append(session.TypeUserMessage, session.UserMessageData{Text: userMsg, Images: imgs}); err != nil {
 		a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
 		// 无 TurnStarted 也要有 TurnEnded：消费端以本事件解除 busy。
 		a.emit(TurnEndedEvent{StopReason: StopError})
@@ -266,14 +274,23 @@ func (a *Agent) Run(parent context.Context, userMsg string) {
 	}
 	a.emit(TurnStartedEvent{})
 
-	stopReason, usage := a.runSteps(ctx)
+	stopReason, usage := a.runSteps(ctx, imgs)
 	if err := a.sess.EndTurn(stopReason); err != nil {
 		a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
 	}
 	a.emit(TurnEndedEvent{StopReason: stopReason, Usage: usage})
 }
 
-func (a *Agent) runSteps(ctx context.Context) (string, *provider.Usage) {
+func (a *Agent) runSteps(ctx context.Context, images []string) (string, *provider.Usage) {
+	var imgParts []provider.ContentPart
+	if len(images) > 0 {
+		parts, err := assembleImageParts(images)
+		if err != nil {
+			a.emit(ErrorEvent{Err: err})
+			return StopError, nil
+		}
+		imgParts = parts
+	}
 	for step := 0; ; step++ {
 		a.absorbInbox()
 		if step == 0 {
@@ -282,10 +299,21 @@ func (a *Agent) runSteps(ctx context.Context) (string, *provider.Usage) {
 			a.autoCompact(ctx)
 		}
 
+		msgs := a.sess.DeriveMessages()
+		if len(imgParts) > 0 {
+			// 图片挂到最近的 user 消息并随每个请求重发：端点无状态，
+			// 工具环的后续请求不带图片即丢失图片上下文。
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "user" {
+					msgs[i].Content = append(msgs[i].Content, imgParts...)
+					break
+				}
+			}
+		}
 		req := provider.Request{
 			Model:    a.model,
 			System:   a.system,
-			Messages: a.sess.DeriveMessages(),
+			Messages: msgs,
 			Tools:    a.reg.Defs(),
 		}
 		hash, err := provider.PrefixHash(req)
@@ -404,7 +432,7 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 			if ctx.Err() != nil {
 				streamErr = ctx.Err()
 			} else {
-				msg := provider.Message{Role: "assistant", Content: text.String(), ToolCalls: toolCalls}
+				msg := provider.Message{Role: "assistant", Content: provider.ContentFromText(text.String()), ToolCalls: toolCalls}
 				if err := a.sess.Append(session.TypeAssistantMessage, session.AssistantMessageData{
 					Text: text.String(), ToolCalls: toolCalls,
 				}); err != nil {
@@ -428,7 +456,7 @@ func (a *Agent) finalizePartial(text string, toolCalls []provider.ToolCall) prov
 	if text == "" && len(toolCalls) == 0 {
 		return provider.Message{}
 	}
-	msg := provider.Message{Role: "assistant", Content: text, ToolCalls: toolCalls}
+	msg := provider.Message{Role: "assistant", Content: provider.ContentFromText(text), ToolCalls: toolCalls}
 	if a.appendFatal(session.TypeAssistantMessage, session.AssistantMessageData{
 		Text: text, ToolCalls: toolCalls, Interrupted: true,
 	}) != nil {
@@ -626,6 +654,37 @@ func appendToolDelta(calls []provider.ToolCall, d *provider.ToolCallDelta) []pro
 	}
 	c.Function.Arguments += d.ArgsDelta
 	return calls
+}
+
+// assembleImageParts 把图片路径集合编码为 content image_url parts。
+// 读取失败、超过 20MB 或不支持的扩展名时返回错误，本次提交中止。
+func assembleImageParts(paths []string) ([]provider.ContentPart, error) {
+	mimes := map[string]string{
+		".png":  "image/png",
+		".jpg":  "image/jpeg",
+		".jpeg": "image/jpeg",
+		".gif":  "image/gif",
+		".webp": "image/webp",
+	}
+	parts := make([]provider.ContentPart, 0, len(paths))
+	for _, p := range paths {
+		mimeType, ok := mimes[strings.ToLower(filepath.Ext(p))]
+		if !ok {
+			return nil, fmt.Errorf("不支持的图片格式：%s", p)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("读取图片 %s 失败：%w", p, err)
+		}
+		if len(data) > 20*1024*1024 {
+			return nil, fmt.Errorf("图片 %s 超过 20MB 上限", p)
+		}
+		parts = append(parts, provider.ContentPart{
+			Type:     "image_url",
+			ImageURL: &provider.ImageURL{URL: "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)},
+		})
+	}
+	return parts, nil
 }
 
 // emit 投递事件。root 取消后允许丢弃事件：一切落盘都先于对应 emit 完成，

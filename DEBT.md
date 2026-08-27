@@ -16,3 +16,5 @@
 | internal/agent/agent.go runSteps | turn 内无 step 数软上限，压缩只在 turn 开始触发：模型失控循环调用工具时会一直烧到上下文溢出才停（大窗口端点损失放大） | 先加软阈值 StatusEvent 提醒；实测出现失控再加溢出后 turn 内压缩重试或硬上限 | 按需（首个实际失控出现时） |
 | internal/agent/agent.go captureBeforeWrite | 快照捕获按 `{path}` 参数启发式识别写类工具：未来新增参数不含 path 的写工具会被静默漏快照（/rewind 盲区扩大且无告警） | Tool 接口加显式声明（如 SnapshotTargets 方法）替代启发式解析 | 首个非 path 参数的写工具进入注册表时 |
 | internal/tool/tool_test.go | bash/grep 测试用真实 sleep 脚本化并发行为，整包 ~32s：拖慢开发反馈环，不影响正确性 | 用 channel 同步或轮询断言替代定时 sleep | 下次大改 tool 包时顺手 |
+| internal/agent/agent.go runSteps | 图片 base64 只进请求不进日志（日志只存文件名，避免 JSONL 膨胀）：带图 turn 的请求哈希无法从日志重放重建，I1 验证对带图会话失效 | 重放时按日志中的文件路径重读磁盘重建 image parts（文件缺失则跳过该请求的验证），或日志落图片内容哈希承诺 | 按需（首个需要验证带图会话重放时） |
+| internal/agent/agent.go Submit | 生成中提交的图片被静默丢弃：插话收件箱（Steering）只承载文本 | 收件箱扩展图片负载，或 TUI 在生成中带图提交时明确提示 | 按需（生成中带图插入成为实际用法时） |
