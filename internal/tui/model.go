@@ -89,7 +89,7 @@ func (m Model) Init() tea.Cmd {
 
 type agentEventMsg struct{ ev agent.Event }
 type agentClosedMsg struct{}
-type turnTickMsg struct{} // 生成中的每秒心跳：刷新计时器/思考行动画
+type turnTickMsg struct{} // 生成中的每秒心跳：刷新计时器/状态栏
 
 func listenAgent(ch <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
@@ -431,7 +431,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.ModelSwitchedEvent:
 		m.modelName = ev.Name
 		m.windowTokens = ev.Window
-		m.usage = nil        // 新窗口下旧百分比无意义，等首个 usage 重建
+		m.usage = nil // 新窗口下旧百分比无意义，等首个 usage 重建
 		m.ctxWarned = false
 
 	case agent.ErrorEvent:
@@ -469,8 +469,9 @@ func (m Model) reasonLine() string {
 	return lastLine(m.reason.String())
 }
 
-// armTick 生成中挂一个每秒心跳，驱动计时器与思考行的刷新。// tickArmed 去重：事件高频到达时（每个 reasoning 增量都会尝试挂表），
-// 保证任意时刻至多一个未触发的 tick，否则定时器指数堆积。
+// armTick 生成中挂一个每秒心跳，驱动计时器与状态栏刷新。tickArmed 去重：
+// 事件高频到达时（每个 reasoning 增量都会尝试挂表），保证任意时刻至多
+// 一个未触发的 tick，否则定时器指数堆积。
 func (m Model) armTick() tea.Cmd {
 	if !m.busy || m.tickArmed {
 		return nil
@@ -479,7 +480,10 @@ func (m Model) armTick() tea.Cmd {
 	return tea.Tick(time.Second, func(time.Time) tea.Msg { return turnTickMsg{} })
 }
 
-// turnTick 心跳：busy 期间自续，空闲时终止。
+// turnTick 心跳：busy 期间自续，空闲时终止。思考行动画不走这里——思考行
+// 的动感全部由 token 到达驱动（尾部跟随），定时渲染只保留 1s 计时器一档；
+// 思考期间任何更高频的定时重绘都会与 tea.Println 交错产生空行（扫光方案
+// 实测回归，已弃）。
 func (m Model) turnTick() (tea.Model, tea.Cmd) {
 	m.tickArmed = false
 	if !m.busy {
@@ -609,11 +613,17 @@ func (m Model) streamBlockLines(width int) []string {
 			line = fmt.Sprintf("- 思考中 %s", formatElapsed(time.Since(m.turnStart)))
 		}
 		if cur := m.reasonLine(); cur != "" {
-			candidate := line + " | " + strings.ReplaceAll(cur, "\t", " ")
-			if w := widthOf(candidate); w > width-2 {
-				candidate = clipLine(candidate, width-1)
+			// 前缀（"思考中 12s"）固定做锚点，正文超宽时只保留尾部——
+			// dsh 的尾部跟随（overflow:hidden + scrollLeft 推到最右）：
+			// 最新 token 永远可见，无省略号。思考行的动感全部来自 token
+			// 到达本身，不做定时动画（高频重绘实测会产生空行 artifact）。
+			prefix := line + " | "
+			body := strings.ReplaceAll(cur, "\t", " ")
+			if bodyW := width - 1 - widthOf(prefix); bodyW > 0 {
+				lines = append(lines, dim(prefix+tailWindow(body, bodyW)))
+			} else {
+				lines = append(lines, dim(clipLine(prefix+body, width-1)))
 			}
-			lines = append(lines, dim(candidate))
 		} else {
 			lines = append(lines, dim(clipLine(line, width-1)))
 		}
@@ -771,4 +781,38 @@ func clipLine(s string, width int) string {
 		b.WriteString("...")
 	}
 	return b.String()
+}
+
+// clustersOf 按字素簇切分文本（与 clipLine 同一宽度语义，宽字符/组合字符
+// 不会被切半）。
+func clustersOf(text string) []string {
+	var out []string
+	state := -1
+	rest := text
+	for len(rest) > 0 {
+		var c string
+		c, rest, _, state = uniseg.FirstGraphemeClusterInString(rest, state)
+		out = append(out, c)
+	}
+	return out
+}
+
+// tailWindow 取 text 尾部至多 width 显示宽的片段——dsh 思考行的尾部跟随
+// （overflow:hidden + scrollLeft 推到最右）：永远显示最新 token，超宽时
+// 头部被裁掉、无省略号（running 态 text-overflow: clip）。文本不超宽时
+// 原样返回。前缀计时进位会让窗口宽度每秒 ±1 列，属可接受的轻微抖动。
+func tailWindow(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if widthOf(text) <= width {
+		return text
+	}
+	clusters := clustersOf(text)
+	used, start := 0, len(clusters)
+	for start > 0 && used+widthOf(clusters[start-1]) <= width {
+		start--
+		used += widthOf(clusters[start])
+	}
+	return strings.Join(clusters[start:], "")
 }
