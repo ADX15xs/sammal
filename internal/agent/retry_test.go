@@ -149,22 +149,48 @@ func TestBackoffFor(t *testing.T) {
 		name       string
 		attempt    int
 		retryAfter time.Duration
+		base       time.Duration
 		want       time.Duration
 	}{
-		{"首试盲退避1s", 0, 0, time.Second},
-		{"二次2s", 1, 0, 2 * time.Second},
-		{"三次4s", 2, 0, 4 * time.Second},
-		{"指数增长32s", 5, 0, 32 * time.Second},
-		{"64s截断到上限", 6, 0, retryCap},
-		{"尊重端点30s", 0, 30 * time.Second, 30 * time.Second},
-		{"端点要求90s截断到上限", 0, 90 * time.Second, retryCap},
+		{"首试盲退避1s", 0, 0, retryBackoff, time.Second},
+		{"二次2s", 1, 0, retryBackoff, 2 * time.Second},
+		{"三次4s", 2, 0, retryBackoff, 4 * time.Second},
+		{"指数增长32s", 5, 0, retryBackoff, 32 * time.Second},
+		{"64s截断到上限", 6, 0, retryBackoff, retryCap},
+		{"尊重端点30s", 0, 30 * time.Second, retryBackoff, 30 * time.Second},
+		{"端点要求90s截断到上限", 0, 90 * time.Second, retryBackoff, retryCap},
+		{"5s预算耗尽首试", 0, 0, defaultRateLimitBackoff, 5 * time.Second},
+		{"5s预算耗尽二次10s", 1, 0, defaultRateLimitBackoff, 10 * time.Second},
+		{"5s预算耗尽三次20s", 2, 0, defaultRateLimitBackoff, 20 * time.Second},
+		{"5s预算耗尽四次40s", 3, 0, defaultRateLimitBackoff, 40 * time.Second},
+		{"5s预算耗尽五次截断60s", 4, 0, defaultRateLimitBackoff, retryCap},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := backoffFor(tt.attempt, tt.retryAfter); got != tt.want {
-				t.Errorf("backoffFor(%d, %v) = %v, want %v", tt.attempt, tt.retryAfter, got, tt.want)
+			if got := backoffFor(tt.attempt, tt.retryAfter, tt.base); got != tt.want {
+				t.Errorf("backoffFor(%d, %v, %v) = %v, want %v", tt.attempt, tt.retryAfter, tt.base, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBackoffBaseFor(t *testing.T) {
+	// budget > 0：未耗尽时 1s，耗尽后 5s。
+	if got := backoffBaseFor(0, 0, 5); got != retryBackoff {
+		t.Errorf("budget未耗尽 base = %v, want 1s", got)
+	}
+	if got := backoffBaseFor(0, 5, 5); got != retryBackoff {
+		t.Errorf("budget边界 base = %v, want 1s", got)
+	}
+	if got := backoffBaseFor(0, 5+1, 5); got != defaultRateLimitBackoff {
+		t.Errorf("budget耗尽 base = %v, want 5s", got)
+	}
+	// budget = 0：rlHits > 0 时 5s（关闭该机制时始终 1s 需显式传 budget=0 且 rlHits=0）。
+	if got := backoffBaseFor(0, 0, 0); got != retryBackoff {
+		t.Errorf("budget=0 且 rlHits=0 base = %v, want 1s", got)
+	}
+	if got := backoffBaseFor(0, 1, 0); got != defaultRateLimitBackoff {
+		t.Errorf("budget=0 且 rlHits>0 base = %v, want 5s", got)
 	}
 }
 
@@ -181,5 +207,126 @@ func TestOverWaitLimitPredicate(t *testing.T) {
 	}
 	if overWaitLimit(errors.New("plain"), 0) {
 		t.Error("非断流错误不应判定超限")
+	}
+}
+
+// budgetExhaustedSwitchesBase 429 连续命中超出 budget 后，退避从 1s 切到 5s。
+// budget=0 + retries=2：attempt 0 用 1s，attempt 1 时 rlHits=1 > budget=0
+// 触发 5s 基础退避（5s << 1 = 10s），总等待 1+10=11s，用 15s 自定义超时。
+func TestBudgetExhaustedSwitchesBase(t *testing.T) {
+	fp := &fakeProvider{
+		syncErrs: []error{
+			rateLimitErr(0), // attempt 0: rlHits=0，base=1s
+			rateLimitErr(0), // attempt 1: rlHits=1 > budget=0（耗尽），base=5s
+			rateLimitErr(0), // attempt 2: attempt=2 >= retries=2 → StopError
+		},
+	}
+	fx := newFixture(t, fp)
+	fx.ag.retries = 2
+	fx.ag.rateLimitBudget = 0
+	events := fx.ag.Events()
+
+	go fx.ag.Run(context.Background(), "hi")
+	evs := drainEventsTimeout(t, events, 15*time.Second, func(e Event) bool {
+		te, ok := e.(TurnEndedEvent)
+		return ok && te.StopReason == StopError
+	})
+
+	var statuses []string
+	for _, ev := range evs {
+		if se, ok := ev.(StatusEvent); ok && strings.Contains(se.Text, "后重连") {
+			statuses = append(statuses, se.Text)
+		}
+	}
+	if len(statuses) < 2 {
+		t.Fatalf("期望至少 2 条重连状态，got %d: %v", len(statuses), statuses)
+	}
+	if !strings.Contains(statuses[0], "1s 后重连") {
+		t.Errorf("首次退避应为 1s，got %q", statuses[0])
+	}
+	if !strings.Contains(statuses[1], "10s 后重连") {
+		t.Errorf("budget 耗尽后退避应切换到 5s 起步（5s<<1=10s），got %q", statuses[1])
+	}
+}
+
+// budgetExhaustedFastTrackSuccess 预算耗尽后切换到 5s 退避，但仍能在 retries 内成功。
+// budget=0 + retries=1：attempt 0 用 1s，attempt 1 时 budget 耗尽用 5s，
+// 但 attempt=1 >= retries=1 → StopError（不等待 5s）。
+// 改用 budget=1 + retries=2：attempt 0/1 用 1s 基础（rlHits=1 未超限），
+// attempt 2 时 rlHits=2 > budget=1（耗尽），base=5s，但 attempt=2 >= retries=2 → StopError。
+// 总等待 1+2=3s，在 drainEvents 超时内完成。
+func TestBudgetExhaustedFastTrackSuccess(t *testing.T) {
+	fp := &fakeProvider{
+		syncErrs: []error{
+			rateLimitErr(0), // attempt 0: rlHits=0，base=1s
+			rateLimitErr(0), // attempt 1: rlHits=1（budget=1，未超限），base=1s
+			rateLimitErr(0), // attempt 2: rlHits=2 > budget=1（耗尽），attempt=2 >= retries=2 → StopError
+		},
+	}
+	fx := newFixture(t, fp)
+	fx.ag.retries = 2
+	fx.ag.rateLimitBudget = 1
+	events := fx.ag.Events()
+
+	go fx.ag.Run(context.Background(), "hi")
+	evs := drainEvents(t, events, func(e Event) bool {
+		te, ok := e.(TurnEndedEvent)
+		return ok && te.StopReason == StopError
+	})
+
+	var statuses []string
+	for _, ev := range evs {
+		if se, ok := ev.(StatusEvent); ok && strings.Contains(se.Text, "后重连") {
+			statuses = append(statuses, se.Text)
+		}
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("期望 2 条重连状态，got %d: %v", len(statuses), statuses)
+	}
+	if !strings.Contains(statuses[0], "1s 后重连") {
+		t.Errorf("首次退避应为 1s，got %q", statuses[0])
+	}
+	if !strings.Contains(statuses[1], "2s 后重连") {
+		t.Errorf("第二次退避应为 2s，got %q", statuses[1])
+	}
+}
+
+// nonRateLimitResetsCounter 非 429 断流（网络错误）把 rlHits 清零，
+// 之后再次命中 429 不从 budget 顶部继续累加。
+func TestNonRateLimitResetsCounter(t *testing.T) {
+	fp := &fakeProvider{
+		syncErrs: []error{
+			rateLimitErr(0),                     // attempt 0: 429，rlHits=1
+			&provider.StreamInterruptedError{Kind: provider.InterruptNetwork}, // attempt 1: 网络，rlHits=0
+			rateLimitErr(0),                     // attempt 2: 429，rlHits=1（重置后）
+			nil,                                 // attempt 3: 成功，落到 streams
+		},
+		streams: [][]provider.Chunk{textChunks("done")},
+	}
+	fx := newFixture(t, fp)
+	fx.ag.retries = 3
+	fx.ag.rateLimitBudget = 2
+	events := fx.ag.Events()
+
+	go fx.ag.Run(context.Background(), "hi")
+	evs := drainEvents(t, events, turnEnded)
+
+	// 验证停止原因：成功完成（非 error）。
+	var stop string
+	var usage *provider.Usage
+	for _, ev := range evs {
+		if te, ok := ev.(TurnEndedEvent); ok {
+			stop = te.StopReason
+			usage = te.Usage
+		}
+	}
+	if stop != StopCompleted {
+		t.Fatalf("期望 StopCompleted，got %q", stop)
+	}
+	if usage == nil {
+		t.Fatal("期望有 usage")
+	}
+	if len(fp.calls) != 4 {
+		t.Fatalf("provider calls = %d，期望 4（3次重试+1次成功）", len(fp.calls))
 	}
 }

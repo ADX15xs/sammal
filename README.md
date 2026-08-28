@@ -99,6 +99,8 @@ base_url       = "https://api.deepseek.com"
 model          = "deepseek-v4-flash"
 api_key_env    = "DEEPSEEK_API_KEY"  # 可选；本地端点可不设
 context_window = 131072
+retry_max      = 6                   # 断流重连上限；缺省 3
+rate_limit_budget = 10               # 429 宽容预算（按端点连续命中计数）；默认 5
 
 [ui]
 editor = ""                          # Ctrl+E 默认 $VISUAL/$EDITOR，可强制指定
@@ -116,6 +118,21 @@ DEEPSEEK_API_KEY=sk-xxxx
 
 在配置文件所在目录的任意子目录运行 `sammal`，会话与快照存储在
 `~/.local/share/sammal/sessions/`（Windows：`%LOCALAPPDATA%\sammal\sessions\`）。
+
+### 断流重连
+
+网络错误、流停滞、429 限流、5xx 服务端错误都会在 step 边界自动重连，重试同一请求（逐字节一致，KV 缓存友好）。配置字段：
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `retry_max` | 3 | 断流重连上限；超出后上抛错误终止 turn |
+| `rate_limit_budget` | 5 | 按端点连续命中 429 的宽容次数；预算耗尽后基础退避从 1s 切换到 5s，覆盖大多数分钟级限流窗口 |
+
+退避曲线：
+- **正常阶段**（429 未超限）：`1s`、`2s`、`4s`、`8s`、`16s`、`32s`、上限 `60s`
+- **预算耗尽后**：`5s`、`10s`、`20s`、`40s`、上限 `60s`
+- 端点提供 `Retry-After` 时取 `max(退避, Retry-After)`；要求等待超过 `60s` 即视为订阅 plan 用量窗口，立即快速失败并注明恢复时间点
+- 429 命中配额特征串（`usage limit` 等）直接快速失败，不消耗重试预算
 
 ### 键位
 

@@ -127,9 +127,14 @@ func (f *fixture) system() string {
 }
 
 func drainEvents(t *testing.T, events <-chan Event, until func(Event) bool) []Event {
+	return drainEventsTimeout(t, events, 10*time.Second, until)
+}
+
+// drainEventsTimeout 与 drainEvents 相同，但允许自定义超时。
+func drainEventsTimeout(t *testing.T, events <-chan Event, timeout time.Duration, until func(Event) bool) []Event {
 	t.Helper()
 	var out []Event
-	timeout := time.After(10 * time.Second)
+	timeoutCh := time.After(timeout)
 	for {
 		select {
 		case ev := <-events:
@@ -137,7 +142,7 @@ func drainEvents(t *testing.T, events <-chan Event, until func(Event) bool) []Ev
 			if until(ev) {
 				return out
 			}
-		case <-timeout:
+		case <-timeoutCh:
 			t.Fatalf("事件等待超时，已收到 %d 个", len(out))
 		}
 	}
