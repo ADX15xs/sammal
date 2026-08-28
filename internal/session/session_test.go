@@ -258,3 +258,95 @@ func TestReasoningChunksExcludedFromProjection(t *testing.T) {
 		}
 	}
 }
+
+// 投影不含图片 part（关键不变量）：带图 user 消息投影出的请求前缀与
+// 无图会话同构，跨轮前缀稳定（I2）与模型切换自由由此保证。
+func TestUserMessageImagesNotProjected(t *testing.T) {
+	s := newSession(t)
+	ref, err := s.Assets().Put([]byte("img-bytes"), ".png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(TypeUserMessage, UserMessageData{Text: "看图", Images: []string{ref}}); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := s.DeriveMessages()
+	if len(msgs) != 1 {
+		t.Fatalf("msgs = %d", len(msgs))
+	}
+	for _, p := range msgs[0].Content {
+		if p.Type == "image_url" {
+			t.Error("投影不得包含图片 part")
+		}
+	}
+}
+
+func TestAttachImageParts(t *testing.T) {
+	img := provider.ContentPart{Type: "image_url", ImageURL: &provider.ImageURL{URL: "data:image/png;base64,x"}}
+	// AttachImageParts 就地修改元素（两个调用方都传全新派生的切片），
+	// 每个用例构造独立的消息集。
+	newMsgs := func() []provider.Message {
+		return []provider.Message{
+			{Role: "user", Content: provider.ContentFromText("q")},
+			{Role: "assistant", Content: provider.ContentFromText("a")},
+			{Role: "user", Content: provider.ContentFromText("插话")},
+		}
+	}
+
+	out := AttachImageParts(newMsgs(), []provider.ContentPart{img})
+	if len(out[2].Content) != 2 {
+		t.Fatalf("应追加到最后一条 user 消息: %+v", out[2])
+	}
+	if len(out[0].Content) != 1 {
+		t.Errorf("更早的 user 消息不应被动: %+v", out[0])
+	}
+
+	if out := AttachImageParts(newMsgs(), nil); len(out[2].Content) != 1 {
+		t.Errorf("空 parts 应原样返回: %+v", out[2])
+	}
+	if out := AttachImageParts([]provider.Message{{Role: "assistant"}}, []provider.ContentPart{img}); len(out[0].Content) != 0 {
+		t.Errorf("无 user 消息应原样返回: %+v", out[0])
+	}
+}
+
+// 重放按 request/header 记录的引用还原图片（DEBT「图片重放」主项的
+// 会话级验收）；资产被外部删除时该图跳过、重放不一致（既定降级语义）。
+func TestReplayRequestHashesWithImages(t *testing.T) {
+	s := newSession(t)
+	img := []byte("png-bytes")
+	ref, err := s.Assets().Put(img, ".png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Append(TypeUserMessage, UserMessageData{Text: "看图", Images: []string{ref}})
+
+	part, _ := provider.ImagePart(".png", img)
+	req := provider.Request{
+		Model:    "m1",
+		System:   "sys",
+		Messages: []provider.Message{{Role: "user", Content: append(provider.ContentFromText("看图"), part)}},
+	}
+	hash, err := provider.PrefixHash(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Append(TypeRequestHeader, RequestHeaderData{PrefixHash: hash, MessageCount: 1, Model: "m1", Images: []string{ref}})
+
+	pairs, err := s.ReplayRequestHashes("sys", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pairs) != 1 || pairs[0][0] != pairs[0][1] {
+		t.Fatalf("带图请求重放应一致: %v", pairs)
+	}
+
+	os.Remove(filepath.Join(s.Dir(), "assets", ref))
+	pairs, err = s.ReplayRequestHashes("sys", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pairs[0][0] == pairs[0][1] {
+		t.Error("资产缺失时重放应不一致（降级语义）")
+	}
+}

@@ -50,7 +50,7 @@ type Envelope struct {
 
 type UserMessageData struct {
 	Text   string   `json:"text"`
-	Images []string `json:"images,omitempty"` // 仅存文件名，不存 base64（避免 JSONL 膨胀）
+	Images []string `json:"images,omitempty"` // 图片资产引用（assets/ 下文件名）：turn 事实记录，投影不含图，重放按 request/header 的引用还原
 }
 
 // chunk kind 常量：assistant/chunk 的流增量类别。空值 = text（旧日志兼容）。
@@ -84,11 +84,14 @@ type ToolResultData struct {
 }
 
 // RequestHeaderData 留痕请求形态（I1）。model 字段是重放逐字节比对的
-// 必要输入（会话中途切模型后请求体随之变化）。
+// 必要输入（会话中途切模型后请求体随之变化）；images 记录该请求尾部携带
+// 的图片资产引用——图片不进投影（前缀稳定），重放据此还原。与 MessageCount
+// 同为记录性字段：写入日志供消费，不参与投影。
 type RequestHeaderData struct {
-	PrefixHash   string `json:"prefixHash"`
-	MessageCount int    `json:"messageCount"`
-	Model        string `json:"model"`
+	PrefixHash   string   `json:"prefixHash"`
+	MessageCount int      `json:"messageCount"`
+	Model        string   `json:"model"`
+	Images       []string `json:"images,omitempty"`
 }
 
 type CompactionData struct {
@@ -115,6 +118,8 @@ type Session struct {
 	seq    int
 	turn   int
 	header Header
+
+	assets *Assets
 }
 
 // DataRoot 返回会话数据根目录（~/.local/share/sammal 或
@@ -319,6 +324,14 @@ func (s *Session) Header() Header     { return s.header }
 func (s *Session) Turn() int          { return s.turn }
 func (s *Session) Events() []Envelope { return s.events }
 
+// Assets 返回会话的图片资产存储（<会话目录>/assets）。
+func (s *Session) Assets() *Assets {
+	if s.assets == nil {
+		s.assets = NewAssets(s.Dir())
+	}
+	return s.assets
+}
+
 // EndTurn 记录 turn/end 并推进 turn 计数。
 func (s *Session) EndTurn(stopReason string) error {
 	if err := s.Append(TypeTurnEnd, TurnEndData{Turn: s.turn, StopReason: stopReason}); err != nil {
@@ -447,8 +460,9 @@ func (s *Session) MessagesUpTo(limit int) []provider.Message {
 }
 
 // ReplayRequestHashes 重放日志：在每个 request/header 处，用当时的投影
-// 重建请求并计算哈希，与留痕比对。返回 (留痕哈希, 重建哈希) 序列——
-// I1 的 golden 请求测试直接消费（全部成对相等即通过）。
+// 重建请求（含 header 记录的图片资产引用还原）并计算哈希，与留痕比对。
+// 返回 (留痕哈希, 重建哈希) 序列——I1 的 golden 请求测试直接消费
+// （全部成对相等即通过）。
 func (s *Session) ReplayRequestHashes(system string, defs []provider.ToolDef) ([][2]string, error) {
 	var out [][2]string
 	p := &projector{}
@@ -457,7 +471,10 @@ func (s *Session) ReplayRequestHashes(system string, defs []provider.ToolDef) ([
 			var d RequestHeaderData
 			json.Unmarshal(env.Data, &d)
 			hash, err := provider.PrefixHash(provider.Request{
-				Model: d.Model, System: system, Messages: p.messages(), Tools: defs,
+				Model:    d.Model,
+				System:   system,
+				Messages: AttachImageParts(p.messages(), s.imageParts(d.Images)),
+				Tools:    defs,
 			})
 			if err != nil {
 				return nil, err
@@ -467,6 +484,60 @@ func (s *Session) ReplayRequestHashes(system string, defs []provider.ToolDef) ([
 		p.apply(env)
 	}
 	return out, nil
+}
+
+// AttachImageParts 把图片 parts 追加到最后一条 user 消息的 Content 尾部。
+// live 请求构造与日志重放共用的唯一放置规则：图片只进请求尾部、不进投影
+// 历史（I2 前缀稳定与缓存命中的前提）。parts 为空或无 user 消息时原样返回。
+func AttachImageParts(msgs []provider.Message, parts []provider.ContentPart) []provider.Message {
+	if len(parts) == 0 {
+		return msgs
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			msgs[i].Content = append(msgs[i].Content, parts...)
+			return msgs
+		}
+	}
+	return msgs
+}
+
+// imageParts 把资产引用解析为图片 parts；引用无法读取（资产被外部删除）
+// 时跳过该图——对应请求的重放哈希将不一致，是既定降级语义。
+func (s *Session) imageParts(refs []string) []provider.ContentPart {
+	var parts []provider.ContentPart
+	for _, ref := range refs {
+		data, err := s.Assets().Data(ref)
+		if err != nil {
+			continue
+		}
+		if part, ok := provider.ImagePart(filepath.Ext(ref), data); ok {
+			parts = append(parts, part)
+		}
+	}
+	return parts
+}
+
+// PruneAssets 删除日志中不再被引用的资产文件（/rewind 截断后调用）。
+func (s *Session) PruneAssets() {
+	keep := map[string]bool{}
+	for _, env := range s.events {
+		switch env.Type {
+		case TypeUserMessage:
+			var d UserMessageData
+			json.Unmarshal(env.Data, &d)
+			for _, ref := range d.Images {
+				keep[ref] = true
+			}
+		case TypeRequestHeader:
+			var d RequestHeaderData
+			json.Unmarshal(env.Data, &d)
+			for _, ref := range d.Images {
+				keep[ref] = true
+			}
+		}
+	}
+	s.Assets().Prune(keep)
 }
 
 // TruncateBeforeTurn 丢弃 turn 及其后的所有事件并重写日志（/rewind 用，

@@ -16,5 +16,7 @@
 | internal/agent/agent.go runSteps | turn 内无 step 数软上限，压缩只在 turn 开始触发：模型失控循环调用工具时会一直烧到上下文溢出才停（大窗口端点损失放大） | 先加软阈值 StatusEvent 提醒；实测出现失控再加溢出后 turn 内压缩重试或硬上限 | 按需（首个实际失控出现时） |
 | internal/agent/agent.go captureBeforeWrite | 快照捕获按 `{path}` 参数启发式识别写类工具：未来新增参数不含 path 的写工具会被静默漏快照（/rewind 盲区扩大且无告警） | Tool 接口加显式声明（如 SnapshotTargets 方法）替代启发式解析 | 首个非 path 参数的写工具进入注册表时 |
 | internal/tool/tool_test.go | bash/grep 测试用真实 sleep 脚本化并发行为，整包 ~32s：拖慢开发反馈环，不影响正确性 | 用 channel 同步或轮询断言替代定时 sleep | 下次大改 tool 包时顺手 |
-| internal/agent/agent.go runSteps | 图片 base64 只进请求不进日志（日志只存文件名，避免 JSONL 膨胀）：带图 turn 的请求哈希无法从日志重放重建，I1 验证对带图会话失效 | 重放时按日志中的文件路径重读磁盘重建 image parts（文件缺失则跳过该请求的验证），或日志落图片内容哈希承诺 | 按需（首个需要验证带图会话重放时） |
+| internal/session/assets.go | 图片字节存会话目录 assets/（内容寻址）而非日志本身：资产文件被外部删除、或旧格式日志（Images 存绝对路径）时该图跳过、对应请求重放哈希不一致（既定降级语义，TestReplayRequestHashesWithImages 锁定）。设计保证：图片不进投影 → 跨轮切换模型不受多模态限制；turn 内端点由 switchModel 运行中守卫恒定 | 无可还——字节不在即不可还原，属物理边界而非设计缺口 | 无（边界说明） |
+| internal/agent/agent.go Submit | `go a.Run` 与 goroutine 内 `setRunning` 之间有微秒级窗口，`Running()` 尚为 false 时 switchModel/idleGuard 命令理论上可插入（对 /new 等命令同样存在的既有竞态，与图片无关）；TUI 人手操作（≥ 数百毫秒）实际不可达 | 把运行标记提前到 Submit 同步段（pending 状态位），或 Run 启动前二次校验 | 按需（出现程序化紧邻调用 Submit+Slash 的用法时） |
+| internal/compaction/compaction.go | 压缩估算不计图片 token（EstimateRequest/eventTokens 只计文本 part）：近满窗口的带图请求可能真实溢出（图片 base64 单张可达 ~27MB） | 图片字节折算 token（如 4 字节/token）或附加固定配额计入估算 | 按需（首个实际溢出出现时） |
 | internal/agent/agent.go Submit | 生成中提交的图片被静默丢弃：插话收件箱（Steering）只承载文本 | 收件箱扩展图片负载，或 TUI 在生成中带图提交时明确提示 | 按需（生成中带图插入成为实际用法时） |

@@ -5,7 +5,6 @@ package agent
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -266,7 +265,14 @@ func (a *Agent) Run(parent context.Context, userMsg string) {
 	a.absorbInbox()
 	imgs := a.pendingImages
 	a.pendingImages = nil
-	if err := a.sess.Append(session.TypeUserMessage, session.UserMessageData{Text: userMsg, Images: imgs}); err != nil {
+	refs, parts, err := a.importImages(imgs)
+	if err != nil {
+		a.emit(ErrorEvent{Err: err})
+		// 无 TurnStarted 也要有 TurnEnded：消费端以本事件解除 busy。
+		a.emit(TurnEndedEvent{StopReason: StopError})
+		return
+	}
+	if err := a.sess.Append(session.TypeUserMessage, session.UserMessageData{Text: userMsg, Images: refs}); err != nil {
 		a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
 		// 无 TurnStarted 也要有 TurnEnded：消费端以本事件解除 busy。
 		a.emit(TurnEndedEvent{StopReason: StopError})
@@ -274,23 +280,14 @@ func (a *Agent) Run(parent context.Context, userMsg string) {
 	}
 	a.emit(TurnStartedEvent{})
 
-	stopReason, usage := a.runSteps(ctx, imgs)
+	stopReason, usage := a.runSteps(ctx, refs, parts)
 	if err := a.sess.EndTurn(stopReason); err != nil {
 		a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
 	}
 	a.emit(TurnEndedEvent{StopReason: stopReason, Usage: usage})
 }
 
-func (a *Agent) runSteps(ctx context.Context, images []string) (string, *provider.Usage) {
-	var imgParts []provider.ContentPart
-	if len(images) > 0 {
-		parts, err := assembleImageParts(images)
-		if err != nil {
-			a.emit(ErrorEvent{Err: err})
-			return StopError, nil
-		}
-		imgParts = parts
-	}
+func (a *Agent) runSteps(ctx context.Context, imageRefs []string, imageParts []provider.ContentPart) (string, *provider.Usage) {
 	for step := 0; ; step++ {
 		a.absorbInbox()
 		if step == 0 {
@@ -299,21 +296,12 @@ func (a *Agent) runSteps(ctx context.Context, images []string) (string, *provide
 			a.autoCompact(ctx)
 		}
 
-		msgs := a.sess.DeriveMessages()
-		if len(imgParts) > 0 {
-			// 图片挂到最近的 user 消息并随每个请求重发：端点无状态，
-			// 工具环的后续请求不带图片即丢失图片上下文。
-			for i := len(msgs) - 1; i >= 0; i-- {
-				if msgs[i].Role == "user" {
-					msgs[i].Content = append(msgs[i].Content, imgParts...)
-					break
-				}
-			}
-		}
 		req := provider.Request{
-			Model:    a.model,
-			System:   a.system,
-			Messages: msgs,
+			Model:  a.model,
+			System: a.system,
+			// 图片只进请求尾部并随工具环每个请求重发（端点无状态）；
+			// 投影不含图，跨轮前缀与无图会话逐字节一致（I2）。
+			Messages: session.AttachImageParts(a.sess.DeriveMessages(), imageParts),
 			Tools:    a.reg.Defs(),
 		}
 		hash, err := provider.PrefixHash(req)
@@ -322,7 +310,7 @@ func (a *Agent) runSteps(ctx context.Context, images []string) (string, *provide
 			return StopError, nil
 		}
 		if err := a.sess.Append(session.TypeRequestHeader, session.RequestHeaderData{
-			PrefixHash: hash, MessageCount: len(req.Messages), Model: req.Model,
+			PrefixHash: hash, MessageCount: len(req.Messages), Model: req.Model, Images: imageRefs,
 		}); err != nil {
 			a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
 			return StopError, nil
@@ -656,35 +644,37 @@ func appendToolDelta(calls []provider.ToolCall, d *provider.ToolCallDelta) []pro
 	return calls
 }
 
-// assembleImageParts 把图片路径集合编码为 content image_url parts。
-// 读取失败、超过 20MB 或不支持的扩展名时返回错误，本次提交中止。
-func assembleImageParts(paths []string) ([]provider.ContentPart, error) {
-	mimes := map[string]string{
-		".png":  "image/png",
-		".jpg":  "image/jpeg",
-		".jpeg": "image/jpeg",
-		".gif":  "image/gif",
-		".webp": "image/webp",
-	}
-	parts := make([]provider.ContentPart, 0, len(paths))
+// importImages 读取并校验图片，写入会话资产存储：返回日志引用与本轮
+// 请求共用的 data URI parts（turn 级缓存，随 turn 结束释放）。重复路径
+// 去重；任一图片失败即整体报错，本次提交中止。
+func (a *Agent) importImages(paths []string) ([]string, []provider.ContentPart, error) {
+	var refs []string
+	var parts []provider.ContentPart
+	seen := map[string]bool{}
 	for _, p := range paths {
-		mimeType, ok := mimes[strings.ToLower(filepath.Ext(p))]
-		if !ok {
-			return nil, fmt.Errorf("不支持的图片格式：%s", p)
+		if seen[p] {
+			continue
 		}
+		seen[p] = true
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return nil, fmt.Errorf("读取图片 %s 失败：%w", p, err)
+			return nil, nil, fmt.Errorf("读取图片 %s 失败：%w", p, err)
 		}
 		if len(data) > 20*1024*1024 {
-			return nil, fmt.Errorf("图片 %s 超过 20MB 上限", p)
+			return nil, nil, fmt.Errorf("图片 %s 超过 20MB 上限", p)
 		}
-		parts = append(parts, provider.ContentPart{
-			Type:     "image_url",
-			ImageURL: &provider.ImageURL{URL: "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)},
-		})
+		part, ok := provider.ImagePart(filepath.Ext(p), data)
+		if !ok {
+			return nil, nil, fmt.Errorf("不支持的图片格式：%s", p)
+		}
+		ref, err := a.sess.Assets().Put(data, filepath.Ext(p))
+		if err != nil {
+			return nil, nil, fmt.Errorf("图片 %s 落盘失败：%w", p, err)
+		}
+		refs = append(refs, ref)
+		parts = append(parts, part)
 	}
-	return parts, nil
+	return refs, parts, nil
 }
 
 // emit 投递事件。root 取消后允许丢弃事件：一切落盘都先于对应 emit 完成，

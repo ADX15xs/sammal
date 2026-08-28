@@ -2,6 +2,7 @@ package provider
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -42,6 +43,28 @@ func ContentText(parts []ContentPart) string {
 		}
 	}
 	return b.String()
+}
+
+// ImagePart 把图片字节构造为 image_url content part（data URI 形态），
+// 扩展名（大小写不敏感）不支持时返回 false。agent 组装与会话重放共用
+// 的唯一构造点：同一字节在两侧必须产出逐字节一致的 part（重放哈希依赖）。
+func ImagePart(ext string, data []byte) (ContentPart, bool) {
+	mime, ok := imageMIME[strings.ToLower(ext)]
+	if !ok {
+		return ContentPart{}, false
+	}
+	return ContentPart{
+		Type:     "image_url",
+		ImageURL: &ImageURL{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)},
+	}, true
+}
+
+var imageMIME = map[string]string{
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
 }
 
 // ToolCall 是聚合完成的工具调用（assistant 消息携带，或来自日志重放）。

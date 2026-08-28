@@ -34,6 +34,7 @@ func (a *Agent) Rewind(turn int) (string, error) {
 	if err := a.sess.TruncateBeforeTurn(turn); err != nil {
 		return "", fmt.Errorf("日志截断失败：%w", err)
 	}
+	a.sess.PruneAssets()
 	return fmt.Sprintf("已回滚 turn %d：恢复 %d 个文件，会话日志截断到该 turn 之前（bash 副作用不在回滚范围）", turn, n), nil
 }
 
@@ -175,7 +176,11 @@ func (a *Agent) branchSession() (*session.Session, error) {
 	if err := os.WriteFile(path, out.Bytes(), 0o644); err != nil {
 		return nil, err
 	}
-	// 分支不带 checkpoint（快照属于原会话的物理写历史）。
+	// 分支日志的 request/header 引用原会话的图片资产，重放还原依赖，必须
+	// 随日志一起带走；checkpoint 属于原会话的物理写历史，不带。
+	if err := a.sess.Assets().CopyTo(dir); err != nil {
+		return nil, fmt.Errorf("资产复制失败：%w", err)
+	}
 	return session.Open(path)
 }
 
