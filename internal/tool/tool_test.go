@@ -14,18 +14,7 @@ import (
 func testRegistry(t *testing.T) (*Registry, string) {
 	t.Helper()
 	dir := t.TempDir()
-	shell := "bash"
-	if _, err := exec.LookPath("bash"); err != nil && runtime.GOOS == "windows" {
-		shell = "powershell"
-	}
-	return NewRegistry(
-		&ReadTool{WorkDir: dir},
-		&WriteTool{WorkDir: dir},
-		&EditTool{WorkDir: dir},
-		&BashTool{WorkDir: dir, Shell: shell},
-		&GrepTool{WorkDir: dir},
-		&GlobTool{WorkDir: dir},
-	), dir
+	return NewRegistry(Resolve(dir, shellForTest(t), nil)...), dir
 }
 
 func shellForTest(t *testing.T) string {

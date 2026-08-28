@@ -32,6 +32,8 @@ type Config struct {
 	DefaultModel string           `toml:"default_model"`
 	Models       map[string]Model `toml:"models"`
 	UI           UI               `toml:"ui"`
+	// Tools 是启用工具名列表；空 = 默认六件套（tool.Resolve 兜底）。
+	Tools []string `toml:"tools"`
 }
 
 // DefaultPath 返回系统默认配置路径（~/.config/sammal/config.toml，

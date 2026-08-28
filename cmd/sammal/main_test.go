@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"sammal/internal/agent"
 	"sammal/internal/config"
 	"sammal/internal/provider"
+	"sammal/internal/tool"
 )
 
 func loadTestConfig(t *testing.T) (*config.Config, string) {
@@ -61,6 +63,46 @@ func TestEditorCommandResolution(t *testing.T) {
 		t.Errorf("配置应优先: %v", cmd.Args)
 	}
 	os.Unsetenv("VISUAL")
+}
+
+// 工具集配置化：cfg.Tools 驱动 registry 组装；缺省回退默认六件套，
+// 且 Defs() 的顺序与 schema 与硬编码时代一致（I2）。
+func TestToolRegistryFromConfig(t *testing.T) {
+	cfg, _ := loadTestConfig(t)
+
+	// 缺省：六件套，默认注册序。
+	r := toolRegistry(cfg, "/work", "bash")
+	got := toolDefNames(r)
+	want := []string{"read", "write", "edit", "bash", "grep", "glob"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("缺省工具 = %v, want %v", got, want)
+	}
+
+	// 子集：只保留配置命中项。
+	cfg.Tools = []string{"read", "write"}
+	r = toolRegistry(cfg, "/work", "bash")
+	got = toolDefNames(r)
+	if strings.Join(got, ",") != "read,write" {
+		t.Errorf("子集工具 = %v, want [read write]", got)
+	}
+
+	// schema 可序列化：空配置与子集都不得产出非法 JSON。
+	r = toolRegistry(cfg, "/work", "bash")
+	for _, d := range r.Defs() {
+		var check map[string]any
+		if err := json.Unmarshal(d.Function.Parameters, &check); err != nil {
+			t.Errorf("%s schema 非法 JSON: %v", d.Function.Name, err)
+		}
+	}
+}
+
+func toolDefNames(r *tool.Registry) []string {
+	defs := r.Defs()
+	names := make([]string, 0, len(defs))
+	for _, d := range defs {
+		names = append(names, d.Function.Name)
+	}
+	return names
 }
 
 func TestModelSpecsSorted(t *testing.T) {

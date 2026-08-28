@@ -100,6 +100,8 @@ model          = "deepseek-v4-flash"
 api_key_env    = "DEEPSEEK_API_KEY"  # 可选；本地端点可不设
 context_window = 131072
 
+tools = ["read", "write", "edit", "bash", "grep", "glob"]  # 可选；空 = 默认六件套
+
 [ui]
 editor = ""                          # Ctrl+E 默认 $VISUAL/$EDITOR，可强制指定
 ```

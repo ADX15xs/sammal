@@ -84,14 +84,7 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	}
 	defer sess.Close()
 
-	registry := tool.NewRegistry(
-		&tool.ReadTool{WorkDir: cwd},
-		&tool.WriteTool{WorkDir: cwd},
-		&tool.EditTool{WorkDir: cwd},
-		&tool.BashTool{WorkDir: cwd, Shell: facts.Shell},
-		&tool.GrepTool{WorkDir: cwd},
-		&tool.GlobTool{WorkDir: cwd},
-	)
+	registry := toolRegistry(cfg, cwd, facts.Shell)
 
 	// secrets 兜底：%APPDATA%\sammal\.env（进程环境变量优先，第 7.2 节）。
 	secrets := config.LoadEnvFile(configPath)
@@ -130,6 +123,12 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	}
 	cancelRoot()
 	return nil
+}
+
+// toolRegistry 按配置装配工具注册表：tools 为空时回退默认六件套。
+// 工具 schema 在会话创建时定格（I2），此处只做一次实例化。
+func toolRegistry(cfg *config.Config, cwd, shell string) *tool.Registry {
+	return tool.NewRegistry(tool.Resolve(cwd, shell, cfg.Tools)...)
 }
 
 func fatal(err error) {

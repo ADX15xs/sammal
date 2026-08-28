@@ -37,6 +37,35 @@ editor = "nvim"
 	}
 }
 
+func TestLoadTools(t *testing.T) {
+	load := func(toml string) *Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(toml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	// 缺省：Tools 为空，tool.Resolve 回退默认六件套。
+	if c := load("default_model = \"m\"\n"); len(c.Tools) != 0 {
+		t.Errorf("缺省 Tools = %v, want 空", c.Tools)
+	}
+	// 显式空列表与缺省等价。
+	if c := load("default_model = \"m\"\ntools = []\n"); len(c.Tools) != 0 {
+		t.Errorf("空列表 Tools = %v, want 空", c.Tools)
+	}
+	// 子集声明：保留配置序。
+	c := load("default_model = \"m\"\ntools = [\"read\", \"write\"]\n")
+	if len(c.Tools) != 2 || c.Tools[0] != "read" || c.Tools[1] != "write" {
+		t.Errorf("子集 Tools = %v", c.Tools)
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "none.toml"))
 	if err == nil {
