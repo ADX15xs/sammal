@@ -21,7 +21,7 @@ func TestReasoningRenderArtifactFree(t *testing.T) {
 	m := New(Deps{
 		ModelName: "qwen3:8b",
 		Events:    evs,
-		Send:      func(string) {},
+		Send:      func(string, []string) {},
 		Abort:     func() {},
 		Slash:     func(string) []string { return nil },
 		Models:    func() []string { return nil },
