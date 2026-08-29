@@ -106,6 +106,95 @@ func TestReasoningLineShowsElapsed(t *testing.T) {
 	}
 }
 
+// tailWindow 纯函数矩阵：尾部跟随窗口的确定性断言。
+func TestTailWindow(t *testing.T) {
+	// 不超宽：原样返回。
+	if got := tailWindow("abc", 10); got != "abc" {
+		t.Fatalf("不超宽应原样返回: %q", got)
+	}
+	// 超宽：精确取尾部 4 列。
+	if got := tailWindow("abcdefgh", 4); got != "efgh" {
+		t.Fatalf("超宽应取尾段: %q", got)
+	}
+	// CJK：宽度 4 = 两个汉字，窗口边缘不截半宽字。
+	if got := tailWindow("思考文本测试", 4); got != "测试" {
+		t.Fatalf("CJK 应按整字取尾: %q", got)
+	}
+	// CJK 与 ASCII 混排：3 列窗口从尾部贪心装填，考(2列)放不下则只取 ASCII。
+	if got := tailWindow("ab思考cd", 3); got != "cd" {
+		t.Fatalf("混排应按显示宽度从尾贪心取: %q", got)
+	}
+	// width<=0：空串。
+	if got := tailWindow("abc", 0); got != "" {
+		t.Fatalf("width=0 应返回空: %q", got)
+	}
+}
+
+// 思考行超宽时尾部跟随：前缀（思考中）固定，正文保留最新 token，总宽不超终端。
+func TestReasoningTailFollowsLatest(t *testing.T) {
+	m := New(Deps{ModelName: "m"})
+	m.width = 30
+	m = applyEvent(t, m, agent.TurnStartedEvent{})
+
+	// 分多个 token 流式到达，每个 token 后渲染都应以它结尾。
+	tokens := []string{"思考", "进行", "中，", "最新", "内容", "在此"}
+	for i, tk := range tokens {
+		m = applyEvent(t, m, agent.ReasonDeltaEvent{Text: tk})
+		lines := m.streamBlockLines(m.width)
+		if len(lines) != 1 {
+			t.Fatalf("token %d: 应只有 1 行: %v", i, lines)
+		}
+		plain := stripANSI(lines[0])
+		if !strings.HasPrefix(plain, "- 思考中") {
+			t.Fatalf("token %d: 前缀应固定: %q", i, plain)
+		}
+		if !strings.HasSuffix(plain, tk) {
+			t.Fatalf("token %d: 应跟随最新 token %q: %q", i, tk, plain)
+		}
+		if widthOf(plain) > m.width-1 {
+			t.Fatalf("token %d: 总宽不应超终端: %d > %d: %q", i, widthOf(plain), m.width-1, plain)
+		}
+	}
+
+	// 换行闭合旧行后窗口重开，新行从头累积。
+	m = applyEvent(t, m, agent.ReasonDeltaEvent{Text: "\n新行"})
+	plain := stripANSI(m.streamBlockLines(m.width)[0])
+	if !strings.HasSuffix(plain, "新行") || strings.Contains(plain, "在此") {
+		t.Fatalf("换行后应只显示新行: %q", plain)
+	}
+}
+
+// 工具环回归：思考行出现/消失与工具行打印交错时，View 行数稳定、无空行。
+func TestReasoningToolLoopStable(t *testing.T) {
+	m := New(Deps{ModelName: "m"})
+	m.width = 40
+	long := "这是一段很长的思考内容用于触发尾部跟随窗口的裁切逻辑"
+
+	// 事件流：两轮「思考→定稿→工具调用→工具结果」。
+	evs := []agent.Event{
+		agent.TurnStartedEvent{},
+		agent.ReasonDeltaEvent{Text: long},
+		agent.ReasonFinalEvent{},
+		agent.ToolCallEvent{ID: "1", Name: "read", ArgsSummary: "a.txt"},
+		agent.ToolResultEvent{ID: "1", Name: "read"},
+		agent.ReasonDeltaEvent{Text: long},
+		agent.ReasonFinalEvent{},
+		agent.ToolCallEvent{ID: "2", Name: "grep", ArgsSummary: "query"},
+	}
+	for i, ev := range evs {
+		m = applyEvent(t, m, ev)
+		lines := m.streamBlockLines(m.width)
+		if len(lines) > 3 {
+			t.Fatalf("事件 %d: View 行数超限: %v", i, lines)
+		}
+		for j, ln := range lines {
+			if stripANSI(ln) == "" {
+				t.Fatalf("事件 %d: 第 %d 行为空串", i, j)
+			}
+		}
+	}
+}
+
 // MessageFinal 也更新 usage：多 step 工具环中 ctx% 随 step 刷新。
 func TestUsageUpdatesAtMessageFinal(t *testing.T) {
 	m := New(Deps{ModelName: "m", ContextWindow: 1000})
