@@ -12,21 +12,11 @@ import (
 // DefaultContextWindow 未配置时的兜底窗口；compaction 触发阈值依赖它。
 const DefaultContextWindow = 32768
 
-// DefaultRetryMax 未配置 retry_max 时的断流重连预算（用户故事：免费/线上
-// 端点瞬断常见，默认给 3 次耐心；订阅 plan 用量窗口靠快速失败而非重试）。
-const DefaultRetryMax = 3
-
-// DefaultRateLimitBudget 未配置 rate_limit_budget 时 429 宽容预算；
-// 预算耗尽后切换到 5s 起步的指数退避，覆盖大多数分钟级限流窗口。
-const DefaultRateLimitBudget = 5
-
 type Model struct {
-	BaseURL          string `toml:"base_url"`
-	Model            string `toml:"model"`
-	APIKeyEnv        string `toml:"api_key_env"`
-	ContextWindow    int    `toml:"context_window"`
-	RetryMax         int    `toml:"retry_max"`         // 断流重连上限；0 = 默认
-	RateLimitBudget  int    `toml:"rate_limit_budget"` // 429 宽容预算（按端点连续命中计数）；0 = 默认
+	BaseURL       string `toml:"base_url"`
+	Model         string `toml:"model"`
+	APIKeyEnv     string `toml:"api_key_env"`
+	ContextWindow int    `toml:"context_window"`
 }
 
 type UI struct {
@@ -79,14 +69,6 @@ func Load(path string) (*Config, error) {
 	for name, m := range c.Models {
 		if m.ContextWindow == 0 {
 			m.ContextWindow = DefaultContextWindow
-			c.Models[name] = m
-		}
-		if m.RetryMax <= 0 {
-			m.RetryMax = DefaultRetryMax
-			c.Models[name] = m
-		}
-		if m.RateLimitBudget <= 0 {
-			m.RateLimitBudget = DefaultRateLimitBudget
 			c.Models[name] = m
 		}
 	}

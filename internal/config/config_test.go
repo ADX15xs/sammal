@@ -28,12 +28,6 @@ editor = "nvim"
 	if c.Models["local"].ContextWindow != DefaultContextWindow {
 		t.Errorf("context_window = %d, 默认值未填充", c.Models["local"].ContextWindow)
 	}
-	if c.Models["local"].RetryMax != DefaultRetryMax {
-		t.Errorf("retry_max = %d, 默认值未填充", c.Models["local"].RetryMax)
-	}
-	if c.Models["local"].RateLimitBudget != DefaultRateLimitBudget {
-		t.Errorf("rate_limit_budget = %d, 默认值未填充", c.Models["local"].RateLimitBudget)
-	}
 	name, m, err := c.Resolve("")
 	if err != nil || name != "local" || m.Model != "qwen3:32b" {
 		t.Errorf("resolve = %s %+v %v", name, m, err)

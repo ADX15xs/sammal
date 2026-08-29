@@ -105,7 +105,6 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 		System:        agent.BuildSystemPrompt(facts),
 		DataRoot:      root,
 		ContextWindow: modelCfg.ContextWindow,
-		Retries:       modelCfg.RetryMax,
 		Models:        modelSpecs(cfg, secrets),
 	})
 
@@ -162,7 +161,6 @@ func modelSpecs(cfg *config.Config, secrets map[string]string) []agent.ModelSpec
 			ModelID: m.Model,
 			Client:  provider.NewClient(m.BaseURL, config.ResolveSecret(m.APIKeyEnv, secrets)),
 			Window:  m.ContextWindow,
-			Retries: m.RetryMax,
 		})
 	}
 	return specs

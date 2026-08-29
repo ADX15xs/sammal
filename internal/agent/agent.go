@@ -79,37 +79,38 @@ const (
 const (
 	// retryBackoff/retryCap 重连退避曲线：1s 起指数增长，单次等待上限 60s。
 	// 要求等待超过上限即订阅 plan 的用量窗口（小时级），走快速失败而非重试。
-	// defaultRateLimitBackoff 是 429 宽容预算耗尽后的基础退避；5s 起步的
-	// 指数曲线（5→10→20→40s）覆盖大多数分钟级限流窗口。
-	retryBackoff             = time.Second
-	defaultRateLimitBackoff  = 5 * time.Second
-	retryCap                 = time.Minute
-	eventsBuffer             = 256
+	retryBackoff = time.Second
+	retryCap     = time.Minute
+	// rateLimitBackoff 是 429 连续命中超过 rateLimitBudget 后的基础退避：
+	// 5s 起步的指数曲线（5→10→20→40s）覆盖大多数分钟级限流窗口。
+	rateLimitBackoff = 5 * time.Second
+	// rateLimitBudget 同一 step 内连续 429 的宽容次数，内置不可配置。
+	rateLimitBudget = 1
+	// defaultRetries 断流重连上限，内置不可配置：预算耗尽后的 429 曲线
+	// 总耐心 131s，覆盖分钟级限流窗口；端点宕机约 2 分钟内上抛错误。
+	defaultRetries = 5
+	eventsBuffer   = 256
 )
 
 // ModelSpec 是一个可切换模型的运行装配（/model 与 Ctrl+P 的数据源）。
 type ModelSpec struct {
-	Name           string // 配置键（用户可见名）
-	ModelID        string // 发给端点的 model 字符串
-	Client         provider.Provider
-	Window         int
-	Retries        int // 断流重连上限（config.Load 已回填默认）
-	RateLimitBudget int // 按端点连续命中 429 的宽容预算；0 = 默认
+	Name    string // 配置键（用户可见名）
+	ModelID string // 发给端点的 model 字符串
+	Client  provider.Provider
+	Window  int
 }
 
 // Config 装配 Agent 的全部依赖。
 type Config struct {
-	Root            context.Context
-	Provider        provider.Provider
-	Session         *session.Session
-	Registry        *tool.Registry
-	Checkpoints     *checkpoint.Store
-	System          string
-	DataRoot        string // /new /resume /branch 创建/打开会话的根目录
-	ContextWindow   int    // compaction 触发阈值依赖（0 = 不压缩）
-	Retries         int    // 初始模型的断流重连上限（config.Load 已回填默认）
-	RateLimitBudget int    // 初始模型 429 宽容预算（config.Load 已回填默认）
-	Models          []ModelSpec
+	Root          context.Context
+	Provider      provider.Provider
+	Session       *session.Session
+	Registry      *tool.Registry
+	Checkpoints   *checkpoint.Store
+	System        string
+	DataRoot      string // /new /resume /branch 创建/打开会话的根目录
+	ContextWindow int    // compaction 触发阈值依赖（0 = 不压缩）
+	Models        []ModelSpec
 }
 
 type Agent struct {
@@ -120,11 +121,8 @@ type Agent struct {
 	cp       *checkpoint.Store
 	system   string
 	dataRoot string
-	window   int
-	retries  int
-	// rateLimitBudget 记录端点连续 429 的宽容次数；跨 step 清零。
-	// 预算耗尽后切换到 5s 起步退避（覆盖分钟级限流窗口）。
-	rateLimitBudget int
+	window  int
+	retries int // 断流重连上限（内置 defaultRetries；测试直接注入）
 
 	model      string // 当前请求使用的 model ID
 	modelName  string // 当前模型配置键
@@ -147,16 +145,15 @@ func New(cfg Config) *Agent {
 	}
 	modelID, modelName := resolveModel(cfg)
 	a := &Agent{
-		root:            root,
-		prov:            cfg.Provider,
-		sess:            cfg.Session,
-		reg:             cfg.Registry,
-		cp:              cfg.Checkpoints,
-		system:          cfg.System,
-		dataRoot:        cfg.DataRoot,
-		window:          cfg.ContextWindow,
-		retries:         cfg.Retries,
-		rateLimitBudget: cfg.RateLimitBudget,
+		root:      root,
+		prov:      cfg.Provider,
+		sess:      cfg.Session,
+		reg:       cfg.Registry,
+		cp:        cfg.Checkpoints,
+		system:    cfg.System,
+		dataRoot:  cfg.DataRoot,
+		window:    cfg.ContextWindow,
+		retries:   defaultRetries,
 		model:     modelID,
 		modelName: modelName,
 		events:    make(chan Event, eventsBuffer),
@@ -208,8 +205,6 @@ func (a *Agent) switchModel(name string) ([]string, error) {
 	}
 	a.prov = spec.Client
 	a.window = spec.Window
-	a.retries = spec.Retries
-	a.rateLimitBudget = spec.RateLimitBudget
 	a.modelName = name
 	a.model = spec.ModelID
 	a.emit(ModelSwitchedEvent{Name: name, Window: spec.Window})
@@ -359,8 +354,9 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 	var text strings.Builder
 	var toolCalls []provider.ToolCall
 	var usage *provider.Usage
-	// rlHits 跟踪当前 step 内连续 429 的次数；首次 429 重置为 1，
-	// 非 429 错误（网络/停滞/服务端）把计数器清零，避免跨 step 累积。
+	// rlHits 是当前 step 内连续 429 的次数；非 429 错误（网络/停滞/服务端）
+	// 清零。两条错误路径都先更新计数再进 handleInterrupt，预算判定用的
+	// 是本次命中后的值。
 	rlHits := 0
 
 	for attempt := 0; ; attempt++ {
@@ -374,13 +370,13 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 
 		ch, err := a.prov.Stream(ctx, req)
 		if err != nil {
-			if ok, stop := a.handleInterrupt(ctx, err, attempt, rlHits); !ok {
-				return a.finalizePartial(text.String(), toolCalls), toolCalls, usage, stop
-			}
 			if isRateLimit(err) {
 				rlHits++
 			} else {
 				rlHits = 0
+			}
+			if ok, stop := a.handleInterrupt(ctx, err, attempt, rlHits); !ok {
+				return a.finalizePartial(text.String(), toolCalls), toolCalls, usage, stop
 			}
 			continue
 		}
@@ -564,19 +560,20 @@ func argsSummary(args json.RawMessage) string {
 
 // handleInterrupt 处理一次断流，返回 (继续下一 attempt, 终止错误)，恰一
 // 个有效。优先级：用户中止 > 用量窗口快速失败 > 预算内重连 > 上抛。
-// rlHits 是当前 step 内连续 429 的次数；预算耗尽后切换到 5s 起步退避。
+// rlHits 是当前 step 内连续 429 的次数（调用方已更新）；超过 rateLimitBudget
+// 后退避切换 5s 起步。
 func (a *Agent) handleInterrupt(ctx context.Context, err error, attempt int, rlHits int) (bool, error) {
 	if ctx.Err() != nil {
 		return false, context.Canceled
 	}
 	if overWaitLimit(err, attempt) {
-		wait := requiredWait(attempt, retryAfterOf(err))
+		wait := max(retryBackoff<<attempt, retryAfterOf(err))
 		a.emit(ErrorEvent{Err: fmt.Errorf("%v；超过单次等待上限 %s，停止自动重试：预计 %s 前后可恢复（会话已保留，稍后重发即可）",
 			err, retryCap, time.Now().Add(wait).Format("15:04"))})
 		return false, err
 	}
 	if retryable(err) && attempt < a.retries {
-		base := backoffBaseFor(attempt, rlHits, a.rateLimitBudget)
+		base := backoffBaseFor(rlHits)
 		if !a.retryPause(ctx, err, attempt, base) {
 			return false, context.Canceled
 		}
@@ -599,55 +596,25 @@ func (a *Agent) retryPause(ctx context.Context, err error, attempt int, base tim
 	}
 }
 
-// requiredWait 返回第 attempt 次重试前应等待的时长（指数退避与端点要求
-// 取大者，未截断）；结果超过 retryCap 即小时级用量窗口的信号。
-func requiredWait(attempt int, retryAfter time.Duration) time.Duration {
-	if d := retryBackoff << attempt; d > retryAfter {
-		return d
-	}
-	return retryAfter
-}
-
-// backoffBaseFor 返回第 attempt 次重试的基础退避间隔。
-// rlHits 是当前 step 内连续 429 次数：预算耗尽（rlHits > budget）时，
-// 基础退避从 1s 提升到 5s，覆盖大多数分钟级限流窗口。
-// budget=0 表示关闭该机制（始终返回 retryBackoff）。
-func backoffBaseFor(attempt int, rlHits int, budget int) time.Duration {
-	if budget > 0 && rlHits > budget {
-		return defaultRateLimitBackoff
-	}
-	if budget == 0 && rlHits > 0 {
-		return defaultRateLimitBackoff
+// backoffBaseFor 返回本次重试的基础退避间隔：同一 step 内连续 429 超过
+// rateLimitBudget 次后从 1s 提升到 5s，覆盖大多数分钟级限流窗口。
+func backoffBaseFor(rlHits int) time.Duration {
+	if rlHits > rateLimitBudget {
+		return rateLimitBackoff
 	}
 	return retryBackoff
 }
 
-// backoffFor 实际等待时长：requiredWait 截断到单次等待上限。
-// base 为本次重试的基础退避（来自 backoffBaseFor）。
+// backoffFor 实际等待时长：基础退避与端点要求取大者，截断到单次等待上限。
 func backoffFor(attempt int, retryAfter time.Duration, base time.Duration) time.Duration {
-	if d := base << attempt; d > retryAfter {
-		if d < retryCap {
-			return d
-		}
-		return retryCap
-	}
-	if retryAfter > 0 && retryAfter < retryCap {
-		return retryAfter
-	}
-	if retryAfter > retryCap {
-		return retryCap
-	}
-	if base << attempt < retryCap {
-		return base << attempt
-	}
-	return retryCap
+	return min(max(base<<attempt, retryAfter), retryCap)
 }
 
 // overWaitLimit 报告端点要求的等待超出单次上限（订阅 plan 的用量窗口以
 // 小时计）：继续循环重试无意义，应立即上报恢复时间点。
 func overWaitLimit(err error, attempt int) bool {
 	ra := retryAfterOf(err)
-	return ra > 0 && requiredWait(attempt, ra) > retryCap
+	return ra > 0 && max(retryBackoff<<attempt, ra) > retryCap
 }
 
 func retryAfterOf(err error) time.Duration {
