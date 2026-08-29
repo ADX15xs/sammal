@@ -2,7 +2,7 @@
 
 > 本文档是 Sammal 的开发主文档。设计决策、不变量、模块规格与里程碑以此为准；README 只做导览。
 >
-> 状态：规格阶段（M0 尚未开始）。决策记录格式：本章陈述为基线，后续变更在文末「决策变更记录」追加，不静默修改。
+> 状态：实现阶段——M0–M4 已全部交付（2026-08-23，git log 与第 9 章为证），此后特性增量以文末「决策变更记录」追加为准。决策记录格式：本章陈述为基线，后续变更在文末「决策变更记录」追加，不静默修改。
 
 ---
 
@@ -74,6 +74,8 @@ Sammal 是一个随需求生长、始终满足六条不变量（第 2 章）、�
 - **消息历史**：`session.DeriveMessages()` 通过 `projector` 确定性投影日志。turn 间的工具结果投影受剪枝策略影响（见下文豁免区）
 
 **注 —— 剪枝豁免区**：`session.go` 中 `projector.messages()` 对超过 `pruneThreshold`（8KB）的旧 turn 工具结果做头尾截断，**是唯一允许的前缀非单调变化**。新增剪枝路径须过 I1 重放测试。
+
+**注 —— 图片放置规则**：多模态图片不进消息投影，只在请求构造时经 `session.AttachImageParts` 追加到最后一条 user 消息尾部——带图请求的前缀因此与无图会话逐字节一致。放置与重放还原机制见 6.9。
 
 **新增请求类型模式**：`agent/commands.go:compact()` 展示了如何构造一个复用前缀缓存的请求（逐字重放 + 尾部追加指令）。新增类似请求应遵循此模式。
 
@@ -273,7 +275,7 @@ loop:
 关键设计：
 
 - **消息收件箱**：生成期间用户输入进入队列（不丢弃、不注入进行中的请求），在下一个 step 边界吸收——用户可以随时插话纠偏
-- **断流分类重连**：网络/停滞/限流/服务端错误在 step 边界重连，重试同一请求（逐字节一致，I2/KV 缓存友好）。退避 = max(1s 指数增长, Retry-After)，单次等待上限 60s；要求等待超过 60s 即订阅 plan 的用量窗口（小时级），立即放弃重试并注明恢复时间点；429 命中配额特征串同样直接上抛。重试预算按模型配置（`retry_max`，用户故事：免费端点与付费端点限额差异大，本地 Ollama 保持快速失败、免费云端多熬几次）
+- **断流分类重连**：网络/停滞/限流/服务端错误在 step 边界重连，重试同一请求（逐字节一致，I2/KV 缓存友好）。退避 = max(基础退避指数增长, Retry-After)，单次等待上限 60s；要求等待超过 60s 即订阅 plan 的用量窗口（小时级），立即放弃重试并注明恢复时间点；429 命中配额特征串同样直接上抛。重试上限与退避曲线**内置不可配置**：上限 5 次；同一 step 内连续 429 超过 1 次后基础退避从 1s 切到 5s（两段式），对分钟级限流窗口的总耐心约 131s
 - **中止语义**：`Esc` 触发 AbortSignal 贯穿流与工具执行；已产出部分内容标记 `interrupted` 存为 assistant 消息；**未执行的工具调用写入合成错误结果**（"aborted before execution"），保证 I1/I3 可重放
 - **无 max-steps**：循环跑到模型自己停（token 压力由 compaction 兜底）；若实测需要上限，作为 DEBT 记账后加
 - v1 工具顺序执行；并行执行（有界池 + 按序提交结果，dsh 方案）是明确的生长点，不在 v1 设计
@@ -325,6 +327,7 @@ func ForTUI(r Result) string
 ~/.local/share/sammal/sessions/<normalized-cwd>/<session-id>/
     session.jsonl          # 事件日志（唯一真相）
     checkpoints/           # per-turn 快照
+    assets/                # 内容寻址图片资产（首次带图提交时创建，6.9）
 ```
 
 （Windows：`%LOCALAPPDATA%\sammal\sessions\...`；`<normalized-cwd>` 把路径分隔符等 unsafe 字符替换为 `-`）
@@ -334,18 +337,18 @@ func ForTUI(r Result) string
 首行是不可变 `SessionHeader`；其后每行一个事件：
 
 ```jsonc
-{"seq":1,"ts":"...","type":"session/header","data":{"id":"...","cwd":"...","model":"qwen3:32b","created":"..."}}
+{"seq":1,"ts":"...","type":"session/header","data":{"id":"...","cwd":"...","model":"qwen3-local","created":"..."}}
 
 // 事件类型（envelope 统一：seq / ts / type / data）
-session/header                          // 会话身份与初始预设
-user/message        {"text":"..."}
+session/header                          // 会话身份与提示词事实；model 存配置键（唯一身份）
+user/message        {"text":"...","images":["<sha256><ext>"]}   // images = assets/ 资产引用；投影不含图
 assistant/chunk     {"delta":"...","kind":"text|reasoning"}  // 流式增量（UI 保真）；reasoning 落日志不投影
-assistant/message   {"text":"...","toolCalls":[...],"interrupted":false}
+assistant/message   {"text":"...","toolCalls":[...],"interrupted":false,"synthetic":false}  // synthetic = 崩溃恢复自 chunk 合成
 tool/call           {"id":"...","name":"edit","args":{...}}
-tool/result         {"id":"...","canonical":{...}}     // I5：canonical 入日志
-request/header      {"prefixHash":"...","messageCount":n}  // I1：请求形态留痕
-compaction/happened {"summaryRange":[a,b],"keptFrom":c}
-turn/end            {"stopReason":"..."}
+tool/result         {"id":"...","canonical":{...},"synthetic":false}     // I5：canonical 入日志
+request/header      {"prefixHash":"...","messageCount":n,"model":"<端点 model>","images":[...]}  // I1：请求形态留痕；images 供重放还原图片
+compaction/happened {"summary":"...","summaryRange":[a,b],"keptFrom":c}
+turn/end            {"turn":n,"stopReason":"...","synthetic":false}
 ```
 
 #### 6.5.3 恢复 / 分支 / 崩溃恢复
@@ -358,7 +361,7 @@ turn/end            {"stopReason":"..."}
 
 ### 6.6 compaction — 上下文压缩
 
-**触发**：投影后的模型历史估算 token ≥ 0.8 × `context_window`（模型预设中配置）。
+**触发**：投影后的模型历史估算 token ≥ 0.8 × `context_window`（模型预设中配置），在 **turn 开始的 step 边界**检查——turn 内不触发：工具环正在消费自己产出的上下文，中途换前缀会破坏 step 语义（turn 内撑爆上下文的场景见 DEBT 记账）。
 
 **配方**（Reasonix 与 dsh 独立收敛，直接继承）：
 
@@ -366,7 +369,9 @@ turn/end            {"stopReason":"..."}
 2. **LLM 摘要**：仍超限则把被遮蔽区间交给模型产出结构化简报，固定模板：`当前任务 / 关键决定 / 相关文件 / 已遇错误 / 待办 / 下一步`
 3. **保留尾部**：最新 0.16 × 窗口的 turn 原文保留（永不小于 2 个 turn）
 4. **缓存复用**：摘要请求**逐字重放**原系统提示词 + 工具 schema + 被遮蔽消息，只在尾部追加摘要指令——前缀 KV 缓存直接命中（I2）
-5. 摘要以 `<compacted-summary>` 包裹替换旧区间，`compaction/happened` 事件落日志
+5. 摘要以 `<compacted-summary>` 包裹替换旧区间，`compaction/happened` 事件落日志（`summary` 存完整摘要文本）
+
+摘要请求**不留痕** `request/header`：它是日志的确定性函数（遮蔽区间投影 + 常量模板），重放可重建；留痕反而破坏 `ReplayRequestHashes` 的投影语义。
 
 ### 6.7 tui — 内联滚动前端
 
@@ -375,8 +380,10 @@ turn/end            {"stopReason":"..."}
 渲染策略：
 
 - **定稿内容追加进原生滚动缓冲区**（`tea.Println` 语义）：assistant 定稿消息、工具结果投影、状态行——终端原生滚动/搜索/复制全保留
-- **唯一的可变区**：底部输入框 + 其上方一小块"正在生成"的当前流式块（原地重绘仅限这一小块，宽字符变化时整块全量重绘——显式策略，不做平台补丁）
-- **弹窗状态用一个枚举集中管理**（none / modelPicker / branchPicker / rewindPicker…），避开 Reasonix 的 nil 链互斥
+- **唯一的可变区**：底部一块——当前流式块（尾部至多 8 行）+ 思考行 + 状态栏一行 + 底部输入框（原地重绘仅限这一块，宽字符变化时整块全量重绘——显式策略，不做平台补丁）
+- **思考行**（reasoning 增量，dsh 方案）：只渲染最新一行暗色文字 `- 思考中 <计时> | <正文>`，超宽走尾部跟随；定稿即整行撤出视窗（行为细节见 8.3）
+- **状态栏**：常驻一行，段构成与丢弃优先级见 8.3
+- **弹窗状态用一个枚举集中管理**（none / modelPicker…），避开 Reasonix 的 nil 链互斥
 - `Ctrl+P` 模型选择器：输入框上方的内嵌列表，自带模糊过滤（不依赖外部 fzf）
 - `Ctrl+E` 长输入：临时文件 + `tea.ExecProcess` 调 `$VISUAL`/`$EDITOR`，保存退出后内容进入输入框待发送
 - Markdown 渲染 v1 不做（纯文本 + 保留换行），列为生长点
@@ -390,6 +397,16 @@ CJK 安全策略（集中声明，替代散布的终端特判）：
 ### 6.8 config — 配置
 
 TOML，加载顺序：默认值 → 用户配置。每个键的当下用户故事见 7.2。
+
+### 6.9 多模态图片
+
+M4 后增量（2026-08-28/29，见决策变更记录）：
+
+- **入口**：TUI 命令 `/attach <path...>`（无参列出，`-clear` 清空）累积待发送图片，随下一条消息提交；支持 png / jpg / jpeg / gif / webp，单张上限 20MB，任一图片校验失败则整体报错、本次提交中止
+- **存储**：字节按内容寻址落会话目录 `assets/<sha256><ext>`，日志只存引用（文件名）——JSONL 不膨胀，同字节幂等去重
+- **请求放置**：图片只进请求尾部（最后一条 user 消息 content 追加 `image_url` data URI part），不进投影——带图请求前缀与无图会话逐字节一致（I2）；随工具环每个请求在尾部重发（端点无状态）
+- **重放还原**：`request/header.images` 记录每次请求携带的资产引用，重放据此重建带图请求；资产被外部删除时该图跳过、对应请求重放哈希不一致，属既定降级语义（DEBT 记账）
+- **生命周期**：`/branch` 随日志复制全部资产到新会话；`/rewind` 截断后清理不再被引用的孤儿资产；生成中带图插话被静默丢弃（收件箱只承载文本，DEBT 记账）
 
 ---
 
@@ -410,25 +427,19 @@ default_model = "qwen3-local"        # 用户故事：日常启动即用，不�
 base_url      = "http://localhost:11434/v1"
 model         = "qwen3:32b"
 api_key_env   = "OLLAMA_API_KEY"     # 可选；本地端点可不设
-context_window = 131072              # compaction 触发阈值依赖它
+context_window = 131072              # compaction 触发阈值依赖它；缺省 32768
 
 [models.deepseek]                    # 用户故事：云端备选，Ctrl+P 切换
-base_url      = "https://api.deepseek.com/v1"
-model         = "deepseek-chat"
+base_url      = "https://api.deepseek.com"
+model         = "deepseek-v4-flash"
 api_key_env   = "DEEPSEEK_API_KEY"
 context_window = 131072
-
-[models.free-api]                    # 用户故事：免费云端端点限额严格，多熬几次限流
-base_url      = "https://free-relay.example.com/v1"
-model         = "free-chat"
-api_key_env   = "FREE_API_KEY"
-retry_max     = 6                    # 断流重连上限；缺省 3（退避曲线为代码常量，不进配置）
 
 [ui]
 editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDITOR，可强制指定
 ```
 
-配置面收敛原则：新增键必须登记用户故事；宁可代码常量，不可配置膨胀。
+配置面收敛原则：新增键必须登记用户故事；宁可代码常量，不可配置膨胀。断流重连的次数与退避曲线即按此内置为代码常量（见 6.2）。
 
 ### 7.3 模型预设
 
@@ -446,7 +457,7 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | `Ctrl+E` | `$EDITOR` 编辑长输入 | 原构想保留；多行/粘贴大段的主路径 |
 | `Ctrl+P` | 模型选择器（模糊过滤） | 原构想保留；去外部 fzf 依赖 |
 | `Esc` | 中止当前生成（abort 语义见 6.2） | 生成期最高频操作 |
-| `Ctrl+C` | 生成中 = 中止；空闲输入框 = 退出（空确认） | 惯例；防误退 |
+| `Ctrl+C` | 生成中 = 中止；空闲空输入 = 退出；非空输入 = 清空，3 秒内再按退出 | 惯例；防误退 |
 | `↑` / `↓`（输入框空时） | 翻阅历史输入 | 惯例 |
 
 ### 8.2 最小 slash 命令集（逐个登记理由）
@@ -455,10 +466,11 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 |---|---|
 | `/model [name]` | 无参打开选择器；模型切换是核心工作流 |
 | `/new` | 开新会话（频繁操作不值得退出重启） |
+| `/attach [path...]` | 图片输入入口：附加 / 列出 / `-clear` 清空待发送图片（TUI 侧管理，随下一条消息提交） |
 | `/resume` | 恢复历史会话（I3 的用户入口） |
 | `/branch` | 从当前 turn 分叉探索（会话分支的用户入口） |
 | `/compact` | 手动触发压缩（自动触发之外的逃生门） |
-| `/rewind [n]` | 回滚代码与对话（快照的用户入口） |
+| `/rewind [n]` | 回滚代码与对话（快照的用户入口）；无参列出可回滚的 turn |
 | `/help` | 命令自述 |
 
 新增命令须在此表登记理由；不设别名、不做分组嵌套（避开 45+ 命令平铺的可达性灾难）。
@@ -466,9 +478,9 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 ### 8.3 流式渲染行为
 
 - 文本/思考增量：只更新"当前流式块"（可变区），定稿时一次性追加进滚动缓冲区
-- 思考（reasoning）：只渲染**最新一行**暗色文字 + 计时器（缓解等待焦虑的最小口子，dsh 方案）；思考块闭合即整行撤出视窗，不留摘要。全文经 `assistant/chunk kind=reasoning` 落日志（人类回看），**不进模型投影**——发给模型的历史不含思考
+- 思考（reasoning）：只渲染**最新一行**暗色文字 + 计时器（缓解等待焦虑的最小口子，dsh 方案）；增量按 token 到达，正文超宽走尾部跟随（保留最新 token，无省略号）；思考块闭合即整行撤出视窗，不留摘要。全文经 `assistant/chunk kind=reasoning` 落日志（人类回看），**不进模型投影**——发给模型的历史不含思考
 - 工具调用：`tool/call` 到达时输出一行摘要（工具名 + 参数摘要）；`tool/result` 到达时追加投影（截断至可读长度）
-- 状态行：当前模型、token 用量、缓存命中指标（I2 的可观测出口）、上下文窗口占用 `ctx %`（≥70% 黄、≥80% 压缩触发线红）、生成中显示 turn 计时与本轮工具调用数。空间不足时按丢弃优先级从右往左裁剪：ctx → in/out → cache → 计时器 → 工具数；模型名与生成中标记永不丢
+- 状态行：当前模型、token 用量、缓存命中指标（I2 的可观测出口）、上下文窗口占用 `ctx %`（≥70% 黄、≥80% 压缩触发线红）、生成中显示 turn 计时与本轮工具调用数；usage 随每个 step 定稿更新，ctx% 因此跟随工具环推进。空间不足时按丢弃优先级裁剪：工具数 → 计时器 → cache → in/out → ctx（模型名与生成中标记永不丢，负优先级段不可裁剪）；达到压缩触发线时 turn 结束后追加一次文字预警（一轮只报一次）
 
 ---
 
@@ -476,40 +488,42 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 
 每个里程碑的验收 = **功能测试 + 不变量测试 + 收尾纯净清单**（3.4 节）三重门。
 
-### M0 走路骨架
+### M0 走路骨架 —— 已交付（02fb687，2026-08-23）
 
 范围：provider（SSE 流式，无工具调用）+ tui 内联模式 + 单轮对话（无会话持久化）。
 
 - 验收：流式输出追加进滚动缓冲区；`Enter` 发送；`Esc` 中止；CJK 输入/删除/光标移动正确（Windows Terminal + iTerm2 + Linux 终端各过一遍）
 - 不变量测试起步：I2 前缀 golden bytes（系统提示词序列化确定性）
 
-### M1 工具环 + 快照
+### M1 工具环 + 快照 —— 已交付（80e4526，2026-08-23）
 
 范围：六件套工具 + agent 多 step 循环 + 收件箱 steering + 中止语义 + per-turn 快照 + `/rewind`。
 
 - 验收：模型能用工具完成"读文件→改文件→跑命令验证"闭环；中止后日志可重放；`/rewind` 同时回滚文件与对话；无 bash 的 Windows 上 PowerShell 降级生效
 - 不变量测试：I1 golden 请求重放、I5 投影分离单测
 
-### M2 会话全套
+### M2 会话全套 —— 已交付（e8ba2f6，2026-08-23）
 
 范围：JSONL 事件日志 + `/new` `/resume` `/branch` + compaction 全配方 + 崩溃恢复。
 
 - 验收：kill -9 后 resume 状态一致；分支后两会话独立演进；0.8× 触发压缩且摘要请求前缀命中（usage 可证）；`/compact` 手动触发可用
 - 不变量测试：I3 重放一致性、I2 跨轮前缀比对、压缩前缀重放命中
 
-### M3 模型切换 + CJK 打磨
+### M3 模型切换 + CJK 打磨 —— 已交付（c1e01e1，2026-08-23）
 
 范围：`Ctrl+P` 选择器 + 多模型配置 + 切换语义（历史 carried、缓存重建如实提示）+ CJK 显式策略全量落地（uniseg 审计、bar 光标、宽字符整块重绘）。
 
 - 验收：会话中途切模型历史不丢；切换后首条提示"KV 缓存已重建"（诚实呈现，不隐藏）；CJK 策略无终端型号分叉
 - 不变量测试：全量回归
 
-### M4 发布
+### M4 发布 —— 已交付（d470f76，2026-08-23）
 
 范围：goreleaser 六目标交叉编译 + README/文档对齐 + DEBT.md 审计。
 
 - 验收：六个平台产物可运行；文档与实现一致；账本无未核对的 TODO/FIXME
 - 不变量测试：全量回归
+
+里程碑之外的特性生长以「决策变更记录」为记录；修复与测试类提交见 git log。
 
 ---
 
@@ -547,3 +561,8 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-08-23 | request/header 事件数据增加 model 字段（规格 6.5.2 最小示例之外） | 会话中途切模型（M3）后重放逐字节比对需要当时请求所用的模型名；I1 要求的必然推论 |
 | 2026-08-23 | 配置面新增 secrets 能力（7.2 之外）：config.toml 同目录 `.env`（Windows `%APPDATA%\sammal\.env`）作为 `api_key_env` 的值兜底；同名进程环境变量优先 | 用户故事：Windows 调全局环境变量成本高；`.env` 跟随配置目录、不入日志、不占会话。优先序沿 dotenv 惯例（显式注入不被覆盖），本地端点不受影响 |
 | 2026-08-24 | 断流分类扩展与限流应对：新增限流（429）/服务端错误（5xx）/配额窗口三档分类，429/5xx 纳入 step 边界重连（1s 指数退避、尊重 Retry-After、单次等待上限 60s）；配额特征或超限等待快速失败并注明恢复时间点；配置面每模型新增可选 `retry_max`（缺省 3） | 用户故事：线上 API 与免费端点 429 太常见，固定 1s×3 盲等熬不过分钟级配额窗口；coding/token plan 类订阅有 5 小时用量窗口，小时级等待循环重试无意义，应报恢复时间让用户自行重发。曲线常量不进配置（收敛原则），仅次数随端点差异可调 |
+| 2026-08-25 | 日志写失败快速失败：全部落盘点统一经 appendFatal，首个写失败即上报并终止当前 turn；emit 在 root 取消后允许丢弃事件 | 日志已坏时继续执行只会产出不可重放的状态（I1）；磁盘满等持久性故障无法在 turn 内自愈，快速失败优于带病续跑。emit 防阻塞：消费端停止后 Submit/Slash 等同步调用方不能冻死在事件发送上 |
+| 2026-08-26 | 思考链单行流式渲染与状态栏可观测：思考行 = 计时 + 最新一行，按 token 到达增量刷新，后移植 dsh 尾部跟随（超宽保留最新 token）；状态栏可观测增强（ctx 分级变色、负优先级段不可裁剪） | reasoning 落日志不投影的设计不变；渲染层只是把「等待中」做成最小的活性口子。省略号截断丢失最新 token，尾部跟随让推理流始终可见 |
+| 2026-08-27 | session/header 的 model 字段改存配置键（用户可见名），不再存端点 model 字符串 | 同一端点 model 字符串可被多个配置复用（多个中转站转发同一模型），按端点字符串反查当前模型必然歧义；配置键才是唯一身份。I1 重放不受影响（request/header 仍存端点 model） |
+| 2026-08-28 | 多模态图片输入：Message.Content 改多模态数组，TUI `/attach` 附加图片随消息提交；字节内容寻址落会话 assets/、日志只存引用；图片只进请求尾部不进投影，request/header 记录 images 引用（新增 6.9 节、I2 附图片放置规则） | 缓存纪律要求图片不进投影前缀（带图请求前缀与无图会话逐字节一致）；资产外置避免 JSONL 膨胀；尾部放置 + 引用留痕使 I1 重放可完整还原带图请求 |
+| 2026-08-29 | 断流重连参数全部内置化：重试上限 5 次、同一 step 连续 429 超 1 次后基础退避 1s→5s（两段式）；移除 2026-08-24 引入的 `retry_max` 配置键，旧配置中的键被忽略 | 撤销上一次「仅次数可调」的让步：次数与曲线是端点无关的耐心策略，实测无需按端点调参，内置常量更符合 7.2 收敛原则；两段式退避把分钟级限流窗口的总耐心提升到约 131s |
