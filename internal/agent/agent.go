@@ -82,7 +82,15 @@ const (
 	// 要求等待超过上限即订阅 plan 的用量窗口（小时级），走快速失败而非重试。
 	retryBackoff = time.Second
 	retryCap     = time.Minute
-	eventsBuffer = 256
+	// rateLimitBackoff 是 429 连续命中超过 rateLimitBudget 后的基础退避：
+	// 5s 起步的指数曲线（5→10→20→40s）覆盖大多数分钟级限流窗口。
+	rateLimitBackoff = 5 * time.Second
+	// rateLimitBudget 同一 step 内连续 429 的宽容次数，内置不可配置。
+	rateLimitBudget = 1
+	// defaultRetries 断流重连上限，内置不可配置：预算耗尽后的 429 曲线
+	// 总耐心 131s，覆盖分钟级限流窗口；端点宕机约 2 分钟内上抛错误。
+	defaultRetries = 5
+	eventsBuffer   = 256
 )
 
 // ModelSpec 是一个可切换模型的运行装配（/model 与 Ctrl+P 的数据源）。
@@ -91,7 +99,6 @@ type ModelSpec struct {
 	ModelID string // 发给端点的 model 字符串
 	Client  provider.Provider
 	Window  int
-	Retries int // 断流重连上限（config.Load 已回填默认）
 }
 
 // Config 装配 Agent 的全部依赖。
@@ -104,7 +111,6 @@ type Config struct {
 	System        string
 	DataRoot      string // /new /resume /branch 创建/打开会话的根目录
 	ContextWindow int    // compaction 触发阈值依赖（0 = 不压缩）
-	Retries       int    // 初始模型的断流重连上限（config.Load 已回填默认）
 	Models        []ModelSpec
 }
 
@@ -116,8 +122,8 @@ type Agent struct {
 	cp       *checkpoint.Store
 	system   string
 	dataRoot string
-	window   int
-	retries  int
+	window  int
+	retries int // 断流重连上限（内置 defaultRetries；测试直接注入）
 
 	pendingImages []string // 本次提交待携带的图片路径，Submit 写入，Run 开始时吸收
 
@@ -150,7 +156,7 @@ func New(cfg Config) *Agent {
 		system:    cfg.System,
 		dataRoot:  cfg.DataRoot,
 		window:    cfg.ContextWindow,
-		retries:   cfg.Retries,
+		retries:   defaultRetries,
 		model:     modelID,
 		modelName: modelName,
 		events:    make(chan Event, eventsBuffer),
@@ -202,7 +208,6 @@ func (a *Agent) switchModel(name string) ([]string, error) {
 	}
 	a.prov = spec.Client
 	a.window = spec.Window
-	a.retries = spec.Retries
 	a.modelName = name
 	a.model = spec.ModelID
 	a.emit(ModelSwitchedEvent{Name: name, Window: spec.Window})
@@ -365,6 +370,10 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 	var text strings.Builder
 	var toolCalls []provider.ToolCall
 	var usage *provider.Usage
+	// rlHits 是当前 step 内连续 429 的次数；非 429 错误（网络/停滞/服务端）
+	// 清零。两条错误路径都先更新计数再进 handleInterrupt，预算判定用的
+	// 是本次命中后的值。
+	rlHits := 0
 
 	for attempt := 0; ; attempt++ {
 		text.Reset()
@@ -377,7 +386,12 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 
 		ch, err := a.prov.Stream(ctx, req)
 		if err != nil {
-			if ok, stop := a.handleInterrupt(ctx, err, attempt); !ok {
+			if isRateLimit(err) {
+				rlHits++
+			} else {
+				rlHits = 0
+			}
+			if ok, stop := a.handleInterrupt(ctx, err, attempt, rlHits); !ok {
 				return a.finalizePartial(text.String(), toolCalls), toolCalls, usage, stop
 			}
 			continue
@@ -431,7 +445,12 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 				return msg, toolCalls, usage, nil
 			}
 		}
-		ok, stop := a.handleInterrupt(ctx, streamErr, attempt)
+		if isRateLimit(streamErr) {
+			rlHits++
+		} else {
+			rlHits = 0
+		}
+		ok, stop := a.handleInterrupt(ctx, streamErr, attempt, rlHits)
 		if !ok {
 			return a.finalizePartial(text.String(), toolCalls), toolCalls, usage, stop
 		}
@@ -557,18 +576,21 @@ func argsSummary(args json.RawMessage) string {
 
 // handleInterrupt 处理一次断流，返回 (继续下一 attempt, 终止错误)，恰一
 // 个有效。优先级：用户中止 > 用量窗口快速失败 > 预算内重连 > 上抛。
-func (a *Agent) handleInterrupt(ctx context.Context, err error, attempt int) (bool, error) {
+// rlHits 是当前 step 内连续 429 的次数（调用方已更新）；超过 rateLimitBudget
+// 后退避切换 5s 起步。
+func (a *Agent) handleInterrupt(ctx context.Context, err error, attempt int, rlHits int) (bool, error) {
 	if ctx.Err() != nil {
 		return false, context.Canceled
 	}
 	if overWaitLimit(err, attempt) {
-		wait := requiredWait(attempt, retryAfterOf(err))
+		wait := max(retryBackoff<<attempt, retryAfterOf(err))
 		a.emit(ErrorEvent{Err: fmt.Errorf("%v；超过单次等待上限 %s，停止自动重试：预计 %s 前后可恢复（会话已保留，稍后重发即可）",
 			err, retryCap, time.Now().Add(wait).Format("15:04"))})
 		return false, err
 	}
 	if retryable(err) && attempt < a.retries {
-		if !a.retryPause(ctx, err, attempt) {
+		base := backoffBaseFor(rlHits)
+		if !a.retryPause(ctx, err, attempt, base) {
 			return false, context.Canceled
 		}
 		return true, nil
@@ -577,8 +599,8 @@ func (a *Agent) handleInterrupt(ctx context.Context, err error, attempt int) (bo
 	return false, err
 }
 
-func (a *Agent) retryPause(ctx context.Context, err error, attempt int) bool {
-	d := backoffFor(attempt, retryAfterOf(err))
+func (a *Agent) retryPause(ctx context.Context, err error, attempt int, base time.Duration) bool {
+	d := backoffFor(attempt, retryAfterOf(err), base)
 	a.emit(StatusEvent{Text: fmt.Sprintf("流中断：%v；%s 后重连（%d/%d）", err, d, attempt+1, a.retries)})
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -590,28 +612,25 @@ func (a *Agent) retryPause(ctx context.Context, err error, attempt int) bool {
 	}
 }
 
-// requiredWait 返回第 attempt 次重试前应等待的时长（指数退避与端点要求
-// 取大者，未截断）；结果超过 retryCap 即小时级用量窗口的信号。
-func requiredWait(attempt int, retryAfter time.Duration) time.Duration {
-	if d := retryBackoff << attempt; d > retryAfter {
-		return d
+// backoffBaseFor 返回本次重试的基础退避间隔：同一 step 内连续 429 超过
+// rateLimitBudget 次后从 1s 提升到 5s，覆盖大多数分钟级限流窗口。
+func backoffBaseFor(rlHits int) time.Duration {
+	if rlHits > rateLimitBudget {
+		return rateLimitBackoff
 	}
-	return retryAfter
+	return retryBackoff
 }
 
-// backoffFor 实际等待时长：requiredWait 截断到单次等待上限。
-func backoffFor(attempt int, retryAfter time.Duration) time.Duration {
-	if d := requiredWait(attempt, retryAfter); d < retryCap {
-		return d
-	}
-	return retryCap
+// backoffFor 实际等待时长：基础退避与端点要求取大者，截断到单次等待上限。
+func backoffFor(attempt int, retryAfter time.Duration, base time.Duration) time.Duration {
+	return min(max(base<<attempt, retryAfter), retryCap)
 }
 
 // overWaitLimit 报告端点要求的等待超出单次上限（订阅 plan 的用量窗口以
 // 小时计）：继续循环重试无意义，应立即上报恢复时间点。
 func overWaitLimit(err error, attempt int) bool {
 	ra := retryAfterOf(err)
-	return ra > 0 && requiredWait(attempt, ra) > retryCap
+	return ra > 0 && max(retryBackoff<<attempt, ra) > retryCap
 }
 
 func retryAfterOf(err error) time.Duration {
@@ -627,6 +646,11 @@ func retryable(err error) bool {
 	return errors.As(err, &se) &&
 		(se.Kind == provider.InterruptNetwork || se.Kind == provider.InterruptStall ||
 			se.Kind == provider.InterruptRateLimit || se.Kind == provider.InterruptServerError)
+}
+
+func isRateLimit(err error) bool {
+	var se *provider.StreamInterruptedError
+	return errors.As(err, &se) && se.Kind == provider.InterruptRateLimit
 }
 
 func appendToolDelta(calls []provider.ToolCall, d *provider.ToolCallDelta) []provider.ToolCall {
