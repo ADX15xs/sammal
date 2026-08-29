@@ -480,10 +480,9 @@ func (m Model) armTick() tea.Cmd {
 	return tea.Tick(time.Second, func(time.Time) tea.Msg { return turnTickMsg{} })
 }
 
-// turnTick 心跳：busy 期间自续，空闲时终止。思考行动画不走这里——思考行
-// 的动感全部由 token 到达驱动（尾部跟随），定时渲染只保留 1s 计时器一档；
-// 思考期间任何更高频的定时重绘都会与 tea.Println 交错产生空行（扫光方案
-// 实测回归，已弃）。
+// turnTick 心跳：busy 期间自续，空闲时终止。思考行的刷新由 token 到达
+// 驱动（尾部跟随）；思考期间勿在此加更高频的定时重绘——会与 tea.Println
+// 交错产生空行 artifact。
 func (m Model) turnTick() (tea.Model, tea.Cmd) {
 	m.tickArmed = false
 	if !m.busy {
@@ -613,10 +612,8 @@ func (m Model) streamBlockLines(width int) []string {
 			line = fmt.Sprintf("- 思考中 %s", formatElapsed(time.Since(m.turnStart)))
 		}
 		if cur := m.reasonLine(); cur != "" {
-			// 前缀（"思考中 12s"）固定做锚点，正文超宽时只保留尾部——
-			// dsh 的尾部跟随（overflow:hidden + scrollLeft 推到最右）：
-			// 最新 token 永远可见，无省略号。思考行的动感全部来自 token
-			// 到达本身，不做定时动画（高频重绘实测会产生空行 artifact）。
+			// 前缀（"思考中 12s"）固定做锚点，正文超宽走尾部跟随：
+			// 最新 token 永远可见、无省略号。不做定时动画（见 turnTick）。
 			prefix := line + " | "
 			body := strings.ReplaceAll(cur, "\t", " ")
 			if bodyW := width - 1 - widthOf(prefix); bodyW > 0 {
