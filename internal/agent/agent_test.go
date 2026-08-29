@@ -96,7 +96,6 @@ func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { sess.Close() })
 	if len(tools) == 0 {
 		tools = []tool.Tool{
 			&tool.ReadTool{WorkDir: work},
@@ -117,6 +116,13 @@ func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture
 		Checkpoints: cp,
 		System:      BuildSystemPrompt(facts),
 		DataRoot:    root,
+	})
+	// /new /resume /branch 会把 agent 切到新会话并关掉旧的：清理时必须关
+	// agent 当前持有的那个，否则其句柄存活到 TempDir 清理，Windows 下报
+	// 「正由另一进程使用」。
+	t.Cleanup(func() {
+		ag.sess.Close()
+		sess.Close()
 	})
 	return &fixture{ag: ag, sess: sess, reg: reg, cp: cp, work: work}
 }
