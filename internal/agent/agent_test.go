@@ -129,7 +129,7 @@ func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture
 
 func (f *fixture) system() string {
 	h := f.sess.Header()
-	return BuildSystemPrompt(PromptFacts{Cwd: h.Cwd, OS: h.OS, Shell: h.Shell, Date: h.Created[:10]})
+	return BuildSystemPrompt(PromptFacts{Cwd: h.Cwd, OS: h.OS, Shell: h.Shell, Date: h.Created[:10], Project: h.AgentsMD})
 }
 
 func drainEvents(t *testing.T, events <-chan Event, until func(Event) bool) []Event {

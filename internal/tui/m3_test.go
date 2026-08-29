@@ -11,21 +11,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-func TestFuzzyMatch(t *testing.T) {
-	if !fuzzyMatch("qwen3-local", "q3l") {
-		t.Error("子序列应命中")
-	}
-	if fuzzyMatch("qwen3-local", "localx") {
-		t.Error("超出子序列不应命中")
-	}
-	if !fuzzyMatch("DeepSeek", "deep") {
-		t.Error("大小写不敏感")
-	}
-	if !fuzzyMatch("anything", "") {
-		t.Error("空过滤命中全部")
-	}
-}
-
 // Ctrl+P 选择器 headless：打开 → 过滤 → Enter 触发 /model 切换。
 func TestModelPickerHeadless(t *testing.T) {
 	var mu sync.Mutex

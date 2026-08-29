@@ -17,11 +17,12 @@ import (
 	"sammal/internal/agent"
 	"sammal/internal/compaction"
 	"sammal/internal/provider"
+	"sammal/internal/skill"
 	"sammal/internal/tool"
 )
 
 // Deps 是 TUI 与 core 的全部接线：事件流订阅、发送、中止、slash 命令、
-// 模型列表与外部编辑器。
+// 模型列表、skill 列表与外部编辑器。
 type Deps struct {
 	ModelName string
 	Events    <-chan agent.Event
@@ -29,7 +30,10 @@ type Deps struct {
 	Abort     func()
 	Slash     func(text string) []string
 	Models    func() []string
-	EditorCmd func(path string) (*exec.Cmd, error)
+	// Skills 返回可用 skill 列表（/skill 命令与选择器的数据源，每次调用
+	// 现扫现显）；nil = 无 skill（SPEC 6.10）。
+	Skills     func() []skill.Skill
+	EditorCmd  func(path string) (*exec.Cmd, error)
 	// ContextWindow 当前模型的上下文窗口（token）；0 = 未知，状态栏不显示
 	// ctx 百分比。
 	ContextWindow int
@@ -43,6 +47,7 @@ type popupKind int
 const (
 	popupNone popupKind = iota
 	popupModelPicker
+	popupSkillPicker
 )
 
 type Model struct {
@@ -150,19 +155,28 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if text != "" {
 			m.rememberInput(text)
 		}
+		echo := text
 		if strings.HasPrefix(text, "/") {
-			if lines, handled := m.handleSlash(text); handled {
-				return m, printLines(lines)
+			switch cmd, expanded, out := m.slashSkill(text); cmd {
+			case skillPickerOpen:
+				return m, nil
+			case skillShow:
+				return m, printLines(out)
+			case skillSend:
+				text = expanded // 展开正文走普通发送路径，回显仍显示原命令
+			default:
+				if lines, handled := m.handleSlash(text); handled {
+					return m, printLines(lines)
+				}
+				return m, printLines(m.deps.Slash(text))
 			}
-			lines := m.deps.Slash(text)
-			return m, printLines(lines)
 		}
 		imgs := m.pendingImages
 		m.pendingImages = nil
 		m.busy = true
 		m.stream.Reset()
 		m.deps.Send(text, imgs)
-		prompt := renderUserEcho(text)
+		prompt := renderUserEcho(echo)
 		if len(imgs) > 0 {
 			prompt += "\n" + dim(fmt.Sprintf("  📎 %s", imagesSummary(imgs)))
 		}
@@ -244,11 +258,26 @@ func (m Model) handlePopupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case msg.Code == tea.KeyDown:
-		if m.pickerSel < len(m.filteredModels())-1 {
+		n := len(m.filteredModels())
+		if m.popup == popupSkillPicker {
+			n = len(m.filteredSkills())
+		}
+		if m.pickerSel < n-1 {
 			m.pickerSel++
 		}
 		return m, nil
 	case msg.Code == tea.KeyEnter:
+		if m.popup == popupSkillPicker {
+			skills := m.filteredSkills()
+			if len(skills) == 0 {
+				return m, nil
+			}
+			chosen := skills[min(m.pickerSel, len(skills)-1)]
+			m.popup = popupNone
+			m.input.Clear()
+			m.input.Insert("/skill " + chosen.Name + " ") // 回填待补任务描述，不直接发送
+			return m, nil
+		}
 		models := m.filteredModels()
 		if len(models) == 0 {
 			return m, nil
@@ -271,8 +300,80 @@ func (m Model) handlePopupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// skillCmd 是 /skill 命令的处理结果类别。
+type skillCmd int
+
+const (
+	skillNone       skillCmd = iota // 不是 /skill 命令，交回常规命令分发
+	skillSend                       // expanded 已就绪，走普通发送路径
+	skillShow                       // out 为候选/提示行，不发送
+	skillPickerOpen                 // 选择器已打开，本次输入消费完毕
+)
+
+// slashSkill 处理 /skill（TUI 专属：展开发生在提交之前，core 无感知）。
+// `<name>` 精确同名优先、其余子序列模糊匹配；唯一命中时把「skill 正文 +
+// 任务描述」拼成一条 user 消息（骑 user turn 尾部，SPEC 6.10）；无参打开
+// 选择器；无命中/歧义输出候选行。
+func (m *Model) slashSkill(input string) (skillCmd, string, []string) {
+	if input != "/skill" && !strings.HasPrefix(input, "/skill ") {
+		return skillNone, "", nil
+	}
+	arg := strings.TrimSpace(strings.TrimPrefix(input, "/skill"))
+	if arg == "" {
+		m.openSkillPicker()
+		return skillPickerOpen, "", nil
+	}
+	name, task, _ := strings.Cut(arg, " ")
+	name, task = strings.TrimSpace(name), strings.TrimSpace(task)
+	skills := m.currentSkills()
+	matches := skill.Resolve(name, skills)
+	switch {
+	case len(matches) == 1:
+		return skillSend, skill.Expand(matches[0], task), nil
+	case len(matches) == 0 && len(skills) == 0:
+		return skillShow, "", []string{"没有找到任何 skill（全局 skills 目录或 <cwd>/.agents/skills）"}
+	case len(matches) == 0:
+		out := append([]string{fmt.Sprintf("没有匹配 %q 的 skill，可用：", name)}, skillNameLines(skills)...)
+		return skillShow, "", out
+	default:
+		out := append([]string{fmt.Sprintf("%q 匹配到 %d 个 skill，请用全名：", name, len(matches))}, skillNameLines(matches)...)
+		return skillShow, "", out
+	}
+}
+
+// skillNameLines 候选名单行（两空格缩进），用于无命中/歧义的输出行。
+func skillNameLines(skills []skill.Skill) []string {
+	out := make([]string, 0, len(skills))
+	for _, s := range skills {
+		out = append(out, "  "+s.Name)
+	}
+	return out
+}
+
+// openSkillPicker 打开 skill 选择器：列表展示名称 + 描述，Enter 回填
+// 输入框（与模型选择器的差异：回填而非提交——skill 主用法是正文 + 任务
+// 拼接）。
+func (m *Model) openSkillPicker() {
+	m.popup = popupSkillPicker
+	m.pickerSel = 0
+	m.inputBeforePopup = m.input.String()
+	m.input.Clear()
+}
+
+func (m Model) currentSkills() []skill.Skill {
+	if m.deps.Skills == nil {
+		return nil
+	}
+	return m.deps.Skills()
+}
+
+func (m Model) filteredSkills() []skill.Skill {
+	return skill.Filter(m.currentSkills(), m.input.String())
+}
+
 // handleSlash 处理不需要 agent 参与的 TUI 专属斜杠命令，返回 (输出行, 已处理)。
 // /attach 是典型例子：它操作 TUI 的 pendingImages，无需请求模型。
+// （/skill 亦为 TUI 专属，但在命令分发改路之前拦截展开，见 slashSkill。）
 func (m *Model) handleSlash(input string) ([]string, bool) {
 	fields := strings.Fields(input)
 	if len(fields) == 0 {
@@ -356,25 +457,11 @@ func (m Model) filteredModels() []string {
 	filter := m.input.String()
 	var out []string
 	for _, name := range m.deps.Models() {
-		if fuzzyMatch(name, filter) {
+		if skill.Match(name, filter) {
 			out = append(out, name)
 		}
 	}
 	return out
-}
-
-func fuzzyMatch(s, sub string) bool {
-	s, sub = strings.ToLower(s), strings.ToLower(sub)
-	if sub == "" {
-		return true
-	}
-	i := 0
-	for j := 0; j < len(s) && i < len(sub); j++ {
-		if s[j] == sub[i] {
-			i++
-		}
-	}
-	return i == len(sub)
 }
 
 type editorDoneMsg struct {
@@ -435,7 +522,7 @@ func (m Model) loadHistory() {
 	m.input.Insert(m.history[len(m.history)-m.histDepth])
 }
 
-func (m Model) rememberInput(text string) {
+func (m *Model) rememberInput(text string) {
 	if n := len(m.history); n > 0 && m.history[n-1] == text {
 		return
 	}
@@ -653,8 +740,11 @@ func (m Model) View() tea.View {
 
 	var lines []string
 	lines = append(lines, m.streamBlockLines(width)...)
-	if m.popup == popupModelPicker {
-		lines = append(lines, m.pickerLines(width)...)
+	switch m.popup {
+	case popupModelPicker:
+		lines = append(lines, m.modelPickerLines(width)...)
+	case popupSkillPicker:
+		lines = append(lines, m.skillPickerLines(width)...)
 	}
 
 	status := m.statusLine()
@@ -676,8 +766,8 @@ func (m Model) View() tea.View {
 	return v
 }
 
-// pickerLines 模型选择器列表（内嵌于可变区，自带模糊过滤，不依赖 fzf）。
-func (m Model) pickerLines(width int) []string {
+// modelPickerLines 模型选择器列表（内嵌于可变区，自带模糊过滤，不依赖 fzf）。
+func (m Model) modelPickerLines(width int) []string {
 	lines := []string{dim(" 选择模型（输入过滤 | Enter 确认 | Esc 取消）")}
 	models := m.filteredModels()
 	const maxShown = 8
@@ -698,6 +788,32 @@ func (m Model) pickerLines(width int) []string {
 	}
 	if len(models) == 0 {
 		lines = append(lines, dim("   （无匹配模型）"))
+	}
+	return lines
+}
+
+// skillPickerLines skill 选择器列表：名称 + 一行描述帮助辨认（正文按需
+// 展开，列表是唯一的发现入口）。
+func (m Model) skillPickerLines(width int) []string {
+	lines := []string{dim(" 选择 skill（输入过滤 | Enter 回填 | Esc 取消）")}
+	skills := m.filteredSkills()
+	const maxShown = 8
+	for i, s := range skills {
+		if i >= maxShown {
+			lines = append(lines, dim(fmt.Sprintf("   ... 共 %d 个", len(skills))))
+			break
+		}
+		entry := "   " + s.Name
+		if s.Description != "" {
+			entry += "  " + s.Description
+		}
+		if i == m.pickerSel {
+			entry = ansiCyan + "> " + strings.TrimLeft(entry, " ") + ansiReset
+		}
+		lines = append(lines, clipLine(entry, width))
+	}
+	if len(skills) == 0 {
+		lines = append(lines, dim("   （无匹配 skill）"))
 	}
 	return lines
 }

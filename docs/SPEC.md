@@ -69,7 +69,7 @@ Sammal 是一个随需求生长、始终满足六条不变量（第 2 章）、�
 
 "请求前缀"由以下部分构成，会话内字节级不变：
 
-- **系统提示词**：`agent.BuildSystemPrompt` 的输入来自 `SessionHeader`（cwd/os/shell/date），会话首拍定格，resume 时从 header 重建，字节一致
+- **系统提示词**：`agent.BuildSystemPrompt` 的输入来自 `SessionHeader`（cwd/os/shell/date/AGENTS.md 内容），会话首拍定格，resume 时从 header 重建，字节一致
 - **工具目录**：`tool.Registry.Defs()` 返回各工具的 `Name`/`Description`/`Schema` 常量。`BashTool.Schema()` 的 shellNote 插值是唯一允许的动态项，定格于会话创建
 - **消息历史**：`session.DeriveMessages()` 通过 `projector` 确定性投影日志。turn 间的工具结果投影受剪枝策略影响（见下文豁免区）
 
@@ -195,6 +195,7 @@ resume、branch、compaction、TUI 重绘、回放全部是同一份事件日志
 ```
 cmd/sammal          薄入口：解析参数、装配、启动
 internal/tui        Bubble Tea v2 内联滚动模式（唯一前端，事件流的订阅者）
+internal/skill      /skill 的扫描、解析与展开（prompt 简化器，TUI 叶子包）
 internal/agent      turn/step 状态机、消息收件箱、中止语义（无 UI）
 internal/tool       Tool 接口 + 六件套 + canonical/render 投影
 internal/provider   OpenAI 兼容 SSE 客户端（流式 + 工具调用聚合 + 看门狗）
@@ -204,7 +205,7 @@ internal/checkpoint per-turn 文件快照与回滚
 internal/config     config.toml 加载
 ```
 
-依赖方向单向向下：tui → agent → {tool, provider, session, compaction, checkpoint} → config。session 不依赖任何上层。
+依赖方向单向向下：tui → agent → {tool, provider, session, compaction, checkpoint} → config，tui → skill（叶子）。session 不依赖任何上层。
 
 ### 5.2 core 与 tui 分离的三个当下依据
 
@@ -408,6 +409,16 @@ M4 后增量（2026-08-28/29，见决策变更记录）：
 - **重放还原**：`request/header.images` 记录每次请求携带的资产引用，重放据此重建带图请求；资产被外部删除时该图跳过、对应请求重放哈希不一致，属既定降级语义（DEBT 记账）
 - **生命周期**：`/branch` 随日志复制全部资产到新会话；`/rewind` 截断后清理不再被引用的孤儿资产；生成中带图插话被静默丢弃（收件箱只承载文本，DEBT 记账）
 
+### 6.10 AGENTS.md 注入与 /skill — prompt 简化器
+
+M4 后增量（2026-08-29，见决策变更记录）。定位：skill 与项目指令本质是 prompt 工程，**明确调用优于自动触发**——sammal 不做模型自决的技能加载，只做确定性的正文展开。
+
+- **AGENTS.md 注入**：会话创建时读取 `<cwd>/AGENTS.md`（不存在则为空），内容存入 `SessionHeader.agentsMd` 首拍定格（resume/branch 从 header 重建，字节一致；`/new` 从磁盘重读让修改即时生效），由 `BuildSystemPrompt` 渲染为 Project instructions 段。常驻注入必须短——它是注意力预算，不是文档
+- **skill 布局**：`<configDir>/skills/<name>/SKILL.md`（全局）与 `<cwd>/.agents/skills/<name>/SKILL.md`（项目）两级扫描；frontmatter 逐行只认 `name`/`description`（缺 name 用目录名）；同名 skill 项目级覆盖全局
+- **展开机制**：`/skill <name> [任务]` 由 TUI 把「skill 正文（`<skill name="...">` 包裹）+ 任务描述」拼成一条 user 消息提交——骑 user turn 尾部（I2 明文豁免区），系统提示词与工具目录零改动，I1 自动满足（普通消息落日志）。skill 正文与历史一起参与压缩投影
+- **发现**：`/skill` 无参打开内嵌模糊选择器（复用模型选择器组件，弹窗枚举新增 `skillPicker`），Enter **回填输入框**而非发送——skill 的主用法是「正文 + 任务」拼接；参数解析精确同名优先、其余子序列模糊匹配，歧义列候选不发送
+- **明确不做的**：skill 目录不进系统提示词（无 I2 冻结负担，选择器现扫现显）；不做 `.agents/rules`（AGENTS.md 即 rules）；不做 hooks（模型验证闭环替代机器强制）；不做项目级 config（7.2 收敛原则）。模型主动加载（skill 工具 + 目录进前缀）的翻案条件：反复需要对模型说「先读 xx skill」时再加
+
 ---
 
 ## 第 7 章 数据与配置格式
@@ -467,6 +478,7 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | `/model [name]` | 无参打开选择器；模型切换是核心工作流 |
 | `/new` | 开新会话（频繁操作不值得退出重启） |
 | `/attach [path...]` | 图片输入入口：附加 / 列出 / `-clear` 清空待发送图片（TUI 侧管理，随下一条消息提交） |
+| `/skill [name] [任务]` | prompt 简化器：skill 正文 + 任务描述拼成一条消息提交；无参打开选择器（TUI 侧展开，6.10） |
 | `/resume` | 恢复历史会话（I3 的用户入口） |
 | `/branch` | 从当前 turn 分叉探索（会话分支的用户入口） |
 | `/compact` | 手动触发压缩（自动触发之外的逃生门） |
@@ -566,3 +578,4 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-08-27 | session/header 的 model 字段改存配置键（用户可见名），不再存端点 model 字符串 | 同一端点 model 字符串可被多个配置复用（多个中转站转发同一模型），按端点字符串反查当前模型必然歧义；配置键才是唯一身份。I1 重放不受影响（request/header 仍存端点 model） |
 | 2026-08-28 | 多模态图片输入：Message.Content 改多模态数组，TUI `/attach` 附加图片随消息提交；字节内容寻址落会话 assets/、日志只存引用；图片只进请求尾部不进投影，request/header 记录 images 引用（新增 6.9 节、I2 附图片放置规则） | 缓存纪律要求图片不进投影前缀（带图请求前缀与无图会话逐字节一致）；资产外置避免 JSONL 膨胀；尾部放置 + 引用留痕使 I1 重放可完整还原带图请求 |
 | 2026-08-29 | 断流重连参数全部内置化：重试上限 5 次、同一 step 连续 429 超 1 次后基础退避 1s→5s（两段式）；移除 2026-08-24 引入的 `retry_max` 配置键，旧配置中的键被忽略 | 撤销上一次「仅次数可调」的让步：次数与曲线是端点无关的耐心策略，实测无需按端点调参，内置常量更符合 7.2 收敛原则；两段式退避把分钟级限流窗口的总耐心提升到约 131s |
+| 2026-08-29 | AGENTS.md 注入与 /skill prompt 简化器（新增 6.10 节、internal/skill 包、TUI 弹窗枚举新增 skillPicker）：AGENTS.md 内容会话首拍存入 SessionHeader.agentsMd 并渲染进系统提示词（/new 从磁盘重读）；/skill 唯一命中时把「skill 正文 + 任务」展开为一条 user 消息，无参打开选择器且 Enter 回填不发送 | skill/项目指令定位为 prompt 简化器：明确调用优于自动触发。正文骑 user turn 尾部（I2 明文豁免区），系统提示词除 agentsMd 首拍外零改动、工具目录零改动，I1 自动满足；不做 .agents/rules、hooks、项目级 config（4.3 避开清单与 7.2 收敛原则），模型主动加载留待「反复需要模型自读 skill」的实际需求出现 |

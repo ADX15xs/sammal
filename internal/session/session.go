@@ -33,12 +33,13 @@ const (
 
 // Header 首行不可变事件：会话身份与提示词事实（重建系统提示词的足够信息）。
 type Header struct {
-	ID      string `json:"id"`
-	Cwd     string `json:"cwd"`
-	Model   string `json:"model"`
-	Created string `json:"created"`
-	OS      string `json:"os"`
-	Shell   string `json:"shell"`
+	ID       string `json:"id"`
+	Cwd      string `json:"cwd"`
+	Model    string `json:"model"`
+	Created  string `json:"created"`
+	OS       string `json:"os"`
+	Shell    string `json:"shell"`
+	AgentsMD string `json:"agentsMd,omitempty"` // <cwd>/AGENTS.md 内容首拍（SPEC 6.10）；旧日志无此字段 = 空
 }
 
 type Envelope struct {

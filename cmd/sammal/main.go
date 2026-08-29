@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"sammal/internal/config"
 	"sammal/internal/provider"
 	"sammal/internal/session"
+	"sammal/internal/skill"
 	"sammal/internal/tool"
 	"sammal/internal/tui"
 )
@@ -72,12 +74,13 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	defer cancelRoot()
 
 	sess, err := session.Create(root, session.Header{
-		ID:      session.NewID(),
-		Cwd:     cwd,
-		Model:   modelName,
-		Created: facts.Date + "T00:00:00Z",
-		OS:      facts.OS,
-		Shell:   facts.Shell,
+		ID:       session.NewID(),
+		Cwd:      cwd,
+		Model:    modelName,
+		Created:  facts.Date + "T00:00:00Z",
+		OS:       facts.OS,
+		Shell:    facts.Shell,
+		AgentsMD: facts.Project,
 	})
 	if err != nil {
 		return fmt.Errorf("创建会话失败：%w", err)
@@ -95,6 +98,11 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 
 	// secrets 兜底：%APPDATA%\sammal\.env（进程环境变量优先，第 7.2 节）。
 	secrets := config.LoadEnvFile(configPath)
+
+	// skill 数据源（/skill 命令与选择器）：每次调用现扫现显，目录不存在
+	// 或不可读视为空（SPEC 6.10）。
+	skillsDir := filepath.Join(filepath.Dir(configPath), "skills")
+	skills := func() []skill.Skill { return skill.Scan(skillsDir, cwd) }
 
 	ag := agent.New(agent.Config{
 		Root:          rootCtx,
@@ -120,6 +128,7 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 		Abort:         ag.Abort,
 		Slash:         ag.Slash,
 		Models:        ag.ModelNames,
+		Skills:        skills,
 		EditorCmd:     editorCommand(cfg.UI.Editor),
 		ContextWindow: modelCfg.ContextWindow,
 		StartupHints:  missingAPIKeyHints(cfg, secrets, config.EnvFile(configPath)),

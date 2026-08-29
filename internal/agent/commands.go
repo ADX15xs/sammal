@@ -118,7 +118,7 @@ func (a *Agent) firstMaskedSeq(keptFrom int) int {
 // switchSession 原子切换活跃会话（/new /resume /branch）。调用方须确保空闲。
 func (a *Agent) switchSession(sess *session.Session) {
 	h := sess.Header()
-	a.system = BuildSystemPrompt(PromptFacts{Cwd: h.Cwd, OS: h.OS, Shell: h.Shell, Date: h.Created[:10]})
+	a.system = BuildSystemPrompt(PromptFacts{Cwd: h.Cwd, OS: h.OS, Shell: h.Shell, Date: h.Created[:10], Project: h.AgentsMD})
 	if a.sess != nil && a.sess != sess {
 		a.sess.Close()
 	}
@@ -127,13 +127,15 @@ func (a *Agent) switchSession(sess *session.Session) {
 	a.gitHintShown = false
 }
 
-// newSession 以当前会话的身份事实开新会话。
+// newSession 以当前会话的身份事实开新会话。AGENTS.md 从磁盘重读而非
+// 继承 header：新会话 = 新前缀，用户改过项目指令应即时生效。
 func (a *Agent) newSession() (*session.Session, error) {
 	h := a.sess.Header()
 	now := time.Now().UTC().Format(time.RFC3339)
 	return session.Create(a.dataRoot, session.Header{
 		ID: session.NewID(), Cwd: h.Cwd, Model: h.Model,
 		Created: now, OS: h.OS, Shell: h.Shell,
+		AgentsMD: ReadAgentsMD(h.Cwd),
 	})
 }
 
@@ -210,6 +212,7 @@ func (a *Agent) Slash(input string) []string {
 			"/model [name] 切换模型；无参列出可用模型（Ctrl+P 打开选择器）",
 			"/new          开新会话",
 			"/attach <path> 附加图片后提交；无参列出，-clear 清空",
+			"/skill [name] 展开 skill 与任务拼接提交；无参打开选择器",
 			"/resume [n]   恢复历史会话；无参列出",
 			"/branch       从当前 turn 分叉探索",
 			"/compact      手动触发上下文压缩",

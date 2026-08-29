@@ -2,27 +2,42 @@ package agent
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
 // PromptFacts 是系统提示词的全部动态输入。会话首拍定值后不再变化
 // （I2：系统提示词在会话内字节级稳定）；resume 时从 SessionHeader 重建。
 type PromptFacts struct {
-	Cwd   string
-	OS    string // runtime.GOOS，会话创建时定格
-	Shell string // "bash" 或 "powershell"，会话创建时探测
-	Date  string // YYYY-MM-DD，会话创建日
+	Cwd     string
+	OS      string // runtime.GOOS，会话创建时定格
+	Shell   string // "bash" 或 "powershell"，会话创建时探测
+	Date    string // YYYY-MM-DD，会话创建日
+	Project string // AGENTS.md 内容，会话创建时定格（SPEC 6.10）
 }
 
 func FactsFromEnv(cwd string) PromptFacts {
 	return PromptFacts{
-		Cwd:   cwd,
-		OS:    runtime.GOOS,
-		Shell: DetectShell(),
-		Date:  time.Now().Format("2006-01-02"),
+		Cwd:     cwd,
+		OS:      runtime.GOOS,
+		Shell:   DetectShell(),
+		Date:    time.Now().Format("2006-01-02"),
+		Project: ReadAgentsMD(cwd),
 	}
+}
+
+// ReadAgentsMD 读取 <cwd>/AGENTS.md（项目常驻指令，prompt 简化器的常驻
+// 半边）。不存在或不可读返回空串——项目指令是可选事实。
+func ReadAgentsMD(cwd string) string {
+	data, err := os.ReadFile(filepath.Join(cwd, "AGENTS.md"))
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 const systemPromptTemplate = `You are Sammal, a terminal-based coding agent working directly in the user's repository.
@@ -32,7 +47,7 @@ Environment:
 - Platform: %s
 - Shell for running commands: %s
 - Today: %s
-
+%s
 Working style:
 - Be concise. Answer in the user's language.
 - For file tasks, prefer precise edits over rewrites.
@@ -47,7 +62,11 @@ func BuildSystemPrompt(f PromptFacts) string {
 	if f.Shell == "powershell" {
 		hint = powershellHint
 	}
-	return fmt.Sprintf(systemPromptTemplate, f.Cwd, f.OS, f.Shell, f.Date, hint)
+	project := ""
+	if f.Project != "" {
+		project = "\nProject instructions (from AGENTS.md):\n" + strings.TrimRight(f.Project, "\n") + "\n"
+	}
+	return fmt.Sprintf(systemPromptTemplate, f.Cwd, f.OS, f.Shell, f.Date, project, hint)
 }
 
 // DetectShell 探测 bash 工具将使用的 shell：PATH 中有 bash 用 bash；

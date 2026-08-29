@@ -33,6 +33,7 @@
 - **事件溯源会话**：JSONL 日志是唯一真相；支持恢复、分支、崩溃恢复
 - **上下文压缩**：0.8× 窗口触发（turn 开始时检查）→ 工具输出剪枝 → 结构化摘要 → 保留 0.16× 原文尾部；摘要请求逐字重放前缀以复用 KV 缓存
 - **多模态图片输入**：`/attach` 附加图片（png / jpg / jpeg / gif / webp，单张 ≤ 20MB）随消息提交；图片只进请求尾部，前缀与无图会话逐字节一致；字节按内容寻址落会话 `assets/`，日志重放可完整还原
+- **AGENTS.md + /skill prompt 简化器**：工作目录 `AGENTS.md` 注入系统提示词（会话首拍定格，保持简短）；skill 正文按需展开进消息尾部——明确调用而非自动触发，`/skill` 无参打开模糊选择器，Enter 回填待补任务
 - **思考链流式**：reasoning 增量以单行暗色文字流式渲染（计时 + 尾部跟随，永远显示最新 token），答案开始即整行撤出视窗；全文落日志、不进模型投影
 - **状态栏可观测**：模型名、in/out token、缓存命中率、上下文占用 `ctx %`（≥70% 黄、≥80% 压缩触发线红）、工具数与 turn 计时；超宽按丢弃优先级裁剪，模型名与生成中标记永不丢
 - **缓存纪律**：请求前缀字节级稳定，同模型多轮下前缀缓存持续命中（切换模型必然重新预填充，属预期行为）
@@ -152,12 +153,18 @@ DEEPSEEK_API_KEY=sk-xxxx
 /model [name]  切换模型；无参列出（历史完整保留，KV 缓存如实重建）
 /new           开新会话
 /attach <path> 附加图片到下一条消息；无参列出，-clear 清空
+/skill [name]  展开 skill 正文与任务拼接提交；无参打开选择器
 /resume [n]    恢复历史会话；无参列出
 /branch        从当前 turn 分叉探索
 /compact       手动触发上下文压缩
 /rewind [n]    回滚代码与对话到 turn n 之前（仅文件写操作，不含 bash 副作用）；无参列出可回滚的 turn
 /help          命令自述
 ```
+
+### 项目指令与 skill
+
+- **AGENTS.md**：工作目录下的 `AGENTS.md` 在会话创建时读入并定格（resume/branch 按当时内容重建，`/new` 重读最新），渲染为系统提示词的 Project instructions 段——放每次都该生效的常驻约定，保持简短
+- **skill**：`<配置目录>/skills/<name>/SKILL.md`（全局）与 `<cwd>/.agents/skills/<name>/SKILL.md`（项目级，同名覆盖全局）。frontmatter 写 `name` / `description`，正文按需展开：`/skill code-purity 重构这个函数` 把「skill 正文 + 任务」拼成一条消息发送；`/skill` 无参打开模糊选择器，Enter 回填输入框继续补任务
 
 ### 终端兼容矩阵
 
