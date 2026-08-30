@@ -588,6 +588,14 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.busy = false
 		m.thinking = false
 		m.resetReason()
+		// 回合耗时落款：只给正常完成的回合——中止/出错的时长无意义，
+		// 错误详情已含原因。须在 turnStart 清零前取值；TurnEnded 每轮
+		// 只来一次、必晚于最后一个回答定稿，标记因此天然落在回答末尾，
+		// 时长覆盖工具环全程。
+		var stamp tea.Cmd
+		if ev.StopReason == agent.StopCompleted && m.turnStart.After(time.Time{}) {
+			stamp = tea.Println(dim(fmt.Sprintf("（耗时 %s）", formatElapsed(time.Since(m.turnStart)))))
+		}
 		m.turnStart = time.Time{}
 		if ev.Usage != nil {
 			m.usage = ev.Usage
@@ -599,7 +607,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if ev.StopReason == agent.StopAborted {
 			cmd = tea.Println(dim("（已中止）"))
 		}
-		cmd = tea.Batch(listenAgent(m.deps.Events), cmd, warn)
+		cmd = tea.Batch(listenAgent(m.deps.Events), cmd, warn, stamp)
 		return m, cmd
 
 	case agent.StatusEvent:
