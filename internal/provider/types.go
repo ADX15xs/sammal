@@ -29,8 +29,12 @@ type Message struct {
 	ToolCallID string        `json:"tool_call_id,omitempty"`
 }
 
-// ContentFromText 把纯文本包装为单 text part 的 content 数组。
+// ContentFromText 把纯文本包装为单 text part 的 content 数组；空文本返回
+// 空数组——不带 text 键的 {"type":"text"} 会被 vLLM 等严格解析端拒收。
 func ContentFromText(s string) []ContentPart {
+	if s == "" {
+		return []ContentPart{}
+	}
 	return []ContentPart{{Type: "text", Text: s}}
 }
 

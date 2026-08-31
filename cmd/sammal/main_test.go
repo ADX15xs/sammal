@@ -15,6 +15,7 @@ import (
 	"sammal/internal/agent"
 	"sammal/internal/config"
 	"sammal/internal/provider"
+	"sammal/internal/skill"
 )
 
 func loadTestConfig(t *testing.T) (*config.Config, string) {
@@ -286,5 +287,28 @@ context_window = 8192
 	}
 	if strings.Contains(out.String(), "[!] ") {
 		t.Errorf("不应出现缺失密钥提示:\n%s", out.String())
+	}
+}
+
+// 回归：全局 skill 目录只拼一次（SPEC 6.10）。修复前 main.go 把已含
+// /skills 的目录当 configDir 传给 Scan，Scan 又再拼一次，全局永远扫空。
+func TestSkillsGlobalDirSingleJoin(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(cfgPath, []byte("default_model = \"a\"\n\n[models.a]\nbase_url = \"x\"\nmodel = \"m\"\n"), 0o644)
+
+	work := t.TempDir()
+
+	// 配置目录旁边放全局 skill，恰是 SPEC 6.10 布局 <configDir>/skills/<name>/SKILL.md。
+	skillDir := filepath.Join(filepath.Dir(cfgPath), "skills", "alpha")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\nname: alpha\ndescription: A\n---\n正文"), 0o644)
+
+	// 完全复刻 main.go 的传参：传给 Scan 的是配置目录。
+	got := skill.Scan(filepath.Dir(cfgPath), work)
+	if len(got) != 1 || got[0].Name != "alpha" || got[0].Description != "A" {
+		t.Errorf("全局 skill 未被发现，got %+v", got)
 	}
 }

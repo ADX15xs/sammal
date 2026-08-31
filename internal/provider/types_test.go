@@ -16,6 +16,33 @@ func TestContentFromText(t *testing.T) {
 	}
 }
 
+// 回归：空文本不产生缺 text 键的 {"type":"text"} part——vLLM 等严格
+// 解析端会拒收（HTTP 500 key 'text' not found）。空文本应序列化为空数组。
+func TestContentFromTextEmptyWire(t *testing.T) {
+	req := Request{
+		Model: "test",
+		Messages: []Message{
+			{Role: "assistant", Content: ContentFromText(""), ToolCalls: []ToolCall{
+				{ID: "c1", Type: "function", Function: FunctionCall{Name: "read", Arguments: "{}"}},
+			}},
+		},
+	}
+	b, err := MarshalRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(b, &v); err != nil {
+		t.Fatal(err)
+	}
+	msgs := v["messages"].([]any)
+	asst := msgs[1].(map[string]any)
+	content, ok := asst["content"].([]any)
+	if !ok || len(content) != 0 {
+		t.Errorf("空文本 assistant 的 content 应为空数组，got %v", asst["content"])
+	}
+}
+
 func TestContentText(t *testing.T) {
 	parts := []ContentPart{
 		{Type: "text", Text: "hello"},

@@ -100,9 +100,8 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	secrets := config.LoadEnvFile(configPath)
 
 	// skill 数据源（/skill 命令与选择器）：每次调用现扫现显，目录不存在
-	// 或不可读视为空（SPEC 6.10）。
-	skillsDir := filepath.Join(filepath.Dir(configPath), "skills")
-	skills := func() []skill.Skill { return skill.Scan(skillsDir, cwd) }
+	// 或不可读视为空。Scan 接收配置目录并自行拼 <configDir>/skills（SPEC 6.10）。
+	skills := func() []skill.Skill { return skill.Scan(filepath.Dir(configPath), cwd) }
 
 	ag := agent.New(agent.Config{
 		Root:          rootCtx,
