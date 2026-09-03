@@ -250,6 +250,7 @@ type Chunk struct {
 - **非 200 分类**（`classifyHTTPError`）：429 且响应体命中配额特征串（usage limit / limit reached 等）→ **配额窗口**；其余 429 → **限流**；5xx → **服务端错误**；400+溢出特征 → **上下文溢出**；其余 → 协议错误。限流/服务端错误附带 `RetryAfter`：解析 `Retry-After`（整数秒 / HTTP-date），best-effort 兼容 `x-ratelimit-reset`（unix 秒 / RFC3339）；过去时点与无法识别的格式一律视为未告知
 - `Usage` 透出 `prompt_cache_hit_tokens`（DeepSeek 系）与 `cached_tokens`（OpenAI 系），供 I2 的可观测指标
 - 请求体序列化确定性（字段顺序稳定），支撑 I2 的前缀比对测试
+- **不传思考控制参数**：`reasoning_effort`、thinking 开关类参数在 OpenAI 兼容生态无标准（OpenAI 系 `reasoning_effort`、DeepSeek `thinking.type`、Qwen3 @ vLLM `chat_template_kwargs.enable_thinking`、Ollama `think`），逐个透传即端点特判起步（7.2 收敛原则）；思考强度用端点默认，想换档位注册两个模型条目走 Ctrl+P。翻案条件：同一部署形态下的思考翻转成为日常用法（如 vLLM/LM Studio 统一部署的混合思考模型，此时双条目无出路）再按端点逐个实现
 
 ### 6.2 agent — 循环与事件
 
@@ -583,3 +584,4 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-08-29 | AGENTS.md 注入与 /skill prompt 简化器（新增 6.10 节、internal/skill 包、TUI 弹窗枚举新增 skillPicker）：AGENTS.md 内容会话首拍存入 SessionHeader.agentsMd 并渲染进系统提示词（/new 从磁盘重读）；/skill 唯一命中时把「skill 正文 + 任务」展开为一条 user 消息，无参打开选择器且 Enter 回填不发送 | skill/项目指令定位为 prompt 简化器：明确调用优于自动触发。正文骑 user turn 尾部（I2 明文豁免区），系统提示词除 agentsMd 首拍外零改动、工具目录零改动，I1 自动满足；不做 .agents/rules、hooks、项目级 config（4.3 避开清单与 7.2 收敛原则），模型主动加载留待「反复需要模型自读 skill」的实际需求出现 |
 | 2026-08-30 | 回合耗时标记：turn 正常完成后在回答末尾追加一行暗色「（耗时 1m30s）」（TUI 侧 turnStart 起算、覆盖工具环全程；中止/出错回合不打） | 生成中已有思考行与状态栏双计时，但定稿即消失——滚动区缺一个「这轮跑了多久」的持久落款。session 日志逐条带时间戳、重放可推导时长，故纯 TUI 呈现不动 core |
 | 2026-09-02 | 当天日期结构化落盘 + 时长渲染统一：新增 internal/human 包统一时长格式（tui/agent/provider/tool 共用）；「今天」由 agent 随每条 user 消息以独立 `date` 字段落盘（UserMessageData.Date），模型投影时展开为消息头部 `Today: YYYY-MM-DD` 前缀（系统提示词恢复纯静态、I2 前缀缓存全程命中；正文无注记，转录回放等人类消费面不泄漏）；回合耗时落款追加本地完成时刻（HH:MM）；等待期 spinner 防静止误判；状态栏丢弃优先级重排（计时器降至与 in/out 同级、平级丢更靠左、晚于 cache）；工具结果投影追加耗时（≥1s）；main 会话 Created 改用真实 UTC 时刻（time.Now().UTC()） | 「今天」须是用户本地当日（UTC 日期在 UTC+8 凌晨差一天），但不能进系统提示词否则前缀缓存失效——date 字段落盘使日期成为固定历史事实、投影时注入使正文保持纯净（拼接进 Text 会把内部注记泄漏给 /resume 转录等所有读者），两者兼得；时长格式三处重复须单一真相；等待期无 spinner 易被误读为卡死；原 Created 拼 "Z" 伪造时区会落盘未来时刻 |
+| 2026-09-04 | 明确不做思考控制参数：provider 不传 `reasoning_effort` / thinking 开关类参数，思考强度随端点默认（6.1 关键设计登记翻案条件） | 多家端点实测：各家思考控制参数形态互不兼容（`reasoning_effort` / `thinking.type` / `chat_template_kwargs` / `think`），透传适配成本高且收益不明；档位差异的既有出路是注册多个模型条目走 Ctrl+P（零新增代码，与缓存纪律无冲突） |
