@@ -60,7 +60,7 @@ Sammal 是一个随需求生长、始终满足六条不变量（第 2 章）、�
 
 ### I2 请求前缀字节级稳定
 
-系统提示词 + 工具 schema 在会话内跨轮字节级不变；一切动态状态（语言偏好、当前计划、记忆增量）只注入 user turn 尾部。
+系统提示词 + 工具 schema 在会话内跨轮字节级不变；一切动态状态（语言偏好、当前计划、记忆增量、当天日期）只进 user turn（系统提示词之后的可变区），不进系统提示词。当天日期由 agent 在每条 user 消息提交时以独立 `date` 字段落盘（UserMessageData.Date），模型投影（DeriveMessages）时展开为消息头部的 `Today: YYYY-MM-DD` 前缀——日期随消息成为该 turn 固定的历史事实：系统提示词全程字节稳定、前缀缓存全程命中，跨零点只影响新 turn，重放可复现；消息正文不含注记，转录回放等人类消费面与模型投影各取所需（投影纯函数）。
 
 - **测试**：系统提示词与工具 schema 序列化有 golden bytes 测试；同一会话相邻两轮请求的公共前缀长度 = 上一轮请求全长
 - **推论**：模式切换类功能不得增删工具目录；模型切换必然重建 KV 缓存（按模型隔离），属预期行为，文档如实陈述，不宣称"100% 命中率"
@@ -203,9 +203,10 @@ internal/session    事件溯源 JSONL 日志（唯一真相）、恢复、分�
 internal/compaction 上下文压缩（剪枝 + 摘要 + 前缀重放）
 internal/checkpoint per-turn 文件快照与回滚
 internal/config     config.toml 加载
+internal/human      面向终端用户的紧凑数值渲染（时长等），tui/agent/provider/tool 共用——保证同一用户看到的格式一致
 ```
 
-依赖方向单向向下：tui → agent → {tool, provider, session, compaction, checkpoint} → config，tui → skill（叶子）。session 不依赖任何上层。
+依赖方向单向向下：tui → agent → {tool, provider, session, compaction, checkpoint} → config，tui → skill（叶子），human 为无内部依赖的叶子（tui/agent/provider/tool 共用）。session 不依赖任何上层。
 
 ### 5.2 core 与 tui 分离的三个当下依据
 
@@ -492,8 +493,8 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 - 文本/思考增量：只更新"当前流式块"（可变区），定稿时一次性追加进滚动缓冲区
 - 思考（reasoning）：只渲染**最新一行**暗色文字 + 计时器（缓解等待焦虑的最小口子，dsh 方案）；增量按 token 到达，正文超宽走尾部跟随（保留最新 token，无省略号）；思考块闭合即整行撤出视窗，不留摘要。全文经 `assistant/chunk kind=reasoning` 落日志（人类回看），**不进模型投影**——发给模型的历史不含思考
 - 工具调用：`tool/call` 到达时输出一行摘要（工具名 + 参数摘要）；`tool/result` 到达时追加投影（截断至可读长度）
-- 状态行：当前模型、token 用量、缓存命中指标（I2 的可观测出口）、上下文窗口占用 `ctx %`（≥70% 黄、≥80% 压缩触发线红）、生成中显示 turn 计时与本轮工具调用数；usage 随每个 step 定稿更新，ctx% 因此跟随工具环推进。空间不足时按丢弃优先级裁剪：工具数 → 计时器 → cache → in/out → ctx（模型名与生成中标记永不丢，负优先级段不可裁剪）；达到压缩触发线时 turn 结束后追加一次文字预警（一轮只报一次）
-- 回合耗时标记：turn 正常完成时在回答最后追加一行暗色「（耗时 1m30s）」——自 TurnStarted 起算、覆盖工具环全程；中止/出错回合不打（用户中止的时长无信息量，错误详情已含原因），TurnStarted 之前的失败路径无计时起点同样不打
+- 状态行：当前模型、token 用量、缓存命中指标（I2 的可观测出口）、上下文窗口占用 `ctx %`（≥70% 黄、≥80% 压缩触发线红）、生成中显示 turn 计时与本轮工具调用数；usage 随每个 step 定稿更新，ctx% 因此跟随工具环推进。空间不足时按丢弃优先级裁剪：工具数(5) → cache(3) → in/out 与计时器(同优先级 2，先丢更靠左的 in/out) → ctx(1)；模型名与生成中标记永不丢（负优先级段不可裁剪）。等待期（已提交、TurnStarted 未到）状态栏显示「生成中 <spinner>」，spinner 帧随心跳每秒推进，避免静止误判卡死。达到压缩触发线时 turn 结束后追加一次文字预警（一轮只报一次），且该预警须排在耗时落款之前
+- 回合耗时标记：turn 正常完成时在回答最后追加一行暗色「（耗时 1m30s · HH:MM 完成）」——自 TurnStarted 起算、覆盖工具环全程，并附本地完成时刻；中止/出错回合不打（用户中止的时长无信息量，错误详情已含原因），TurnStarted 之前的失败路径无计时起点同样不打
 
 ---
 
@@ -581,3 +582,4 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-08-29 | 断流重连参数全部内置化：重试上限 5 次、同一 step 连续 429 超 1 次后基础退避 1s→5s（两段式）；移除 2026-08-24 引入的 `retry_max` 配置键，旧配置中的键被忽略 | 撤销上一次「仅次数可调」的让步：次数与曲线是端点无关的耐心策略，实测无需按端点调参，内置常量更符合 7.2 收敛原则；两段式退避把分钟级限流窗口的总耐心提升到约 131s |
 | 2026-08-29 | AGENTS.md 注入与 /skill prompt 简化器（新增 6.10 节、internal/skill 包、TUI 弹窗枚举新增 skillPicker）：AGENTS.md 内容会话首拍存入 SessionHeader.agentsMd 并渲染进系统提示词（/new 从磁盘重读）；/skill 唯一命中时把「skill 正文 + 任务」展开为一条 user 消息，无参打开选择器且 Enter 回填不发送 | skill/项目指令定位为 prompt 简化器：明确调用优于自动触发。正文骑 user turn 尾部（I2 明文豁免区），系统提示词除 agentsMd 首拍外零改动、工具目录零改动，I1 自动满足；不做 .agents/rules、hooks、项目级 config（4.3 避开清单与 7.2 收敛原则），模型主动加载留待「反复需要模型自读 skill」的实际需求出现 |
 | 2026-08-30 | 回合耗时标记：turn 正常完成后在回答末尾追加一行暗色「（耗时 1m30s）」（TUI 侧 turnStart 起算、覆盖工具环全程；中止/出错回合不打） | 生成中已有思考行与状态栏双计时，但定稿即消失——滚动区缺一个「这轮跑了多久」的持久落款。session 日志逐条带时间戳、重放可推导时长，故纯 TUI 呈现不动 core |
+| 2026-09-02 | 当天日期结构化落盘 + 时长渲染统一：新增 internal/human 包统一时长格式（tui/agent/provider/tool 共用）；「今天」由 agent 随每条 user 消息以独立 `date` 字段落盘（UserMessageData.Date），模型投影时展开为消息头部 `Today: YYYY-MM-DD` 前缀（系统提示词恢复纯静态、I2 前缀缓存全程命中；正文无注记，转录回放等人类消费面不泄漏）；回合耗时落款追加本地完成时刻（HH:MM）；等待期 spinner 防静止误判；状态栏丢弃优先级重排（计时器降至与 in/out 同级、平级丢更靠左、晚于 cache）；工具结果投影追加耗时（≥1s）；main 会话 Created 改用真实 UTC 时刻（time.Now().UTC()） | 「今天」须是用户本地当日（UTC 日期在 UTC+8 凌晨差一天），但不能进系统提示词否则前缀缓存失效——date 字段落盘使日期成为固定历史事实、投影时注入使正文保持纯净（拼接进 Text 会把内部注记泄漏给 /resume 转录等所有读者），两者兼得；时长格式三处重复须单一真相；等待期无 spinner 易被误读为卡死；原 Created 拼 "Z" 伪造时区会落盘未来时刻 |

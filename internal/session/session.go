@@ -51,7 +51,18 @@ type Envelope struct {
 
 type UserMessageData struct {
 	Text   string   `json:"text"`
+	Date   string   `json:"date,omitempty"`   // 提交时刻的本地当日（YYYY-MM-DD）：随消息成为 turn 的历史事实，投影时展开为 Today 前缀（SPEC I2）；旧日志无此字段 = 不注记
 	Images []string `json:"images,omitempty"` // 图片资产引用（assets/ 下文件名）：turn 事实记录，投影不含图，重放按 request/header 的引用还原
+}
+
+// withDatePrefix 把落盘的 turn 日期展开为模型可见的消息头注记。前缀只在
+// 模型投影（DeriveMessages）出现，Text 本体保持纯净——转录回放等人类消费
+// 面读原始 Text，不被内部注记污染。
+func withDatePrefix(text, date string) string {
+	if date == "" {
+		return text
+	}
+	return "Today: " + date + "\n\n" + text
 }
 
 // chunk kind 常量：assistant/chunk 的流增量类别。空值 = text（旧日志兼容）。
@@ -392,7 +403,7 @@ func (p *projector) apply(env Envelope) {
 	case TypeUserMessage:
 		var d UserMessageData
 		json.Unmarshal(env.Data, &d)
-		p.msgs = append(p.msgs, taggedMessage{msg: provider.Message{Role: "user", Content: provider.ContentFromText(d.Text)}, turn: cur, seq: env.Seq})
+		p.msgs = append(p.msgs, taggedMessage{msg: provider.Message{Role: "user", Content: provider.ContentFromText(withDatePrefix(d.Text, d.Date))}, turn: cur, seq: env.Seq})
 	case TypeAssistantMessage:
 		var d AssistantMessageData
 		json.Unmarshal(env.Data, &d)

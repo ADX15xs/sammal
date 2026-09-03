@@ -118,7 +118,7 @@ func (a *Agent) firstMaskedSeq(keptFrom int) int {
 // switchSession 原子切换活跃会话（/new /resume /branch）。调用方须确保空闲。
 func (a *Agent) switchSession(sess *session.Session) {
 	h := sess.Header()
-	a.system = BuildSystemPrompt(PromptFacts{Cwd: h.Cwd, OS: h.OS, Shell: h.Shell, Date: h.Created[:10], Project: h.AgentsMD})
+	a.system = BuildSystemPrompt(PromptFacts{Cwd: h.Cwd, OS: h.OS, Shell: h.Shell, Project: h.AgentsMD})
 	if a.sess != nil && a.sess != sess {
 		a.sess.Close()
 	}
@@ -284,6 +284,21 @@ func (a *Agent) Slash(input string) []string {
 	}
 }
 
+// sessionStamp 渲染会话的本地可读时间。Created 是 UTC 时刻，直接显示会差
+// 一个时区；解析失败（旧会话）退回 ID 前缀——它本身就是本地时间戳。旧格式
+// Created 是"本地日期 + T00:00:00Z"，时刻本身无意义，Local() 会显示虚假的
+// 08:00，只显示日期。
+func sessionStamp(si session.SessionInfo) string {
+	t, err := time.Parse(time.RFC3339, si.Created)
+	if err != nil {
+		return si.ID
+	}
+	if strings.HasSuffix(si.Created, "T00:00:00Z") {
+		return t.Local().Format("01-02")
+	}
+	return t.Local().Format("01-02 15:04:05")
+}
+
 func (a *Agent) slashResume(fields []string) []string {
 	if msg, ok := a.idleGuard("/resume"); !ok {
 		return msg
@@ -305,7 +320,8 @@ func (a *Agent) slashResume(fields []string) []string {
 		}
 		lines := []string{"历史会话（/resume <序号>）："}
 		for i, si := range others {
-			lines = append(lines, fmt.Sprintf("  %d. %s  %d turns", i+1, si.ID, si.Turns))
+			// ID 保留：同一分钟创建的会话时间串会撞，序号之外的唯一标识。
+			lines = append(lines, fmt.Sprintf("  %d. %s  %d turns  %s", i+1, sessionStamp(si), si.Turns, si.ID))
 		}
 		return lines
 	}

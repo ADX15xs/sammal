@@ -134,7 +134,7 @@ func TestOverWaitLimitFailsFastWithResumeHint(t *testing.T) {
 			errMsg = ee.Err.Error()
 		}
 	}
-	for _, want := range []string{"要求等待 5h0m0s", "停止自动重试", "可恢复", "稍后重发"} {
+	for _, want := range []string{"要求等待 5h00m", "停止自动重试", "可恢复", "稍后重发"} {
 		if !strings.Contains(errMsg, want) {
 			t.Errorf("错误文案缺 %q：%q", want, errMsg)
 		}

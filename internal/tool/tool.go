@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"sammal/internal/human"
 	"sammal/internal/provider"
 )
 
@@ -59,11 +61,14 @@ func ForModel(r Result, budget int) string {
 	return b.String()
 }
 
-// asInt 归一化 canonical 中的整数字段：内存值是 int，日志重放后是 float64。
+// asInt 归一化 canonical 中的整数字段：内存值是 int（exitCode）或
+// int64（durationMs），日志重放后是 float64。
 func asInt(v any) (int, bool) {
 	switch n := v.(type) {
 	case int:
 		return n, true
+	case int64:
+		return int(n), true
 	case float64:
 		return int(n), true
 	case json.Number:
@@ -89,6 +94,11 @@ func ForTUI(r Result) string {
 	}
 	if r.Truncated {
 		line += " (+)"
+	}
+	// 工具耗时（bash 写入 durationMs）是长回合里的主要时间成分，不展示就
+	// 无从定位慢在哪；只报满秒的，亚秒调用不值得占版面。
+	if ms, ok := asInt(r.Extra["durationMs"]); ok && ms >= 1000 {
+		line += fmt.Sprintf(" (%s)", human.Duration(time.Duration(ms)*time.Millisecond))
 	}
 	return line
 }

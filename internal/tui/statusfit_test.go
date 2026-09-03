@@ -9,19 +9,19 @@ import (
 // 按真实顺序排列），用于纯函数级的裁剪断点测试。
 func mkSegs() []statusSeg {
 	return []statusSeg{
-		{text: "model"},                                        // pri 0（隐式）模型名
-		{text: "in 1234 out 567", pri: 2},                      // in/out
-		{text: "cache 87%", pri: 3},                            // cache
-		{text: "ctx 43%", pri: 1},                              // ctx
-		{text: "工具 5", pri: 5},                                // 工具数
-		{text: "* 2m14s", pri: 4},                              // 计时器
+		{text: "model"},                   // pri 0（隐式）模型名
+		{text: "in 1234 out 567", pri: 2}, // in/out
+		{text: "cache 87%", pri: 3},       // cache
+		{text: "ctx 43%", pri: 1},         // ctx
+		{text: "工具 5", pri: 5},            // 工具数
+		{text: "* 2m14s", pri: 2},         // 计时器（与 in/out 同级，平级丢更靠左）
 	}
 }
 
 func joined(segs []statusSeg) string { return strings.Join(segTexts(segs), " | ") }
 
 // 断点矩阵：从宽到窄逐步收窄，验证每一步丢的段与注释声明一致：
-// 工具(5) → 计时(4) → cache(3) → in/out(2) → ctx(1)，模型名永存。
+// 工具(5) → cache(3) → in/out(2) = 计时(2)（平级丢更靠左）→ ctx(1)，模型名永存。
 // 用逐 token 收窄而非跳变采样，保证任何宽度下都不出现顺序错乱。
 func TestDropToFitBreakpointMatrix(t *testing.T) {
 	base := mkSegs()
@@ -103,5 +103,36 @@ func TestDropToFitNeverDropsNegativePriority(t *testing.T) {
 	}
 	if !strings.Contains(joined0, "m") {
 		t.Errorf("首段（模型名）被丢弃: %q", joined0)
+	}
+}
+
+// 平级 tie-break 方向：in/out 与计时器同为 pri 2，收窄时先丢更靠左的 in/out，
+// 计时器存活；计时器（pri 2，安慰信息）先于 ctx（pri 1，决定压缩的决策信息）
+// 消失。锁定新优先级设计的两个承重断言，防止回退到旧的计时器 pri 4 方案。
+func TestDropToFitTieBreakDropsLeftFirst(t *testing.T) {
+	base := mkSegs()
+	has := func(live []string, s string) bool {
+		for _, x := range live {
+			if x == s {
+				return true
+			}
+		}
+		return false
+	}
+	sawInOutOfFirst, sawTimerBeforeCtx := false, false
+	for w := 120; w >= 4; w-- {
+		live := segTexts(dropToFit(append([]statusSeg(nil), base...), w))
+		if !has(live, "in 1234 out 567") && has(live, "* 2m14s") {
+			sawInOutOfFirst = true
+		}
+		if !has(live, "* 2m14s") && has(live, "ctx 43%") {
+			sawTimerBeforeCtx = true
+		}
+	}
+	if !sawInOutOfFirst {
+		t.Error("平级丢弃未先丢 in/out、计时器仍存活：tie-break 方向错误")
+	}
+	if !sawTimerBeforeCtx {
+		t.Error("计时器(pri 2)应先于 ctx(pri 1) 消失")
 	}
 }

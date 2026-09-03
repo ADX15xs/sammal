@@ -155,7 +155,8 @@ func TestNewResumeBranch(t *testing.T) {
 		t.Fatalf("恢复到了错误会话: %s", fx.ag.sess.Header().ID)
 	}
 	msgs := fx.ag.sess.DeriveMessages()
-	if len(msgs) != 2 || provider.ContentText(msgs[0].Content) != "hello A" {
+	if len(msgs) != 2 || !strings.HasPrefix(provider.ContentText(msgs[0].Content), "Today: ") ||
+		!strings.HasSuffix(provider.ContentText(msgs[0].Content), "hello A") {
 		t.Fatalf("恢复后历史 = %+v", msgs)
 	}
 

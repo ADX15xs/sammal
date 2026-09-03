@@ -39,7 +39,7 @@ func TestProjectInstructionsLifecycle(t *testing.T) {
 	}
 	rebuilt := BuildSystemPrompt(PromptFacts{
 		Cwd: sess.Header().Cwd, OS: sess.Header().OS, Shell: sess.Header().Shell,
-		Date: sess.Header().Created[:10], Project: sess.Header().AgentsMD,
+		Project: sess.Header().AgentsMD,
 	})
 	if !strings.Contains(rebuilt, "Always answer in Chinese.") || strings.Contains(rebuilt, "changed on disk") {
 		t.Errorf("resume 重建应使用 header 首拍内容:\n%s", rebuilt)

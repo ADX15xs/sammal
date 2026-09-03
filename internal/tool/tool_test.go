@@ -311,3 +311,15 @@ func TestBashToolPowerShellPath(t *testing.T) {
 		t.Errorf("应保留部分输出: %q", res.Output)
 	}
 }
+
+func TestForTUIDuration(t *testing.T) {
+	for _, v := range []any{int64(2500), float64(2500)} {
+		got := ForTUI(Result{Output: "ok", Extra: map[string]any{"durationMs": v}})
+		if !strings.Contains(got, "(3s)") {
+			t.Errorf("ForTUI(%T) = %q, want 含 (3s)", v, got)
+		}
+	}
+	if got := ForTUI(Result{Output: "ok", Extra: map[string]any{"durationMs": int64(500)}}); strings.Contains(got, "(") {
+		t.Errorf("亚秒不应显示耗时: %q", got)
+	}
+}

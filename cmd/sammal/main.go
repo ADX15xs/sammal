@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/term"
@@ -77,7 +78,9 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 		ID:       session.NewID(),
 		Cwd:      cwd,
 		Model:    modelName,
-		Created:  facts.Date + "T00:00:00Z",
+		// Created 是 UTC 时刻，与 /new（agent.newSession）同格式。不能拿
+		// 本地日期拼 "Z"——那会伪造时区，落盘出未来时刻。
+		Created: time.Now().UTC().Format(time.RFC3339),
 		OS:       facts.OS,
 		Shell:    facts.Shell,
 		AgentsMD: facts.Project,

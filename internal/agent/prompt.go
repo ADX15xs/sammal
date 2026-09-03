@@ -10,22 +10,26 @@ import (
 	"time"
 )
 
-// PromptFacts 是系统提示词的全部动态输入。会话首拍定值后不再变化
-// （I2：系统提示词在会话内字节级稳定）；resume 时从 SessionHeader 重建。
+// PromptFacts 是系统提示词的全部输入。会话首拍定值后不再变化（I2：系统
+// 提示词在会话内字节级稳定）；resume 时从 SessionHeader 重建。「今天」不进
+// 系统提示词——它是每 turn 动态的事实，由 Submit 随消息以 UserMessageData.Date
+// 落盘、session 投影时注入消息头部前缀，系统提示词因此保持纯静态。
 type PromptFacts struct {
 	Cwd     string
 	OS      string // runtime.GOOS，会话创建时定格
 	Shell   string // "bash" 或 "powershell"，会话创建时探测
-	Date    string // YYYY-MM-DD，会话创建日
 	Project string // AGENTS.md 内容，会话创建时定格（SPEC 6.10）
 }
+
+// TodayLocal 返回本地时区的当前日期（YYYY-MM-DD）。「今天」必须是用户
+// 所在时区的一天——用 UTC 日期会让 UTC+8 的凌晨整整错一天。
+func TodayLocal() string { return time.Now().Format("2006-01-02") }
 
 func FactsFromEnv(cwd string) PromptFacts {
 	return PromptFacts{
 		Cwd:     cwd,
 		OS:      runtime.GOOS,
 		Shell:   DetectShell(),
-		Date:    time.Now().Format("2006-01-02"),
 		Project: ReadAgentsMD(cwd),
 	}
 }
@@ -46,7 +50,6 @@ Environment:
 - Working directory: %s
 - Platform: %s
 - Shell for running commands: %s
-- Today: %s
 %s
 Working style:
 - Be concise. Answer in the user's language.
@@ -66,7 +69,7 @@ func BuildSystemPrompt(f PromptFacts) string {
 	if f.Project != "" {
 		project = "\nProject instructions (from AGENTS.md):\n" + strings.TrimRight(f.Project, "\n") + "\n"
 	}
-	return fmt.Sprintf(systemPromptTemplate, f.Cwd, f.OS, f.Shell, f.Date, project, hint)
+	return fmt.Sprintf(systemPromptTemplate, f.Cwd, f.OS, f.Shell, project, hint)
 }
 
 // DetectShell 探测 bash 工具将使用的 shell：PATH 中有 bash 用 bash；

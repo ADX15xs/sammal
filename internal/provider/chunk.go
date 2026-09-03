@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sammal/internal/human"
 )
 
 // parseRetryAfter 把限流重试信号头解析为时长；无法识别一律返回 0。
@@ -138,7 +140,7 @@ func (e *StreamInterruptedError) Error() string {
 		msg += fmt.Sprintf("：%s", e.Err)
 	}
 	if e.RetryAfter > 0 {
-		msg += fmt.Sprintf("；要求等待 %s 后重试", e.RetryAfter)
+		msg += fmt.Sprintf("；要求等待 %s 后重试", human.Duration(e.RetryAfter))
 	}
 	return msg
 }

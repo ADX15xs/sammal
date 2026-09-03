@@ -1,3 +1,4 @@
 .zcode/
 dist/
 /sammal*
+.workbuddy/

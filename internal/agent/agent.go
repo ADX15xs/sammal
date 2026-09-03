@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"sammal/internal/checkpoint"
+	"sammal/internal/human"
 	"sammal/internal/provider"
 	"sammal/internal/session"
 	"sammal/internal/tool"
@@ -277,7 +278,9 @@ func (a *Agent) Run(parent context.Context, userMsg string) {
 		a.emit(TurnEndedEvent{StopReason: StopError})
 		return
 	}
-	if err := a.sess.Append(session.TypeUserMessage, session.UserMessageData{Text: userMsg, Images: refs}); err != nil {
+	// Date 随消息首拍落盘：session 投影时展开为 Today 前缀（SPEC I2），
+	// 系统提示词保持纯静态、前缀缓存全程命中。
+	if err := a.sess.Append(session.TypeUserMessage, session.UserMessageData{Text: userMsg, Date: TodayLocal(), Images: refs}); err != nil {
 		a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
 		// 无 TurnStarted 也要有 TurnEnded：消费端以本事件解除 busy。
 		a.emit(TurnEndedEvent{StopReason: StopError})
@@ -354,7 +357,7 @@ func (a *Agent) absorbInbox() {
 	for {
 		select {
 		case msg := <-a.inbox:
-			if a.appendFatal(session.TypeUserMessage, session.UserMessageData{Text: msg}) != nil {
+			if a.appendFatal(session.TypeUserMessage, session.UserMessageData{Text: msg, Date: TodayLocal()}) != nil {
 				return // 失败已上报；本请求不含该插话（未落盘即模型不可见）
 			}
 			a.emit(StatusEvent{Text: "已吸收插话，将随下一请求发送"})
@@ -601,7 +604,7 @@ func (a *Agent) handleInterrupt(ctx context.Context, err error, attempt int, rlH
 
 func (a *Agent) retryPause(ctx context.Context, err error, attempt int, base time.Duration) bool {
 	d := backoffFor(attempt, retryAfterOf(err), base)
-	a.emit(StatusEvent{Text: fmt.Sprintf("流中断：%v；%s 后重连（%d/%d）", err, d, attempt+1, a.retries)})
+	a.emit(StatusEvent{Text: fmt.Sprintf("流中断：%v；%s 后重连（%d/%d）", err, human.Duration(d), attempt+1, a.retries)})
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

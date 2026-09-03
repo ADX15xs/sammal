@@ -16,6 +16,7 @@ import (
 
 	"sammal/internal/agent"
 	"sammal/internal/compaction"
+	"sammal/internal/human"
 	"sammal/internal/provider"
 	"sammal/internal/skill"
 	"sammal/internal/tool"
@@ -67,6 +68,7 @@ type Model struct {
 	windowTokens int       // 上下文窗口大小（0 = 不显示 ctx%）
 	ctxWarned    bool      // ctx ≥ 压缩阈值时只告警一次
 	tickArmed    bool      // 心跳去重：至多一个未触发的 turnTick
+	tickN        int       // 心跳计数：驱动等待期 spinner 帧
 
 	history   []string
 	histDepth int // 0 = 实时输入；>0 = 正在翻阅的第 N 条历史
@@ -180,7 +182,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if len(imgs) > 0 {
 			prompt += "\n" + dim(fmt.Sprintf("  📎 %s", imagesSummary(imgs)))
 		}
-		return m, tea.Println(prompt)
+		// 提交即挂心跳：TurnStarted 回来之前是用户最紧张的等待期，
+		// spinner 帧必须动起来，不能等事件回环才起步。
+		return m, tea.Batch(tea.Println(prompt), m.armTick())
 	}
 	switch {
 	case msg.Code == tea.KeyEscape:
@@ -594,7 +598,8 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		// 时长覆盖工具环全程。
 		var stamp tea.Cmd
 		if ev.StopReason == agent.StopCompleted && m.turnStart.After(time.Time{}) {
-			stamp = tea.Println(dim(fmt.Sprintf("（耗时 %s）", formatElapsed(time.Since(m.turnStart)))))
+			stamp = tea.Println(dim(fmt.Sprintf("（耗时 %s · %s 完成）",
+				human.Duration(time.Since(m.turnStart)), time.Now().Format("15:04"))))
 		}
 		m.turnStart = time.Time{}
 		if ev.Usage != nil {
@@ -607,7 +612,10 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if ev.StopReason == agent.StopAborted {
 			cmd = tea.Println(dim("（已中止）"))
 		}
-		cmd = tea.Batch(listenAgent(m.deps.Events), cmd, warn, stamp)
+		// tea.Batch 无顺序保证（bubbletea 文档明示），多个 Println 会竞速；
+		// 耗时落款须排在上下文告警之后，故打印段走 Sequence。listenAgent
+		// 是长命命令，只能并发挂在 Batch 上。
+		cmd = tea.Batch(listenAgent(m.deps.Events), tea.Sequence(cmd, warn, stamp))
 		return m, cmd
 
 	case agent.StatusEvent:
@@ -654,15 +662,20 @@ func (m Model) reasonLine() string {
 	return lastLine(m.reason.String())
 }
 
-// armTick 生成中挂一个每秒心跳，驱动计时器与状态栏刷新。tickArmed 去重：
+// armTick 生成中挂一个心跳，驱动计时器与状态栏刷新。tickArmed 去重：
 // 事件高频到达时（每个 reasoning 增量都会尝试挂表），保证任意时刻至多
-// 一个未触发的 tick，否则定时器指数堆积。
+// 一个未触发的 tick，否则定时器指数堆积。延时对齐 turnStart 的整秒边界：
+// 自续式「触发后再等 1s」会把每次处理延迟累计进计时器，长回合越走越慢。
 func (m Model) armTick() tea.Cmd {
 	if !m.busy || m.tickArmed {
 		return nil
 	}
 	m.tickArmed = true
-	return tea.Tick(time.Second, func(time.Time) tea.Msg { return turnTickMsg{} })
+	delay := time.Second
+	if m.turnStart.After(time.Time{}) {
+		delay = time.Second - time.Since(m.turnStart)%time.Second
+	}
+	return tea.Tick(delay, func(time.Time) tea.Msg { return turnTickMsg{} })
 }
 
 // turnTick 心跳：busy 期间自续，空闲时终止。思考行的刷新由 token 到达
@@ -673,8 +686,13 @@ func (m Model) turnTick() (tea.Model, tea.Cmd) {
 	if !m.busy {
 		return m, nil
 	}
+	m.tickN++
 	return m, m.armTick()
 }
+
+// spinnerFrames 等待期 spinner 的帧序列：心跳每秒推进一帧，给「还活着」
+// 一个可见信号（turn 开始后由跳动的计时数字接管）。
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // warnContextPressure 投影逼近压缩触发线时提示一次（把「下一轮要压缩、
 // 会变慢且缓存重建」提前解释给用户）。TurnEnded 时判定，一轮只报一次。
@@ -834,7 +852,7 @@ func (m Model) streamBlockLines(width int) []string {
 		// 数字就是「还活着」的口子。定稿即从视窗丢弃，全文在日志里。
 		line := "- 思考中"
 		if m.turnStart.After(time.Time{}) {
-			line = fmt.Sprintf("- 思考中 %s", formatElapsed(time.Since(m.turnStart)))
+			line = fmt.Sprintf("- 思考中 %s", human.Duration(time.Since(m.turnStart)))
 		}
 		if cur := m.reasonLine(); cur != "" {
 			// 前缀（"思考中 12s"）固定做锚点，正文超宽走尾部跟随：
@@ -871,28 +889,17 @@ func (m Model) streamBlockLines(width int) []string {
 	return lines
 }
 
-// formatElapsed 把时长渲染为紧凑形式（38s / 2m14s / 1h02m）。
-func formatElapsed(d time.Duration) string {
-	d = d.Round(time.Second)
-	s := int(d.Seconds())
-	switch {
-	case s < 60:
-		return fmt.Sprintf("%ds", s)
-	case s < 3600:
-		return fmt.Sprintf("%dm%02ds", s/60, s%60)
-	default:
-		return fmt.Sprintf("%dh%02dm", s/3600, (s%3600)/60)
-	}
-}
-
 // statusSeg 是状态栏的一个显示段。
 type statusSeg struct {
 	text string // 已着色的最终文本
 	pri  int    // 丢弃优先级：越大越先丢；负值 = 永不丢（模型名、生成中标记）
 }
 
-// statusLine 状态栏。空间不足时按优先级从右往左丢弃：ctx → in/out →
-// cache → 计时器 → 工具数（模型名与生成中标记永不丢）。
+// statusLine 状态栏。空间不足时按丢弃优先级从高到低：工具数(5) → cache(3)
+// → in/out(2) → 计时器(2) → ctx(1)；同优先级丢更靠左的（见 dropToFit），
+// 故 in/out 先于计时器。模型名与生成中标记永不丢。计时器原为 4，在极窄
+// 终端仅晚于工具数被丢；降到 2 后让位给 cache/in/out，但仍保 ctx——ctx
+// 决定下一轮是否压缩，是决策信息，计时器是安慰信息，二者冲突时先丢计时器。
 func (m Model) statusLine() string {
 	segs := []statusSeg{{text: m.modelName}}
 	if m.usage != nil {
@@ -906,9 +913,11 @@ func (m Model) statusLine() string {
 		segs = append(segs, statusSeg{text: fmt.Sprintf("工具 %d", m.toolCalls), pri: 5})
 	}
 	if m.busy && m.turnStart.After(time.Time{}) {
-		segs = append(segs, statusSeg{text: "* " + formatElapsed(time.Since(m.turnStart)), pri: 4})
+		segs = append(segs, statusSeg{text: "* " + human.Duration(time.Since(m.turnStart)), pri: 2})
 	} else if m.busy {
-		segs = append(segs, statusSeg{text: "* 生成中", pri: -1}) // 负优先级 = 永不丢
+		// 等待期（已提交、TurnStarted 未到）：spinner 帧随心跳推进，
+		// 避免「生成中」长时间静止而被误读为卡死。负优先级 = 永不丢。
+		segs = append(segs, statusSeg{text: "* 生成中 " + spinnerFrames[m.tickN%len(spinnerFrames)], pri: -1})
 	}
 
 	width := m.width
@@ -926,7 +935,7 @@ func dropToFit(segs []statusSeg, budget int) []statusSeg {
 	const separator = " | "
 	for widthOf(strings.Join(segTexts(segs), separator)) > budget && len(segs) > 1 {
 		drop := -1
-		for i := len(segs) - 1; i >= 1; i-- { // segs[0] 模型名永不丢；并列时丢更靠右的
+		for i := len(segs) - 1; i >= 1; i-- { // segs[0] 模型名永不丢；并列时丢更靠左的（右往左扫 + >=）
 			if segs[i].pri < 0 {
 				continue // 负优先级段不可丢弃
 			}

@@ -185,6 +185,30 @@ func TestDeriveMessagesProjection(t *testing.T) {
 	}
 }
 
+// Date 字段投影时展开为模型可见的 Today 前缀（SPEC I2）；无日期（旧格式
+// 日志）不注记。前缀只进模型投影——Transcript（人类消费面）读原始 Text。
+func TestDeriveInjectsDatePrefix(t *testing.T) {
+	s := newSession(t)
+	s.Append(TypeUserMessage, UserMessageData{Text: "早", Date: "2026-09-03"})
+	s.Append(TypeUserMessage, UserMessageData{Text: "旧格式"})
+
+	msgs := s.DeriveMessages()
+	if len(msgs) != 2 {
+		t.Fatalf("msgs = %d: %+v", len(msgs), msgs)
+	}
+	if got, want := provider.ContentText(msgs[0].Content), "Today: 2026-09-03\n\n早"; got != want {
+		t.Errorf("带日期投影 = %q, want %q", got, want)
+	}
+	if got := provider.ContentText(msgs[1].Content); got != "旧格式" {
+		t.Errorf("无日期投影 = %q, want 原文", got)
+	}
+	for _, line := range s.Transcript() {
+		if strings.Contains(line, "Today:") {
+			t.Errorf("转录不应含内部注记: %q", line)
+		}
+	}
+}
+
 func TestTruncateBeforeTurn(t *testing.T) {
 	s := newSession(t)
 	s.Append(TypeUserMessage, UserMessageData{Text: "t1u"})

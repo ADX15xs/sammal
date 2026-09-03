@@ -88,7 +88,7 @@ func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture
 		t.Fatal(err)
 	}
 	root := filepath.Join(dir, "data")
-	facts := PromptFacts{Cwd: work, OS: "linux", Shell: "sh", Date: "2026-08-23"}
+	facts := PromptFacts{Cwd: work, OS: "linux", Shell: "sh"}
 	sess, err := session.Create(root, session.Header{
 		ID: session.NewID(), Cwd: work, Model: "test-model",
 		Created: "2026-08-23T00:00:00Z", OS: facts.OS, Shell: facts.Shell,
@@ -129,7 +129,7 @@ func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture
 
 func (f *fixture) system() string {
 	h := f.sess.Header()
-	return BuildSystemPrompt(PromptFacts{Cwd: h.Cwd, OS: h.OS, Shell: h.Shell, Date: h.Created[:10], Project: h.AgentsMD})
+	return BuildSystemPrompt(PromptFacts{Cwd: h.Cwd, OS: h.OS, Shell: h.Shell, Project: h.AgentsMD})
 }
 
 func drainEvents(t *testing.T, events <-chan Event, until func(Event) bool) []Event {

@@ -121,7 +121,7 @@ func TestModelNameResolvesByConfigKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := filepath.Join(dir, "data")
-	facts := PromptFacts{Cwd: work, OS: "linux", Shell: "sh", Date: "2026-08-23"}
+	facts := PromptFacts{Cwd: work, OS: "linux", Shell: "sh"}
 	sess, err := session.Create(root, session.Header{
 		ID: session.NewID(), Cwd: work, Model: "beta", // header 记录配置键
 		Created: "2026-08-23T00:00:00Z", OS: facts.OS, Shell: facts.Shell,
