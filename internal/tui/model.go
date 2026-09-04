@@ -78,6 +78,7 @@ type Model struct {
 
 	popup            popupKind
 	pickerSel        int
+	pickerOffset     int // 选择器可视窗口起始下标（>maxShown 项时跟随选中滚动）
 	inputBeforePopup string // Esc 关闭弹窗时还原
 }
 
@@ -244,6 +245,7 @@ type quitArmExpiredMsg struct{}
 func (m Model) openModelPicker() (tea.Model, tea.Cmd) {
 	m.popup = popupModelPicker
 	m.pickerSel = 0
+	m.pickerOffset = 0
 	m.inputBeforePopup = m.input.String()
 	m.input.Clear()
 	return m, nil
@@ -259,6 +261,7 @@ func (m Model) handlePopupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case msg.Code == tea.KeyUp:
 		if m.pickerSel > 0 {
 			m.pickerSel--
+			m.clampPickerOffset()
 		}
 		return m, nil
 	case msg.Code == tea.KeyDown:
@@ -268,6 +271,7 @@ func (m Model) handlePopupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.pickerSel < n-1 {
 			m.pickerSel++
+			m.clampPickerOffset()
 		}
 		return m, nil
 	case msg.Code == tea.KeyEnter:
@@ -294,13 +298,42 @@ func (m Model) handlePopupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case msg.Code == tea.KeyBackspace:
 		m.input.Backspace()
 		m.pickerSel = 0
+		m.pickerOffset = 0
 		return m, nil
 	default:
 		if s := msg.Text; s != "" {
 			m.input.Insert(s)
 			m.pickerSel = 0
+			m.pickerOffset = 0
 		}
 		return m, nil
+	}
+}
+
+// clampPickerOffset 让可视窗口跟随选中滚动：选中越过窗口末端时窗口下移，
+// 反之窗口顶部回退，保证选中始终在可见范围内（maxShown 项窗口）。
+func (m *Model) clampPickerOffset() {
+	n := len(m.filteredModels())
+	if m.popup == popupSkillPicker {
+		n = len(m.filteredSkills())
+	}
+	maxShown := pickerMaxShown
+	if n <= maxShown {
+		m.pickerOffset = 0
+		return
+	}
+	maxOffset := n - maxShown
+	switch {
+	case m.pickerSel > m.pickerOffset+maxShown-1:
+		m.pickerOffset = m.pickerSel - maxShown + 1
+	case m.pickerSel < m.pickerOffset:
+		m.pickerOffset = m.pickerSel
+	}
+	if m.pickerOffset > maxOffset {
+		m.pickerOffset = maxOffset
+	}
+	if m.pickerOffset < 0 {
+		m.pickerOffset = 0
 	}
 }
 
@@ -360,6 +393,7 @@ func skillNameLines(skills []skill.Skill) []string {
 func (m *Model) openSkillPicker() {
 	m.popup = popupSkillPicker
 	m.pickerSel = 0
+	m.pickerOffset = 0
 	m.inputBeforePopup = m.input.String()
 	m.input.Clear()
 }
@@ -792,25 +826,35 @@ func (m Model) View() tea.View {
 	return v
 }
 
+const pickerMaxShown = 8
+
+func pickerWindow[T any](items []T, offset int) []T {
+	start := min(offset, len(items))
+	if start < 0 {
+		start = 0
+	}
+	end := min(start+pickerMaxShown, len(items))
+	return items[start:end]
+}
+
 // modelPickerLines 模型选择器列表（内嵌于可变区，自带模糊过滤，不依赖 fzf）。
 func (m Model) modelPickerLines(width int) []string {
 	lines := []string{dim(" 选择模型（输入过滤 | Enter 确认 | Esc 取消）")}
 	models := m.filteredModels()
-	const maxShown = 8
-	for i, name := range models {
-		if i >= maxShown {
-			lines = append(lines, dim(fmt.Sprintf("   ... 共 %d 个", len(models))))
-			break
-		}
+	shown := pickerWindow(models, m.pickerOffset)
+	for i, name := range shown {
 		mark := " "
 		if name == m.modelName {
 			mark = "*"
 		}
 		entry := " " + mark + " " + name
-		if i == m.pickerSel {
+		if i == m.pickerSel-m.pickerOffset {
 			entry = ansiCyan + "> " + strings.TrimLeft(entry, " *") + ansiReset
 		}
 		lines = append(lines, clipLine(entry, width))
+	}
+	if len(models) > pickerMaxShown {
+		lines = append(lines, dim(fmt.Sprintf("   ... 共 %d 个", len(models))))
 	}
 	if len(models) == 0 {
 		lines = append(lines, dim("   （无匹配模型）"))
@@ -823,20 +867,19 @@ func (m Model) modelPickerLines(width int) []string {
 func (m Model) skillPickerLines(width int) []string {
 	lines := []string{dim(" 选择 skill（输入过滤 | Enter 回填 | Esc 取消）")}
 	skills := m.filteredSkills()
-	const maxShown = 8
-	for i, s := range skills {
-		if i >= maxShown {
-			lines = append(lines, dim(fmt.Sprintf("   ... 共 %d 个", len(skills))))
-			break
-		}
+	shown := pickerWindow(skills, m.pickerOffset)
+	for i, s := range shown {
 		entry := "   " + s.Name
 		if s.Description != "" {
 			entry += "  " + s.Description
 		}
-		if i == m.pickerSel {
+		if i == m.pickerSel-m.pickerOffset {
 			entry = ansiCyan + "> " + strings.TrimLeft(entry, " ") + ansiReset
 		}
 		lines = append(lines, clipLine(entry, width))
+	}
+	if len(skills) > pickerMaxShown {
+		lines = append(lines, dim(fmt.Sprintf("   ... 共 %d 个", len(skills))))
 	}
 	if len(skills) == 0 {
 		lines = append(lines, dim("   （无匹配 skill）"))
