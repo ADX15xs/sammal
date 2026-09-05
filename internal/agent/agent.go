@@ -444,6 +444,9 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 					a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
 					return msg, toolCalls, usage, err
 				}
+				// 事件契约：MessageFinal.Text 与本 attempt 的 TextDelta 累积
+				// （text）逐字节一致——TUI 渐进落盘依赖它（已落盘前缀 +
+				// 定稿补余 == 全文，见 internal/tui/scroll.go）。
 				a.emit(MessageFinalEvent{Text: text.String(), Interrupted: false, Usage: usage})
 				return msg, toolCalls, usage, nil
 			}

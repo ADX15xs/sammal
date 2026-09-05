@@ -1,6 +1,6 @@
 // Package tui 是 Bubble Tea v2 内联滚动前端：唯一的可变区是底部
-// 输入框 + 当前流式块，定稿内容经 tea.Println 追加进原生滚动缓冲区
-// （I4：单渲染路径，永不进 alt-screen）。
+// 输入框 + 当前流式块尾部窗口，内容经 scroll.go 的安全落盘路径渐进追加进
+// 原生滚动缓冲区（I4：单渲染路径，永不进 alt-screen）。
 package tui
 
 import (
@@ -33,8 +33,8 @@ type Deps struct {
 	Models    func() []string
 	// Skills 返回可用 skill 列表（/skill 命令与选择器的数据源，每次调用
 	// 现扫现显）；nil = 无 skill（SPEC 6.10）。
-	Skills     func() []skill.Skill
-	EditorCmd  func(path string) (*exec.Cmd, error)
+	Skills    func() []skill.Skill
+	EditorCmd func(path string) (*exec.Cmd, error)
 	// ContextWindow 当前模型的上下文窗口（token）；0 = 未知，状态栏不显示
 	// ctx 百分比。
 	ContextWindow int
@@ -52,16 +52,18 @@ const (
 )
 
 type Model struct {
-	deps      Deps
-	width     int
-	input     InputLine
-	busy      bool
-	stream    *strings.Builder // 当前流式块（可变区）
-	thinking  bool
-	reason    strings.Builder // 思考累积文本（定稿即弃，只取最新行渲染）
-	reasonCur string          // 当前未闭合行的缓存（增量里无换行时也要能显示）
-	usage     *provider.Usage
-	modelName string
+	deps          Deps
+	width         int
+	height        int
+	input         InputLine
+	busy          bool
+	stream        *strings.Builder // 当前流式块未落盘尾部（闭合行 + 半行，可变区）
+	streamPrinted bool             // 本条消息已有内容落进滚动缓冲区（重试作废标记的依据）
+	thinking      bool
+	reason        strings.Builder // 思考累积文本（定稿即弃，只取最新行渲染）
+	reasonCur     string          // 当前未闭合行的缓存（增量里无换行时也要能显示）
+	usage         *provider.Usage
+	modelName     string
 
 	turnStart    time.Time // 当前 turn 开始时刻（0 = 无进行中 turn）
 	toolCalls    int       // 本轮已执行的工具调用数（生成中显示）
@@ -78,7 +80,7 @@ type Model struct {
 
 	popup            popupKind
 	pickerSel        int
-	pickerOffset     int // 选择器可视窗口起始下标（>maxShown 项时跟随选中滚动）
+	pickerOffset     int    // 选择器可视窗口起始下标（>maxShown 项时跟随选中滚动）
 	inputBeforePopup string // Esc 关闭弹窗时还原
 }
 
@@ -92,7 +94,7 @@ func (m Model) InputText() string { return m.input.String() }
 func (m Model) Init() tea.Cmd {
 	if len(m.deps.StartupHints) > 0 {
 		return tea.Batch(listenAgent(m.deps.Events),
-			tea.Println(dim("[!] "+strings.Join(m.deps.StartupHints, "\n  "))))
+			m.printScroll(dim("[!] "+strings.Join(m.deps.StartupHints, "\n  "))))
 	}
 	return listenAgent(m.deps.Events)
 }
@@ -115,6 +117,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 		return m, nil
 
 	case tea.PasteMsg:
@@ -164,14 +167,14 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			case skillPickerOpen:
 				return m, nil
 			case skillShow:
-				return m, printLines(out)
+				return m, m.printLines(out)
 			case skillSend:
 				text = expanded // 展开正文走普通发送路径，回显仍显示原命令
 			default:
 				if lines, handled := m.handleSlash(text); handled {
-					return m, printLines(lines)
+					return m, m.printLines(lines)
 				}
-				return m, printLines(m.deps.Slash(text))
+				return m, m.printLines(m.deps.Slash(text))
 			}
 		}
 		imgs := m.pendingImages
@@ -185,7 +188,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		// 提交即挂心跳：TurnStarted 回来之前是用户最紧张的等待期，
 		// spinner 帧必须动起来，不能等事件回环才起步。
-		return m, tea.Batch(tea.Println(prompt), m.armTick())
+		return m, tea.Batch(m.printScroll(prompt), m.armTick())
 	}
 	switch {
 	case msg.Code == tea.KeyEscape:
@@ -294,7 +297,7 @@ func (m Model) handlePopupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.popup = popupNone
 		m.input.Clear()
 		lines := m.deps.Slash("/model " + chosen)
-		return m, printLines(lines)
+		return m, m.printLines(lines)
 	case msg.Code == tea.KeyBackspace:
 		m.input.Backspace()
 		m.pickerSel = 0
@@ -514,12 +517,12 @@ func (m Model) openEditor() (tea.Model, tea.Cmd) {
 	}
 	path := filepath.Join(os.TempDir(), fmt.Sprintf("sammal-%d.md", time.Now().UnixMilli()))
 	if err := os.WriteFile(path, []byte(m.input.String()), 0o644); err != nil {
-		return m, tea.Println(errStyle("临时文件创建失败：" + err.Error()))
+		return m, m.printScroll(errStyle("临时文件创建失败：" + err.Error()))
 	}
 	cmd, err := m.deps.EditorCmd(path)
 	if err != nil {
 		os.Remove(path)
-		return m, tea.Println(errStyle("未配置编辑器：" + err.Error()))
+		return m, m.printScroll(errStyle("未配置编辑器：" + err.Error()))
 	}
 	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return editorDoneMsg{path: path, err: err}
@@ -529,11 +532,11 @@ func (m Model) openEditor() (tea.Model, tea.Cmd) {
 func (m Model) editorDone(msg editorDoneMsg) (tea.Model, tea.Cmd) {
 	defer os.Remove(msg.path)
 	if msg.err != nil {
-		return m, tea.Println(errStyle("编辑器异常退出：" + msg.err.Error()))
+		return m, m.printScroll(errStyle("编辑器异常退出：" + msg.err.Error()))
 	}
 	data, err := os.ReadFile(msg.path)
 	if err != nil {
-		return m, tea.Println(errStyle("读取编辑结果失败：" + err.Error()))
+		return m, m.printScroll(errStyle("读取编辑结果失败：" + err.Error()))
 	}
 	content := strings.TrimSuffix(string(data), "\n")
 	if content == "" {
@@ -542,13 +545,6 @@ func (m Model) editorDone(msg editorDoneMsg) (tea.Model, tea.Cmd) {
 	m.input.Clear()
 	m.input.Insert(content)
 	return m, nil
-}
-
-func printLines(lines []string) tea.Cmd {
-	if len(lines) == 0 {
-		return nil
-	}
-	return tea.Println(strings.Join(lines, "\n"))
 }
 
 func (m Model) loadHistory() {
@@ -587,6 +583,20 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 			m.resetReason()
 		}
 		m.stream.WriteString(ev.Text)
+		// 渐进落盘：闭合行超过触发线即把头部行落进滚动缓冲区，帧内只留
+		// 尾部窗口。整条回复攒到定稿一次性落盘会在长回答上击穿 insertAbove
+		// 的视口不变式（scroll.go 顶部注释），流式期间滚动缓冲也不可搜索。
+		if s := m.stream.String(); strings.Count(s, "\n") > streamFlushLines {
+			i := strings.LastIndexByte(s, '\n')
+			m.stream.Reset()
+			m.stream.WriteString(s[i+1:])
+			// 头部止于最后一个换行符（不含）：行终止符由落盘通道自补，
+			// 带上它会在批尾多出一个空行。
+			if c := m.printScroll(s[:i]); c != nil {
+				m.streamPrinted = true
+				cmd = c
+			}
+		}
 
 	case agent.ReasonDeltaEvent:
 		m.thinking = true
@@ -598,28 +608,45 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.resetReason()
 
 	case agent.StreamRestartedEvent:
+		// 重连即重新生成：旧增量全部作废。已渐进落盘的部分收不回来，
+		// 打一行暗色标记把静默丢弃变成诚实痕迹；帧内未落盘部分直接清掉。
+		if m.streamPrinted {
+			cmd = m.printScroll(dim("（流中断重连：上方未定稿内容已作废）"))
+		}
 		m.stream.Reset()
+		m.streamPrinted = false
 		m.thinking = false
 		m.resetReason()
 
 	case agent.ToolCallEvent:
 		m.toolCalls++
-		cmd = tea.Println(dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
+		cmd = m.printScroll(dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
 
 	case agent.ToolResultEvent:
-		cmd = tea.Println(dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
+		cmd = m.printScroll(dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
 
 	case agent.MessageFinalEvent:
-		m.stream.Reset()
 		m.thinking = false
 		m.resetReason()
 		if ev.Usage != nil {
 			m.usage = ev.Usage // 多 step 工具环中 ctx% 随每个 step 更新
 		}
-		if ev.Interrupted {
-			cmd = tea.Println(dim(renderInterrupted(ev.Text)))
-		} else {
-			cmd = tea.Println(ev.Text)
+		// 定稿补余：闭合行已随流式渐进落盘，此处只补帧内剩余（含最后的
+		// 未闭合行）。ev.Text 与 TextDelta 累积逐字节一致（agent 事件契约，
+		// agent.go 定稿处直接写 text.String()），已打印前缀 + 剩余 == ev.Text。
+		rest := m.stream.String()
+		wasPrinted := m.streamPrinted
+		m.stream.Reset()
+		m.streamPrinted = false
+		switch {
+		case ev.Interrupted && rest != "":
+			cmd = tea.Sequence(m.printScroll(rest), m.printScroll(dim("（以上内容被中断）")))
+		case ev.Interrupted && wasPrinted:
+			cmd = m.printScroll(dim("（以上内容被中断）"))
+		case ev.Interrupted:
+			cmd = m.printScroll(dim("（生成中断，内容未定稿）"))
+		default:
+			cmd = m.printScroll(rest)
 		}
 
 	case agent.TurnEndedEvent:
@@ -632,7 +659,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		// 时长覆盖工具环全程。
 		var stamp tea.Cmd
 		if ev.StopReason == agent.StopCompleted && m.turnStart.After(time.Time{}) {
-			stamp = tea.Println(dim(fmt.Sprintf("（耗时 %s · %s 完成）",
+			stamp = m.printScroll(dim(fmt.Sprintf("（耗时 %s · %s 完成）",
 				human.Duration(time.Since(m.turnStart)), time.Now().Format("15:04"))))
 		}
 		m.turnStart = time.Time{}
@@ -644,7 +671,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 			warn = m.warnContextPressure()
 		}
 		if ev.StopReason == agent.StopAborted {
-			cmd = tea.Println(dim("（已中止）"))
+			cmd = m.printScroll(dim("（已中止）"))
 		}
 		// tea.Batch 无顺序保证（bubbletea 文档明示），多个 Println 会竞速；
 		// 耗时落款须排在上下文告警之后，故打印段走 Sequence。listenAgent
@@ -653,7 +680,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case agent.StatusEvent:
-		cmd = tea.Println(dim("| " + ev.Text))
+		cmd = m.printScroll(dim("| " + ev.Text))
 
 	case agent.ModelSwitchedEvent:
 		m.modelName = ev.Name
@@ -662,7 +689,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.ctxWarned = false
 
 	case agent.ErrorEvent:
-		cmd = tea.Println(errStyle(ev.Err.Error()))
+		cmd = m.printScroll(errStyle(ev.Err.Error()))
 	}
 	return m, tea.Batch(listenAgent(m.deps.Events), cmd)
 }
@@ -736,7 +763,7 @@ func (m Model) warnContextPressure() tea.Cmd {
 	}
 	if r := float64(m.usage.PromptTokens) / float64(m.windowTokens); r >= compaction.TriggerRatio && !m.ctxWarned {
 		m.ctxWarned = true
-		return tea.Println(dim(fmt.Sprintf("| 上下文已达窗口 %d%%（压缩触发线 %d%%）：下一轮可能自动压缩并重建 KV 缓存",
+		return m.printScroll(dim(fmt.Sprintf("| 上下文已达窗口 %d%%（压缩触发线 %d%%）：下一轮可能自动压缩并重建 KV 缓存",
 			int(r*100), int(compaction.TriggerRatio*100))))
 	}
 	return nil
@@ -781,13 +808,6 @@ func imagesSummary(paths []string) string {
 		return filepath.Base(paths[0])
 	}
 	return fmt.Sprintf("%s +%d more", filepath.Base(paths[0]), len(paths)-1)
-}
-
-func renderInterrupted(text string) string {
-	if text == "" {
-		return "（生成中断，内容未定稿）"
-	}
-	return text + "\n" + dim("（以上内容被中断）")
 }
 
 // View 渲染唯一可变区：当前流式块 → 状态行 → 输入行。
