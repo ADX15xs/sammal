@@ -21,8 +21,62 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
 	"github.com/rivo/uniseg"
 )
+
+// expandTabs 把单行里的 \t 按终端 8 列制表位展开为空格。ANSI 转义序列
+// 原样拷贝、不占列——否则着色行里的 \t 列位会被算错。逐行独立展开
+// （每行列号从 1 起算），与终端换行行为一致。
+func expandTabs(line string) string {
+	runes := []rune(line)
+	var b strings.Builder
+	col := 1
+	for i := 0; i < len(runes); {
+		r := runes[i]
+		if r == '\x1b' {
+			end := escapeEnd(runes, i)
+			for ; i < end; i++ {
+				b.WriteRune(runes[i])
+			}
+			continue
+		}
+		if r == '\t' {
+			nextStop := ((col-1)/8+1)*8 + 1
+			b.WriteString(strings.Repeat(" ", nextStop-col))
+			col = nextStop
+			i++
+			continue
+		}
+		b.WriteRune(r)
+		col += runewidth.RuneWidth(r)
+		i++
+	}
+	return b.String()
+}
+
+// escapeEnd 返回从 i 起的 ANSI 转义序列结束下标（i 指向 ESC）。支持 CSI
+// （\x1b[ 参数/中间/终结字节）与单字符转义；无法识别时只跳过 ESC 本身。
+func escapeEnd(runes []rune, i int) int {
+	end := i + 1
+	if end >= len(runes) {
+		return end
+	}
+	if runes[end] != '[' {
+		return end // 单字符转义
+	}
+	end++
+	for end < len(runes) && runes[end] >= 0x30 && runes[end] <= 0x3f { // 参数字节
+		end++
+	}
+	for end < len(runes) && runes[end] >= 0x20 && runes[end] <= 0x2f { // 中间字节
+		end++
+	}
+	if end < len(runes) && runes[end] >= 0x40 && runes[end] <= 0x7e { // 终结字节
+		end++
+	}
+	return end
+}
 
 // streamFlushLines 流式落盘触发线：流式块内闭合行数超过该值即把头部行
 // 落进滚动缓冲区，帧内只留尾部窗口。取 6 = 显示上限 maxLines(8) 减去
@@ -51,13 +105,20 @@ func printSafeLine(line string, w int) string {
 
 // splitForPrint 把待落盘文本切成若干批，每批就是一次 tea.Println 的载荷，
 // 保证每批折行总行数 ≤ margin。批序即行序；除巨行硬拆与尾空格补齐外
-// 不改写文本。
+// 不改写文本。行内 \t 先按 8 列制表位展开为空格，使 ansi.StringWidth 与
+// 终端实际占列一致（ansi.StringWidth 把 \t 算成 0，会致 wrappedRows 严重
+// 低估、insertAbove 超预算脱轨）。拖尾 \n 产生的空串元素剔除，避免多出
+// 一个空行。
 func splitForPrint(text string, w, margin int) []string {
 	if text == "" {
 		return nil
 	}
 	if margin < 1 {
 		margin = 1
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > 1 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
 	}
 	var batches []string
 	var batch []string
@@ -68,13 +129,11 @@ func splitForPrint(text string, w, margin int) []string {
 			batch, used = nil, 0
 		}
 	}
-	for _, line := range strings.Split(text, "\n") {
+	for _, line := range lines {
+		line = expandTabs(line)
 		line = printSafeLine(line, w)
 		rows := wrappedRows(line, w)
 		if rows > margin {
-			// 巨行（折行后超预算，2000+ 列级别）：按 margin*w-1 显示宽
-			// 硬拆成多段——段宽避开整数倍宽度且折行恰为 margin 行，复制
-			// 代价只落在这一种极端行上。
 			flush()
 			for _, chunk := range chunkByWidth(line, margin*w-1) {
 				batches = append(batches, printSafeLine(chunk, w))
@@ -92,6 +151,8 @@ func splitForPrint(text string, w, margin int) []string {
 }
 
 // chunkByWidth 把单行按显示宽度上限切成多段（字素簇边界切分，宽字符不切半）。
+// ANSI 转义序列作为原子单元整体放入一段，不在中间切断——否则落盘后的着色
+// 文本会出现残缺转义导致的乱码。
 func chunkByWidth(line string, width int) []string {
 	if width < 1 {
 		width = 1
@@ -102,15 +163,24 @@ func chunkByWidth(line string, width int) []string {
 	state := -1
 	rest := line
 	for len(rest) > 0 {
-		var cluster string
-		cluster, rest, _, state = uniseg.FirstGraphemeClusterInString(rest, state)
-		cw := ansi.StringWidth(cluster)
+		var seg string
+		if rest[0] == 0x1b {
+			end := escapeEndBytes(rest)
+			seg = rest[:end]
+			rest = rest[end:]
+			state = -1 // 转义序列边界干净，重置字素状态
+		} else {
+			var s int
+			seg, rest, _, s = uniseg.FirstGraphemeClusterInString(rest, state)
+			state = s
+		}
+		cw := ansi.StringWidth(seg)
 		if used+cw > width && b.Len() > 0 {
 			out = append(out, b.String())
 			b.Reset()
 			used = 0
 		}
-		b.WriteString(cluster)
+		b.WriteString(seg)
 		used += cw
 	}
 	if b.Len() > 0 {
@@ -119,17 +189,51 @@ func chunkByWidth(line string, width int) []string {
 	return out
 }
 
+// escapeEndBytes 返回字符串开头 ANSI 转义序列结束的字节下标（s[0] 必须是
+// ESC）。支持 CSI（\x1b[ 参数/中间/终结字节）与单字符转义；识别失败只跳过
+// ESC 自己。转义序列由 ASCII 组成，字节下标即长度。
+func escapeEndBytes(s string) int {
+	end := 1
+	if end >= len(s) {
+		return end
+	}
+	if s[end] != '[' {
+		return end
+	}
+	end++
+	for end < len(s) && s[end] >= 0x30 && s[end] <= 0x3f {
+		end++
+	}
+	for end < len(s) && s[end] >= 0x20 && s[end] <= 0x2f {
+		end++
+	}
+	if end < len(s) && s[end] >= 0x40 && s[end] <= 0x7e {
+		end++
+	}
+	return end
+}
+
 // printMargin 单次落盘的安全折行行数预算：视口高减去自绘面最大高度
 // （思考行 + 流式尾部 8 行 + 状态栏 + 输入行，共 11 行）再留 3 行余量。
-// insertAbove 的不变式要求折行总行数 ≤ 视口高 − 帧高，故极矮终端下预算
-// 贴着下限 1 逐行落盘，绝不超出真实余量；帧高本身超出视口（h < 12）属
-// 应用不可用态，不在保证范围。
+// 多行输入框会多吃行数——按实际可见行数动态扣减。insertAbove 的不变式
+// 要求折行总行数 ≤ 视口高 − 帧高，故极矮终端下预算贴着下限 1 逐行落盘，
+// 绝不超出真实余量；帧高本身超出视口（h < 12）属应用不可用态，不在保证范围。
 func (m Model) printMargin() int {
 	h := m.height
 	if h <= 0 {
 		h = 24 // WindowSizeMsg 未达前的兜底
 	}
-	if margin := h - 14; margin > 1 {
+	// 基础帧高：思考(1) + 流式尾(8) + 状态(1) + 输入(1) + 余量(3) = 14
+	frameH := 14
+	// 多行输入框比单行多出的行数
+	edLines := m.editor.lineCount()
+	if max := m.editorMaxLines(); edLines > max {
+		edLines = max
+	}
+	if edLines > 1 {
+		frameH += edLines - 1
+	}
+	if margin := h - frameH; margin > 1 {
 		return margin
 	}
 	return 1

@@ -171,6 +171,75 @@ func TestSplitForPrintChunksMonsterLine(t *testing.T) {
 	}
 }
 
+// 行内 \t 展开为空格（8 列制表位），ANSI 转义原样保留且不占列位。
+func TestExpandTabs(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"a\tb", "a       b"},                             // 列位 1 后 \t → 下一制表位 9，7 空格
+		{"1234567\tb", "1234567 b"},                       // 列位 8 后 \t → 9，1 空格
+		{"12345678\tb", "12345678        b"},              // 列位 9 后 \t → 17，8 空格
+		{"\x1b[2ma\tb\x1b[0m", "\x1b[2ma       b\x1b[0m"}, // ANSI 不计列位
+		{"中文\tb", "中文    b"},                              // CJK 双宽：列位 5 → 9，4 空格
+	}
+	for _, c := range cases {
+		if got := expandTabs(c.in); got != c.want {
+			t.Errorf("expandTabs(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// 含 tab 的行展开后折行数不再被 0 宽度低估（insertAbove 超预算的根因）。
+func TestSplitForPrintExpandsTabsBeforeBudget(t *testing.T) {
+	line := "12345678\t9" // 8 列后 \t → 制表位 17，展开成 8 空格，显示宽 17
+	batches := splitForPrint(line, 10, 3)
+	if len(batches) != 1 {
+		t.Fatalf("应单批: %q", batches)
+	}
+	if got := ansi.StringWidth(strings.TrimSuffix(batches[0], " ")); got != 17 {
+		t.Errorf("展开后显示宽 = %d, want 17（终端 tab 展开后的真实宽度）", got)
+	}
+	if strings.Contains(batches[0], "\t") {
+		t.Errorf("输出不应残留字面 tab: %q", batches[0])
+	}
+}
+
+// 拖尾 \n 不产生空批 / 多余空行（原 strings.Split 会附加空串元素）。
+func TestSplitForPrintTrailingNewline(t *testing.T) {
+	got := splitForPrint("hello\n", 80, 16)
+	if len(got) != 1 {
+		t.Fatalf("拖尾换行应单批: %q", got)
+	}
+	if got[0] != "hello" {
+		t.Errorf("批尾不应有空行: %q", got[0])
+	}
+	// 中间空行（分段）应保留。
+	got = splitForPrint("a\n\nb", 80, 16)
+	if len(got) != 1 || got[0] != "a\n\nb" {
+		t.Errorf("中间空行应保留: %q", got)
+	}
+}
+
+// chunkByWidth 不切断 ANSI：着色巨行硬拆后每个转义序列保持完整。
+func TestChunkByWidthANSISafe(t *testing.T) {
+	colored := "\x1b[2m" + strings.Repeat("x", 20) + "\x1b[0m"
+	chunks := chunkByWidth(colored, 5)
+	for i, c := range chunks {
+		if strings.Contains(c, "\x1b") && !strings.Contains(c, "\x1b[0m") {
+			// 简单断言：开头转义 \x1b[2m 和结尾 \x1b[0m 都不该被拆半。
+			if !strings.HasSuffix(c, "m") && !strings.HasPrefix(c, "\x1b") {
+				t.Errorf("段 %d 可能切断 ANSI: %q", i, c)
+			}
+		}
+	}
+	// 拼接后应保留全部转义与内容。
+	joined := strings.Join(chunks, "")
+	if strings.Count(joined, "\x1b[") != 2 {
+		t.Errorf("ANSI 转义数量应保持 2: %q", joined)
+	}
+	if !strings.Contains(joined, "xxxxx") && !strings.Contains(joined, "x") {
+		t.Errorf("内容应保留: %q", joined)
+	}
+}
+
 // 流式渐进落盘：闭合行未达触发线不动，超过即把头部行落盘、帧内只留尾部。
 func TestStreamProgressiveFlush(t *testing.T) {
 	m := New(Deps{ModelName: "m", Events: closedEvents()})
@@ -289,7 +358,7 @@ func TestUserEchoBatchedSafePrint(t *testing.T) {
 		Send:      func(string, []string) {},
 	})
 	m.width, m.height = 80, 30
-	m.input.Insert(strings.Repeat("粘贴行\n", 40))
+	m.editor.Insert(strings.Repeat("粘贴行\n", 40))
 
 	next, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = next.(Model)
