@@ -439,7 +439,7 @@ func (a *Agent) streamStep(ctx context.Context, req provider.Request) (provider.
 			} else {
 				msg := provider.Message{Role: "assistant", Content: provider.ContentFromText(text.String()), ToolCalls: toolCalls}
 				if err := a.sess.Append(session.TypeAssistantMessage, session.AssistantMessageData{
-					Text: text.String(), ToolCalls: toolCalls,
+					Text: text.String(), ToolCalls: toolCalls, Usage: usage,
 				}); err != nil {
 					a.emit(ErrorEvent{Err: fmt.Errorf("日志写入失败：%w", err)})
 					return msg, toolCalls, usage, err

@@ -81,6 +81,7 @@ type AssistantMessageData struct {
 	ToolCalls   []provider.ToolCall `json:"toolCalls,omitempty"`
 	Interrupted bool                `json:"interrupted"`
 	Synthetic   bool                `json:"synthetic,omitempty"` // 崩溃恢复时自 chunk 合成
+	Usage       *provider.Usage     `json:"usage,omitempty"`
 }
 
 type ToolCallData struct {
