@@ -15,7 +15,6 @@ import (
 	"github.com/rivo/uniseg"
 
 	"sammal/internal/agent"
-	"sammal/internal/compaction"
 	"sammal/internal/human"
 	"sammal/internal/provider"
 	"sammal/internal/skill"
@@ -42,20 +41,11 @@ type Deps struct {
 	StartupHints []string
 }
 
-// popupKind 弹窗状态集中管理（第 6.7 节：避开 Reasonix 的 nil 链互斥）。
-type popupKind int
-
-const (
-	popupNone popupKind = iota
-	popupModelPicker
-	popupSkillPicker
-)
-
 type Model struct {
 	deps          Deps
 	width         int
 	height        int
-	input         InputLine
+	editor        Editor
 	busy          bool
 	stream        *strings.Builder // 当前流式块未落盘尾部（闭合行 + 半行，可变区）
 	streamPrinted bool             // 本条消息已有内容落进滚动缓冲区（重试作废标记的依据）
@@ -85,11 +75,11 @@ type Model struct {
 }
 
 func New(deps Deps) Model {
-	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}, windowTokens: deps.ContextWindow}
+	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}, windowTokens: deps.ContextWindow, editor: NewEditor()}
 }
 
 // InputText 返回当前输入内容（测试用）。
-func (m Model) InputText() string { return m.input.String() }
+func (m Model) InputText() string { return m.editor.Text() }
 
 func (m Model) Init() tea.Cmd {
 	if len(m.deps.StartupHints) > 0 {
@@ -121,7 +111,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.PasteMsg:
-		m.input.Insert(msg.Content)
+		m.editor.InsertPaste(msg.Content)
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -153,11 +143,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.openEditor()
 	}
 	if msg.Code == tea.KeyEnter {
-		if m.input.Empty() && len(m.pendingImages) == 0 {
+		if m.editor.Empty() && len(m.pendingImages) == 0 {
 			return m, nil
 		}
-		text := m.input.String()
-		m.input.Clear()
+		text := m.editor.Text()
+		m.editor.Clear()
 		if text != "" {
 			m.rememberInput(text)
 		}
@@ -203,39 +193,45 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.quitArmed {
 			return m, tea.Quit
 		}
-		if m.input.Empty() {
+		if m.editor.Empty() {
 			return m, tea.Quit
 		}
-		m.input.Clear()
+		m.editor.Clear()
 		m.quitArmed = true
 		return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg {
 			return quitArmExpiredMsg{}
 		})
+	case msg.Keystroke() == "ctrl+j" || msg.Keystroke() == "alt+enter":
+		m.editor.InsertNewline()
 	case msg.Code == tea.KeyBackspace:
-		m.input.Backspace()
+		m.editor.Backspace()
 	case msg.Code == tea.KeyDelete:
-		m.input.Delete()
+		m.editor.Delete()
 	case msg.Code == tea.KeyLeft:
-		m.input.Left()
+		m.editor.Left()
 	case msg.Code == tea.KeyRight:
-		m.input.Right()
+		m.editor.Right()
 	case msg.Code == tea.KeyHome:
-		m.input.Home()
+		m.editor.Home()
 	case msg.Code == tea.KeyEnd:
-		m.input.End()
+		m.editor.End()
 	case msg.Code == tea.KeyUp:
-		if m.input.Empty() && len(m.history) > 0 {
+		if m.editor.lineCount() > 1 && m.editor.curRow > 0 {
+			m.editor.Up()
+		} else if m.editor.Empty() && len(m.history) > 0 {
 			m.histDepth = min(m.histDepth+1, len(m.history))
 			m.loadHistory()
 		}
 	case msg.Code == tea.KeyDown:
-		if m.histDepth > 0 {
+		if m.editor.lineCount() > 1 && m.editor.curRow < m.editor.lineCount()-1 {
+			m.editor.Down()
+		} else if m.histDepth > 0 {
 			m.histDepth--
 			m.loadHistory()
 		}
 	default:
 		if s := msg.Text; s != "" {
-			m.input.Insert(s)
+			m.editor.Insert(s)
 		}
 	}
 	m.quitArmed = false
@@ -243,267 +239,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 type quitArmExpiredMsg struct{}
-
-// openModelPicker 打开 Ctrl+P 选择器：输入框转为过滤器，原输入 Esc 时还原。
-func (m Model) openModelPicker() (tea.Model, tea.Cmd) {
-	m.popup = popupModelPicker
-	m.pickerSel = 0
-	m.pickerOffset = 0
-	m.inputBeforePopup = m.input.String()
-	m.input.Clear()
-	return m, nil
-}
-
-func (m Model) handlePopupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch {
-	case msg.Code == tea.KeyEscape:
-		m.popup = popupNone
-		m.input.Clear()
-		m.input.Insert(m.inputBeforePopup)
-		return m, nil
-	case msg.Code == tea.KeyUp:
-		if m.pickerSel > 0 {
-			m.pickerSel--
-			m.clampPickerOffset()
-		}
-		return m, nil
-	case msg.Code == tea.KeyDown:
-		n := len(m.filteredModels())
-		if m.popup == popupSkillPicker {
-			n = len(m.filteredSkills())
-		}
-		if m.pickerSel < n-1 {
-			m.pickerSel++
-			m.clampPickerOffset()
-		}
-		return m, nil
-	case msg.Code == tea.KeyEnter:
-		if m.popup == popupSkillPicker {
-			skills := m.filteredSkills()
-			if len(skills) == 0 {
-				return m, nil
-			}
-			chosen := skills[min(m.pickerSel, len(skills)-1)]
-			m.popup = popupNone
-			m.input.Clear()
-			m.input.Insert("/skill " + chosen.Name + " ") // 回填待补任务描述，不直接发送
-			return m, nil
-		}
-		models := m.filteredModels()
-		if len(models) == 0 {
-			return m, nil
-		}
-		chosen := models[min(m.pickerSel, len(models)-1)]
-		m.popup = popupNone
-		m.input.Clear()
-		lines := m.deps.Slash("/model " + chosen)
-		return m, m.printLines(lines)
-	case msg.Code == tea.KeyBackspace:
-		m.input.Backspace()
-		m.pickerSel = 0
-		m.pickerOffset = 0
-		return m, nil
-	default:
-		if s := msg.Text; s != "" {
-			m.input.Insert(s)
-			m.pickerSel = 0
-			m.pickerOffset = 0
-		}
-		return m, nil
-	}
-}
-
-// clampPickerOffset 让可视窗口跟随选中滚动：选中越过窗口末端时窗口下移，
-// 反之窗口顶部回退，保证选中始终在可见范围内（maxShown 项窗口）。
-func (m *Model) clampPickerOffset() {
-	n := len(m.filteredModels())
-	if m.popup == popupSkillPicker {
-		n = len(m.filteredSkills())
-	}
-	maxShown := pickerMaxShown
-	if n <= maxShown {
-		m.pickerOffset = 0
-		return
-	}
-	maxOffset := n - maxShown
-	switch {
-	case m.pickerSel > m.pickerOffset+maxShown-1:
-		m.pickerOffset = m.pickerSel - maxShown + 1
-	case m.pickerSel < m.pickerOffset:
-		m.pickerOffset = m.pickerSel
-	}
-	if m.pickerOffset > maxOffset {
-		m.pickerOffset = maxOffset
-	}
-	if m.pickerOffset < 0 {
-		m.pickerOffset = 0
-	}
-}
-
-// skillCmd 是 /skill 命令的处理结果类别。
-type skillCmd int
-
-const (
-	skillNone       skillCmd = iota // 不是 /skill 命令，交回常规命令分发
-	skillSend                       // expanded 已就绪，走普通发送路径
-	skillShow                       // out 为候选/提示行，不发送
-	skillPickerOpen                 // 选择器已打开，本次输入消费完毕
-)
-
-// slashSkill 处理 /skill（TUI 专属：展开发生在提交之前，core 无感知）。
-// `<name>` 精确同名优先、其余子序列模糊匹配；唯一命中时把「skill 正文 +
-// 任务描述」拼成一条 user 消息（骑 user turn 尾部，SPEC 6.10）；无参打开
-// 选择器；无命中/歧义输出候选行。
-func (m *Model) slashSkill(input string) (skillCmd, string, []string) {
-	if input != "/skill" && !strings.HasPrefix(input, "/skill ") {
-		return skillNone, "", nil
-	}
-	arg := strings.TrimSpace(strings.TrimPrefix(input, "/skill"))
-	if arg == "" {
-		m.openSkillPicker()
-		return skillPickerOpen, "", nil
-	}
-	name, task, _ := strings.Cut(arg, " ")
-	name, task = strings.TrimSpace(name), strings.TrimSpace(task)
-	skills := m.currentSkills()
-	matches := skill.Resolve(name, skills)
-	switch {
-	case len(matches) == 1:
-		return skillSend, skill.Expand(matches[0], task), nil
-	case len(matches) == 0 && len(skills) == 0:
-		return skillShow, "", []string{"没有找到任何 skill（全局 skills 目录或 <cwd>/.agents/skills）"}
-	case len(matches) == 0:
-		out := append([]string{fmt.Sprintf("没有匹配 %q 的 skill，可用：", name)}, skillNameLines(skills)...)
-		return skillShow, "", out
-	default:
-		out := append([]string{fmt.Sprintf("%q 匹配到 %d 个 skill，请用全名：", name, len(matches))}, skillNameLines(matches)...)
-		return skillShow, "", out
-	}
-}
-
-// skillNameLines 候选名单行（两空格缩进），用于无命中/歧义的输出行。
-func skillNameLines(skills []skill.Skill) []string {
-	out := make([]string, 0, len(skills))
-	for _, s := range skills {
-		out = append(out, "  "+s.Name)
-	}
-	return out
-}
-
-// openSkillPicker 打开 skill 选择器：列表展示名称 + 描述，Enter 回填
-// 输入框（与模型选择器的差异：回填而非提交——skill 主用法是正文 + 任务
-// 拼接）。
-func (m *Model) openSkillPicker() {
-	m.popup = popupSkillPicker
-	m.pickerSel = 0
-	m.pickerOffset = 0
-	m.inputBeforePopup = m.input.String()
-	m.input.Clear()
-}
-
-func (m Model) currentSkills() []skill.Skill {
-	if m.deps.Skills == nil {
-		return nil
-	}
-	return m.deps.Skills()
-}
-
-func (m Model) filteredSkills() []skill.Skill {
-	return skill.Filter(m.currentSkills(), m.input.String())
-}
-
-// handleSlash 处理不需要 agent 参与的 TUI 专属斜杠命令，返回 (输出行, 已处理)。
-// /attach 是典型例子：它操作 TUI 的 pendingImages，无需请求模型。
-// （/skill 亦为 TUI 专属，但在命令分发改路之前拦截展开，见 slashSkill。）
-func (m *Model) handleSlash(input string) ([]string, bool) {
-	fields := strings.Fields(input)
-	if len(fields) == 0 {
-		return nil, false
-	}
-	switch fields[0] {
-	case "/attach":
-		return m.slashAttach(fields), true
-	}
-	return nil, false
-}
-
-// slashAttach 处理 /attach 命令：
-// - /attach <path...>  注册图片路径（校验扩展名 + 文件存在）
-// - /attach（无参数）  列出当前 pending 图片
-// - /attach -clear     清空 pending 图片
-func (m *Model) slashAttach(fields []string) []string {
-	if len(fields) == 1 {
-		return m.listPendingImages()
-	}
-	switch fields[1] {
-	case "-clear":
-		m.pendingImages = nil
-		return []string{"已清空所有待发送图片"}
-	default:
-		var ok, bad int
-		for _, p := range fields[1:] {
-			ext := strings.ToLower(filepath.Ext(p))
-			if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".gif" && ext != ".webp" {
-				bad++
-				continue
-			}
-			if _, err := os.Stat(p); err != nil {
-				bad++
-				continue
-			}
-			m.pendingImages = append(m.pendingImages, p)
-			ok++
-		}
-		lines := []string{}
-		if ok > 0 {
-			lines = append(lines, fmt.Sprintf("已添加 %d 张图片", ok))
-		}
-		if bad > 0 {
-			lines = append(lines, fmt.Sprintf("%d 个路径无效（扩展名不支持或文件不存在）", bad))
-		}
-		return lines
-	}
-}
-
-func (m *Model) listPendingImages() []string {
-	if len(m.pendingImages) == 0 {
-		return []string{"暂无待发送图片"}
-	}
-	lines := []string{"待发送图片："}
-	for _, p := range m.pendingImages {
-		if info, err := os.Stat(p); err == nil {
-			lines = append(lines, fmt.Sprintf("  %s（%s）", filepath.Base(p), humanBytes(info.Size())))
-		} else {
-			lines = append(lines, "  "+filepath.Base(p))
-		}
-	}
-	return lines
-}
-
-func humanBytes(n int64) string {
-	switch {
-	case n < 1024:
-		return fmt.Sprintf("%d B", n)
-	case n < 1024*1024:
-		return fmt.Sprintf("%.1f KB", float64(n)/1024)
-	default:
-		return fmt.Sprintf("%.1f MB", float64(n)/1024/1024)
-	}
-}
-
-func (m Model) filteredModels() []string {
-	if m.deps.Models == nil {
-		return nil
-	}
-	filter := m.input.String()
-	var out []string
-	for _, name := range m.deps.Models() {
-		if skill.Match(name, filter) {
-			out = append(out, name)
-		}
-	}
-	return out
-}
 
 type editorDoneMsg struct {
 	path string
@@ -516,7 +251,7 @@ func (m Model) openEditor() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	path := filepath.Join(os.TempDir(), fmt.Sprintf("sammal-%d.md", time.Now().UnixMilli()))
-	if err := os.WriteFile(path, []byte(m.input.String()), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(m.editor.Text()), 0o644); err != nil {
 		return m, m.printScroll(errStyle("临时文件创建失败：" + err.Error()))
 	}
 	cmd, err := m.deps.EditorCmd(path)
@@ -542,18 +277,16 @@ func (m Model) editorDone(msg editorDoneMsg) (tea.Model, tea.Cmd) {
 	if content == "" {
 		return m, nil // 空内容视为放弃编辑
 	}
-	m.input.Clear()
-	m.input.Insert(content)
+	m.editor.Set(content)
 	return m, nil
 }
 
 func (m Model) loadHistory() {
 	if m.histDepth == 0 {
-		m.input.Clear()
+		m.editor.Clear()
 		return
 	}
-	m.input.Clear()
-	m.input.Insert(m.history[len(m.history)-m.histDepth])
+	m.editor.Set(m.history[len(m.history)-m.histDepth])
 }
 
 func (m *Model) rememberInput(text string) {
@@ -755,20 +488,6 @@ func (m Model) turnTick() (tea.Model, tea.Cmd) {
 // 一个可见信号（turn 开始后由跳动的计时数字接管）。
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-// warnContextPressure 投影逼近压缩触发线时提示一次（把「下一轮要压缩、
-// 会变慢且缓存重建」提前解释给用户）。TurnEnded 时判定，一轮只报一次。
-func (m Model) warnContextPressure() tea.Cmd {
-	if m.windowTokens <= 0 || m.usage == nil {
-		return nil
-	}
-	if r := float64(m.usage.PromptTokens) / float64(m.windowTokens); r >= compaction.TriggerRatio && !m.ctxWarned {
-		m.ctxWarned = true
-		return m.printScroll(dim(fmt.Sprintf("| 上下文已达窗口 %d%%（压缩触发线 %d%%）：下一轮可能自动压缩并重建 KV 缓存",
-			int(r*100), int(compaction.TriggerRatio*100))))
-	}
-	return nil
-}
-
 // lastLine 返回文本最后一个非空行（思考流式只展示最新一行）。
 func lastLine(s string) string {
 	s = strings.TrimRight(s, "\n")
@@ -784,9 +503,6 @@ const (
 	ansiRed    = "\x1b[31m"
 	ansiYellow = "\x1b[33m"
 	ansiReset  = "\x1b[0m"
-
-	// warnRatio ctx% 变黄预警线（压缩触发线 compaction.TriggerRatio 变红）。
-	warnRatio = 0.7
 )
 
 func dim(s string) string      { return ansiDim + s + ansiReset }
@@ -834,77 +550,29 @@ func (m Model) View() tea.View {
 	if m.busy {
 		prompt = "> "
 	}
-	display, cursorCol := m.input.Render(prompt, width)
-	lines = append(lines, display)
+	edLines, curLineIdx, cursorCol := m.editor.Render(prompt, width, m.editorMaxLines())
+	lines = append(lines, edLines...)
 
 	v := tea.NewView(strings.Join(lines, "\n"))
 	v.Cursor = &tea.Cursor{
-		Position: tea.Position{X: cursorCol, Y: len(lines) - 1},
+		Position: tea.Position{X: cursorCol, Y: len(lines) - len(edLines) + curLineIdx},
 		Shape:    tea.CursorBar,
 		Blink:    true,
 	}
 	return v
 }
 
-const pickerMaxShown = 8
-
-func pickerWindow[T any](items []T, offset int) []T {
-	start := min(offset, len(items))
-	if start < 0 {
-		start = 0
+// editorMaxLines 多行输入框最大可视行数：终端高的 1/4，下限 3。
+func (m Model) editorMaxLines() int {
+	h := m.height
+	if h <= 0 {
+		h = 24
 	}
-	end := min(start+pickerMaxShown, len(items))
-	return items[start:end]
-}
-
-// modelPickerLines 模型选择器列表（内嵌于可变区，自带模糊过滤，不依赖 fzf）。
-func (m Model) modelPickerLines(width int) []string {
-	lines := []string{dim(" 选择模型（输入过滤 | Enter 确认 | Esc 取消）")}
-	models := m.filteredModels()
-	shown := pickerWindow(models, m.pickerOffset)
-	for i, name := range shown {
-		mark := " "
-		if name == m.modelName {
-			mark = "*"
-		}
-		entry := " " + mark + " " + name
-		if i == m.pickerSel-m.pickerOffset {
-			entry = ansiCyan + "> " + strings.TrimLeft(entry, " *") + ansiReset
-		}
-		lines = append(lines, clipLine(entry, width))
+	n := h / 4
+	if n < 3 {
+		n = 3
 	}
-	if len(models) > pickerMaxShown {
-		lines = append(lines, dim(fmt.Sprintf("   ... 共 %d 个", len(models))))
-	}
-	if len(models) == 0 {
-		lines = append(lines, dim("   （无匹配模型）"))
-	}
-	return lines
-}
-
-// skillPickerLines skill 选择器列表：名称 + 一行描述帮助辨认（正文按需
-// 展开，列表是唯一的发现入口）。
-func (m Model) skillPickerLines(width int) []string {
-	lines := []string{dim(" 选择 skill（输入过滤 | Enter 回填 | Esc 取消）")}
-	skills := m.filteredSkills()
-	shown := pickerWindow(skills, m.pickerOffset)
-	for i, s := range shown {
-		entry := "   " + s.Name
-		if s.Description != "" {
-			entry += "  " + s.Description
-		}
-		if i == m.pickerSel-m.pickerOffset {
-			entry = ansiCyan + "> " + strings.TrimLeft(entry, " ") + ansiReset
-		}
-		lines = append(lines, clipLine(entry, width))
-	}
-	if len(skills) > pickerMaxShown {
-		lines = append(lines, dim(fmt.Sprintf("   ... 共 %d 个", len(skills))))
-	}
-	if len(skills) == 0 {
-		lines = append(lines, dim("   （无匹配 skill）"))
-	}
-	return lines
+	return n
 }
 
 // streamBlockLines 当前流式块的尾部若干行（原地整块重绘是显式策略）。
@@ -950,104 +618,6 @@ func (m Model) streamBlockLines(width int) []string {
 		lines = append(lines, clipLine(ln, width))
 	}
 	return lines
-}
-
-// statusSeg 是状态栏的一个显示段。
-type statusSeg struct {
-	text string // 已着色的最终文本
-	pri  int    // 丢弃优先级：越大越先丢；负值 = 永不丢（模型名、生成中标记）
-}
-
-// statusLine 状态栏。空间不足时按丢弃优先级从高到低：工具数(5) → cache(3)
-// → in/out(2) → 计时器(2) → ctx(1)；同优先级丢更靠左的（见 dropToFit），
-// 故 in/out 先于计时器。模型名与生成中标记永不丢。计时器原为 4，在极窄
-// 终端仅晚于工具数被丢；降到 2 后让位给 cache/in/out，但仍保 ctx——ctx
-// 决定下一轮是否压缩，是决策信息，计时器是安慰信息，二者冲突时先丢计时器。
-func (m Model) statusLine() string {
-	segs := []statusSeg{{text: m.modelName}}
-	if m.usage != nil {
-		segs = append(segs,
-			statusSeg{text: fmt.Sprintf("in %d out %d", m.usage.PromptTokens, m.usage.CompletionTokens), pri: 2},
-			statusSeg{text: m.cachePart(), pri: 3},
-			statusSeg{text: m.ctxPart(), pri: 1},
-		)
-	}
-	if m.busy && m.toolCalls > 0 {
-		segs = append(segs, statusSeg{text: fmt.Sprintf("工具 %d", m.toolCalls), pri: 5})
-	}
-	if m.busy && m.turnStart.After(time.Time{}) {
-		segs = append(segs, statusSeg{text: "* " + human.Duration(time.Since(m.turnStart)), pri: 2})
-	} else if m.busy {
-		// 等待期（已提交、TurnStarted 未到）：spinner 帧随心跳推进，
-		// 避免「生成中」长时间静止而被误读为卡死。负优先级 = 永不丢。
-		segs = append(segs, statusSeg{text: "* 生成中 " + spinnerFrames[m.tickN%len(spinnerFrames)], pri: -1})
-	}
-
-	width := m.width
-	if width < 20 {
-		width = 20
-	}
-	const separator = " | "
-	segs = dropToFit(segs, width-3) // 行首空格 + 安全边距
-	return dim(" " + strings.Join(segTexts(segs), separator))
-}
-
-// dropToFit 超预算时按优先级从右往左逐段丢弃（负优先级段不可丢），
-// 直到塞下或只剩不可丢段——宁可溢出不丢语义。
-func dropToFit(segs []statusSeg, budget int) []statusSeg {
-	const separator = " | "
-	for widthOf(strings.Join(segTexts(segs), separator)) > budget && len(segs) > 1 {
-		drop := -1
-		for i := len(segs) - 1; i >= 1; i-- { // segs[0] 模型名永不丢；并列时丢更靠左的（右往左扫 + >=）
-			if segs[i].pri < 0 {
-				continue // 负优先级段不可丢弃
-			}
-			if drop == -1 || segs[i].pri >= segs[drop].pri {
-				drop = i
-			}
-		}
-		if drop == -1 {
-			break
-		}
-		segs = append(segs[:drop], segs[drop+1:]...)
-	}
-	return segs
-}
-
-func segTexts(segs []statusSeg) []string {
-	out := make([]string, len(segs))
-	for i, s := range segs {
-		out[i] = s.text
-	}
-	return out
-}
-
-// cachePart 缓存命中率段（无数据返回空串）。
-func (m Model) cachePart() string {
-	if r := m.usage.CacheHitRatio(); r >= 0 {
-		return fmt.Sprintf("cache %d%%", int(r*100))
-	}
-	return ""
-}
-
-// ctxPart 上下文窗口占用百分比；逼近压缩触发线时变色预警。
-// 无 usage 或未知窗口时返回空串（调用方过滤）。
-// 变色段自带完整包裹（color+reset），嵌入外层 dim 文本时会终止 dim——
-// 有意为之：预警色必须盖过 dim。
-func (m Model) ctxPart() string {
-	if m.windowTokens <= 0 || m.usage == nil || m.usage.PromptTokens <= 0 {
-		return ""
-	}
-	r := float64(m.usage.PromptTokens) / float64(m.windowTokens)
-	pct := fmt.Sprintf("ctx %d%%", int(r*100))
-	switch {
-	case r >= compaction.TriggerRatio:
-		return ansiRed + pct + ansiReset
-	case r >= warnRatio:
-		return ansiYellow + pct + ansiReset
-	default:
-		return pct
-	}
 }
 
 // clipLine 超宽行截断到 width（按显示宽度，避免宽字符截半）。

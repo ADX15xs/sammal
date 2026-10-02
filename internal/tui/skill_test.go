@@ -35,7 +35,7 @@ func pressEnter(m Model) Model {
 func TestSlashSkillSendsExpanded(t *testing.T) {
 	var sent []string
 	m := New(skillTestDeps(&sent))
-	m.input.Insert("/skill alpha 重构这个函数")
+	m.editor.Insert("/skill alpha 重构这个函数")
 	m = pressEnter(m)
 
 	if len(sent) != 1 {
@@ -57,7 +57,7 @@ func TestSlashSkillSendsExpanded(t *testing.T) {
 func TestSlashSkillSendsBodyOnly(t *testing.T) {
 	var sent []string
 	m := New(skillTestDeps(&sent))
-	m.input.Insert("/skill beta")
+	m.editor.Insert("/skill beta")
 	m = pressEnter(m)
 	if len(sent) != 1 || sent[0] != "<skill name=\"beta\">\nbeta 正文\n</skill>" {
 		t.Errorf("sent = %v", sent)
@@ -69,7 +69,7 @@ func TestSlashSkillSendsBodyOnly(t *testing.T) {
 func TestSlashSkillAmbiguous(t *testing.T) {
 	var sent []string
 	m := New(skillTestDeps(&sent))
-	m.input.Insert("/skill alph extra")
+	m.editor.Insert("/skill alph extra")
 	m = pressEnter(m)
 
 	if len(sent) != 0 {
@@ -103,7 +103,7 @@ func TestSlashSkillNoMatch(t *testing.T) {
 func TestSlashSkillOpensPicker(t *testing.T) {
 	var sent []string
 	m := New(skillTestDeps(&sent))
-	m.input.Insert("/skill")
+	m.editor.Insert("/skill")
 	m = pressEnter(m)
 
 	if m.popup != popupSkillPicker {
@@ -123,7 +123,7 @@ func TestSkillPickerEnterFillsInput(t *testing.T) {
 	m := New(skillTestDeps(&sent))
 	m.popup = popupSkillPicker
 	m.inputBeforePopup = ""
-	m.input.Insert("alp") // 模糊过滤同时命中 alpha 与 alpha-two
+	m.editor.Insert("alp") // 模糊过滤同时命中 alpha 与 alpha-two
 
 	out, _ := m.handlePopupKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = out.(Model)
@@ -165,7 +165,7 @@ func TestSlashSkillPassThrough(t *testing.T) {
 		t.Errorf("/model 应透传，cmd = %v", cmd)
 	}
 
-	m.input.Insert("/help")
+	m.editor.Insert("/help")
 	m = pressEnter(m)
 	if len(slashCalls) != 1 || slashCalls[0] != "/help" {
 		t.Errorf("slash 调用 = %v", slashCalls)

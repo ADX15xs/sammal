@@ -78,7 +78,7 @@ func TestEditorDoneReadsFile(t *testing.T) {
 	// 空内容视为放弃编辑。
 	path = writeTemp(t, "\n")
 	m2 := New(Deps{ModelName: "x"})
-	m2.input.Insert("原有输入")
+	m2.editor.Insert("原有输入")
 	out, _ = m2.editorDone(editorDoneMsg{path: path})
 	if got := out.(Model).InputText(); got != "原有输入" {
 		t.Errorf("放弃编辑后输入 = %q", got)
