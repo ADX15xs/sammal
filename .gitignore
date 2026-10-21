@@ -1,4 +1,7 @@
-.zcode/
 dist/
 /sammal*
+
+# 本地 AI 助手过程产物
+.kilo/
+.zcode/
 .workbuddy/
