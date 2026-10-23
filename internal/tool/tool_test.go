@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testRegistry(t *testing.T) (*Registry, string) {
@@ -147,21 +148,45 @@ func TestBashEchoAndExitCode(t *testing.T) {
 
 func TestBashTimeout(t *testing.T) {
 	r, _ := testRegistry(t)
-	shell := "bash"
-	if _, err := exec.LookPath("bash"); err != nil {
-		shell = "powershell"
-	}
+	shell := shellForTest(t)
+	start := time.Now()
 	var res Result
 	if shell == "bash" {
 		res = runTool(t, r, "bash", `{"command":"echo started; sleep 30","timeout_seconds":1}`)
 	} else {
 		res = runTool(t, r, "bash", `{"command":"Write-Output started; Start-Sleep 30","timeout_seconds":1}`)
 	}
+	// 耗时上界锁回归：孤儿进程持有输出管道时此处曾阻塞 30s，
+	// WaitDelay 修复后应 ~2s 返回。
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("超时杀进程后应立即返回: %v", d)
+	}
 	if res.Err == "" || !strings.Contains(res.Err, "timed out") {
 		t.Errorf("超时应报错: %+v", res)
 	}
 	if !strings.Contains(res.Output, "started") {
 		t.Errorf("应保留部分输出: %q", res.Output)
+	}
+}
+
+func TestBashBackgroundProcess(t *testing.T) {
+	if shellForTest(t) != "bash" {
+		t.Skip("后台任务用例仅锁 bash 语义")
+	}
+	r, _ := testRegistry(t)
+	start := time.Now()
+	res := runTool(t, r, "bash", `{"command":"echo started; sleep 30 &","timeout_seconds":5}`)
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("shell 退出后不应被后台进程拖住: %v", d)
+	}
+	if res.Err != "" {
+		t.Errorf("后台任务不构成错误（shell 正常退出）: %+v", res)
+	}
+	if code, ok := res.Extra["exitCode"].(int); !ok || code != 0 {
+		t.Errorf("exitCode = %v", res.Extra["exitCode"])
+	}
+	if !strings.Contains(res.Output, "started") {
+		t.Errorf("output = %q", res.Output)
 	}
 }
 

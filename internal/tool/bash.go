@@ -21,6 +21,7 @@ const (
 	bashDefaultTimeoutSec = 120
 	bashMaxTimeoutSec     = 600
 	bashOutputCap         = 200 * 1024
+	bashWaitDelay         = time.Second
 )
 
 func (t *BashTool) Name() string   { return "bash" }
@@ -78,6 +79,10 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, e
 		return Result{Err: fmt.Sprintf("unknown shell %q", t.Shell)}, nil
 	}
 	cmd.Dir = t.WorkDir
+	// shell 被超时杀死或先于后台任务退出时，持有输出管道的后代进程会让
+	// cmd.Run 一直阻塞到管道关闭（实测 sleep 30 配 1s 超时阻塞 30s）：
+	// WaitDelay 强制进程退出后 1s 关管道立即返回，孤儿进程留在后台。
+	cmd.WaitDelay = bashWaitDelay
 
 	var stdout, stderr limitBuffer
 	cmd.Stdout = &stdout
@@ -86,14 +91,14 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, e
 	runErr := cmd.Run()
 	duration := time.Since(start)
 
-	exitCode := 0
 	timedOut := tctx.Err() == context.DeadlineExceeded
-	if runErr != nil {
-		if ee, ok := runErr.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else {
-			exitCode = -1
-		}
+	// ErrWaitDelay（管道被 WaitDelay 强关）仅在 shell 自身正常退出时返回，
+	// ProcessState 携带真实退出码——按退出码判定，而非把 runErr 一律记 -1。
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	} else if runErr != nil {
+		exitCode = -1
 	}
 
 	extra := map[string]any{

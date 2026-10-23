@@ -14,7 +14,6 @@
 | internal/provider/chunk.go | 限流信号识别面收敛：头部只认标准 Retry-After（整数秒/HTTP-date）与常见 x-ratelimit-reset（unix 秒/RFC3339），其余变体格式（如 Go duration 串 "6m30s"、各家自定义头）退化为盲指数退避；配额窗口判档依赖响应体英文特征串，非英文报错可能漏判成普通限流 | 遇到实际端点时按其格式扩展 parseRetryAfter / quotaMarkers | 按需（首个未识别格式实际影响重试效果时） |
 | internal/agent/agent.go runSteps | turn 内无 step 数软上限，压缩只在 turn 开始触发：模型失控循环调用工具时会一直烧到上下文溢出才停（大窗口端点损失放大） | 先加软阈值 StatusEvent 提醒；实测出现失控再加溢出后 turn 内压缩重试或硬上限 | 按需（首个实际失控出现时） |
 | internal/agent/agent.go captureBeforeWrite | 快照捕获按 `{path}` 参数启发式识别写类工具：未来新增参数不含 path 的写工具会被静默漏快照（/rewind 盲区扩大且无告警） | Tool 接口加显式声明（如 SnapshotTargets 方法）替代启发式解析 | 首个非 path 参数的写工具进入注册表时 |
-| internal/tool/tool_test.go | bash/grep 测试用真实 sleep 脚本化并发行为，整包 ~32s：拖慢开发反馈环，不影响正确性 | 用 channel 同步或轮询断言替代定时 sleep | 下次大改 tool 包时顺手 |
 | internal/session/assets.go | 图片字节存会话目录 assets/（内容寻址）而非日志本身：资产文件被外部删除、或旧格式日志（Images 存绝对路径）时该图跳过、对应请求重放哈希不一致（既定降级语义，TestReplayRequestHashesWithImages 锁定）。设计保证：图片不进投影 → 跨轮切换模型不受多模态限制；turn 内端点由 switchModel 运行中守卫恒定 | 无可还——字节不在即不可还原，属物理边界而非设计缺口 | 无（边界说明） |
 | internal/skill/skill.go | SKILL.md frontmatter 解析为逐行 key: value：不支持 YAML 块标量/多行值/引号转义，多行 description 会被静默忽略（正文完整保留） | 遇到首个解析不符合预期的真实 skill 格式时扩展 parse | 按需（首个解析不符预期的真实 skill 出现时） |
 | internal/agent/agent.go Submit | `go a.Run` 与 goroutine 内 `setRunning` 之间有微秒级窗口，`Running()` 尚为 false 时 switchModel/idleGuard 命令理论上可插入（对 /new 等命令同样存在的既有竞态，与图片无关）；TUI 人手操作（≥ 数百毫秒）实际不可达 | 把运行标记提前到 Submit 同步段（pending 状态位），或 Run 启动前二次校验 | 按需（出现程序化紧邻调用 Submit+Slash 的用法时） |
