@@ -85,7 +85,7 @@ core 与 tui 分离不是为了未来扩展，而是三个当下必然：事件�
 
 ```bash
 git clone <repo> && cd sammal
-go build -o sammal ./cmd/sammal      # 或 goreleaser release --snapshot --clean（低内存机器加 --parallelism 1）
+go build ./cmd/sammal                # Windows 得 sammal.exe，Linux/macOS 得 sammal；或 goreleaser release --snapshot --clean（低内存机器加 --parallelism 1）
 ```
 
 ### 配置
