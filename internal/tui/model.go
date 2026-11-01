@@ -180,6 +180,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// spinner 帧必须动起来，不能等事件回环才起步。
 		return m, tea.Batch(m.printScroll(prompt), m.armTick())
 	}
+	var repaint tea.Cmd
 	switch {
 	case msg.Code == tea.KeyEscape:
 		if m.busy {
@@ -232,10 +233,15 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	default:
 		if s := msg.Text; s != "" {
 			m.editor.Insert(s)
+			// WT 组合态期间终端自行改写行单元，哈希渲染器的行状态模型与
+			// 终端现实失步且不自愈（仅中英混排可感知，缓冲层恒正确）。
+			// 文本键后强制整屏重绘对齐——探针 c 变体实机验证有效
+			// （DEBT handleKey 行、SMOKE T10 变体矩阵）。
+			repaint = tea.ClearScreen
 		}
 	}
 	m.quitArmed = false
-	return m, nil
+	return m, repaint
 }
 
 type quitArmExpiredMsg struct{}
