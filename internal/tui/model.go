@@ -49,6 +49,7 @@ type Model struct {
 	busy          bool
 	stream        *strings.Builder // 当前流式块未落盘尾部（闭合行 + 半行，可变区）
 	streamPrinted bool             // 本条消息已有内容落进滚动缓冲区（重试作废标记的依据）
+	interject     []string         // 生成中待随流落盘的插话/工具行（dim 行，不单独 insertAbove）
 	scrollQ       *printQueue      // 滚动区落盘批次的全局 FIFO（scroll.go，T9 保序）
 	frameHold     *frameHoldState  // 帧高冻结态（队列未排空时禁止帧行数变化，T9 根因对策）
 	thinking      bool
@@ -181,13 +182,16 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.busy = true
 		m.stream.Reset()
 		m.deps.Send(text, imgs)
-		prompt := renderUserEcho(echo)
+		// 插话回显随流式块落盘（不单独 insertAbove——舞蹈间的位移错位是
+		// T9 根因）：先在尾部窗口显示，随下一次 flush 进滚动区。
+		m.interject = append(m.interject, renderUserEcho(echo))
 		if len(imgs) > 0 {
-			prompt += "\n" + dim(fmt.Sprintf("  📎 %s", imagesSummary(imgs)))
+			m.interject = append(m.interject, dim(fmt.Sprintf("  📎 %s", imagesSummary(imgs))))
 		}
 		// 提交即挂心跳：TurnStarted 回来之前是用户最紧张的等待期，
 		// spinner 帧必须动起来，不能等事件回环才起步。
-		return m, tea.Batch(m.printScroll(prompt), m.armTick())
+		flush, _ := m.flushPendingStream(false)
+		return m, tea.Batch(flush, m.armTick())
 	}
 	var repaint tea.Cmd
 	switch {
@@ -331,19 +335,18 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 			m.resetReason()
 		}
 		m.stream.WriteString(ev.Text)
-		// 渐进落盘：闭合行超过触发线即把头部行落进滚动缓冲区，帧内只留
-		// 尾部窗口。整条回复攒到定稿一次性落盘会在长回答上击穿 insertAbove
-		// 的视口不变式（scroll.go 顶部注释），流式期间滚动缓冲也不可搜索。
-		if s := m.stream.String(); strings.Count(s, "\n") > streamFlushLines {
-			i := strings.LastIndexByte(s, '\n')
-			m.stream.Reset()
-			m.stream.WriteString(s[i+1:])
-			// 头部止于最后一个换行符（不含）：行终止符由落盘通道自补，
-			// 带上它会在批尾多出一个空行。批次入队即置 streamPrinted——
-			// 排空在飞时 printScroll 返回 nil 但内容已在队列里，重连作废
-			// 标记的判定依据是「是否入队」而非「是否开了新链」。
-			cmd = m.printScroll(s[:i])
-			m.streamPrinted = true
+		// 渐进落盘：闭合行超过触发线（或有待发插话/工具行）即把头部行落进
+		// 滚动缓冲区，帧内只留尾部窗口。整条回复攒到定稿一次性落盘会在长
+		// 回答上击穿 insertAbove 的视口不变式（scroll.go 顶部注释），流式
+		// 期间滚动缓冲也不可搜索。批次入队即置 streamPrinted——排空在飞时
+		// printScroll 返回 nil 但内容已在队列里，重连作废标记的判定依据是
+		// 「是否入队」而非「是否开了新链」。
+		if s := m.stream.String(); strings.Count(s, "\n") > streamFlushLines || len(m.interject) > 0 {
+			var flushed bool
+			cmd, flushed = m.flushPendingStream(false)
+			if flushed {
+				m.streamPrinted = true
+			}
 		}
 
 	case agent.ReasonDeltaEvent:
@@ -368,10 +371,14 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 
 	case agent.ToolCallEvent:
 		m.toolCalls++
-		cmd = m.printScroll(dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
+		// 工具行随流式块落盘（不单独 insertAbove）：工具调用 = 消息边界，
+		// 未闭合的模型文本语义完整，一并落盘。
+		m.interject = append(m.interject, dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
+		cmd, _ = m.flushPendingStream(true)
 
 	case agent.ToolResultEvent:
-		cmd = m.printScroll(dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
+		m.interject = append(m.interject, dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
+		cmd, _ = m.flushPendingStream(true)
 
 	case agent.MessageFinalEvent:
 		m.thinking = false
@@ -631,7 +638,7 @@ func (m Model) streamBlockLines(width int) []string {
 		}
 	}
 	text := m.stream.String()
-	if text == "" {
+	if text == "" && len(m.interject) == 0 {
 		return lines
 	}
 	all := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
@@ -648,7 +655,47 @@ func (m Model) streamBlockLines(width int) []string {
 	for _, ln := range tail {
 		lines = append(lines, clipLine(ln, width))
 	}
+	// 待发插话/工具行随块渲染（在尾部文本之后——它们晚于这些文本到达），
+	// 随下一次 flush 进滚动区；不单独 insertAbove（T9 根因）。
+	lines = append(lines, m.interject...)
 	return lines
+}
+
+// flushPendingStream 把流式内容与待发插话/工具行按时间序并入落盘队列。
+// closePartial=true 时未闭合行一并落盘（工具调用 = 消息边界，语义完整）；
+// 否则未闭合行留在尾部窗口继续生长。插话/工具行不再单独 insertAbove——
+// 舞蹈间的位移从不被渲染器模型记账，背靠背舞蹈互相错位（T9 根因）。
+func (m *Model) flushPendingStream(closePartial bool) (tea.Cmd, bool) {
+	s := m.stream.String()
+	var texts []string
+	flushed := false
+	if s != "" {
+		i := strings.LastIndexByte(s, '\n')
+		switch {
+		case i >= 0:
+			texts = append(texts, s[:i])
+			if closePartial && i+1 < len(s) {
+				texts = append(texts, s[i+1:])
+			}
+			m.stream.Reset()
+			if !closePartial {
+				m.stream.WriteString(s[i+1:])
+			}
+			flushed = true
+		case closePartial:
+			texts = append(texts, s)
+			m.stream.Reset()
+			flushed = true
+		}
+	}
+	if len(m.interject) > 0 {
+		texts = append(texts, strings.Join(m.interject, "\n"))
+		m.interject = nil
+	}
+	if len(texts) == 0 {
+		return nil, flushed
+	}
+	return m.printScroll(texts...), flushed
 }
 
 // clipLine 超宽行截断到 width（按显示宽度，避免宽字符截半）。
