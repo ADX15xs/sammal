@@ -49,6 +49,7 @@ type Model struct {
 	busy          bool
 	stream        *strings.Builder // 当前流式块未落盘尾部（闭合行 + 半行，可变区）
 	streamPrinted bool             // 本条消息已有内容落进滚动缓冲区（重试作废标记的依据）
+	scrollQ       *printQueue      // 滚动区落盘批次的全局 FIFO（scroll.go，T9 保序）
 	thinking      bool
 	reason        strings.Builder // 思考累积文本（定稿即弃，只取最新行渲染）
 	reasonCur     string          // 当前未闭合行的缓存（增量里无换行时也要能显示）
@@ -75,7 +76,7 @@ type Model struct {
 }
 
 func New(deps Deps) Model {
-	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}, windowTokens: deps.ContextWindow, editor: NewEditor()}
+	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}, windowTokens: deps.ContextWindow, editor: NewEditor(), scrollQ: &printQueue{}}
 }
 
 // InputText 返回当前输入内容（测试用）。
@@ -122,6 +123,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case turnTickMsg:
 		return m.turnTick()
+
+	case drainNextMsg:
+		return m.drainNext()
 
 	case editorDoneMsg:
 		return m.editorDone(msg)
@@ -330,11 +334,11 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 			m.stream.Reset()
 			m.stream.WriteString(s[i+1:])
 			// 头部止于最后一个换行符（不含）：行终止符由落盘通道自补，
-			// 带上它会在批尾多出一个空行。
-			if c := m.printScroll(s[:i]); c != nil {
-				m.streamPrinted = true
-				cmd = c
-			}
+			// 带上它会在批尾多出一个空行。批次入队即置 streamPrinted——
+			// 排空在飞时 printScroll 返回 nil 但内容已在队列里，重连作废
+			// 标记的判定依据是「是否入队」而非「是否开了新链」。
+			cmd = m.printScroll(s[:i])
+			m.streamPrinted = true
 		}
 
 	case agent.ReasonDeltaEvent:
@@ -379,7 +383,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.streamPrinted = false
 		switch {
 		case ev.Interrupted && rest != "":
-			cmd = tea.Sequence(m.printScroll(rest), m.printScroll(dim("（以上内容被中断）")))
+			cmd = m.printScroll(rest, dim("（以上内容被中断）"))
 		case ev.Interrupted && wasPrinted:
 			cmd = m.printScroll(dim("（以上内容被中断）"))
 		case ev.Interrupted:
@@ -392,30 +396,29 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.busy = false
 		m.thinking = false
 		m.resetReason()
-		// 回合耗时落款：只给正常完成的回合——中止/出错的时长无意义，
-		// 错误详情已含原因。须在 turnStart 清零前取值；TurnEnded 每轮
-		// 只来一次、必晚于最后一个回答定稿，标记因此天然落在回答末尾，
-		// 时长覆盖工具环全程。
-		var stamp tea.Cmd
-		if ev.StopReason == agent.StopCompleted && m.turnStart.After(time.Time{}) {
-			stamp = m.printScroll(dim(fmt.Sprintf("（耗时 %s · %s 完成）",
-				human.Duration(time.Since(m.turnStart)), time.Now().Format("15:04"))))
-		}
-		m.turnStart = time.Time{}
+		// 回合收尾落盘（变参一次入队、原子保序：告警先于耗时落款）：中止
+		// 打「已中止」；正常完成打耗时落款——须在 turnStart 清零前取值，
+		// TurnEnded 每轮只来一次、必晚于最后一个回答定稿，标记因此天然落
+		// 在回答末尾，时长覆盖工具环全程；中止/出错不打耗时（时长无意义，
+		// 错误详情已含原因）。usage 先行入账，ctx 告警按当轮真实占比判定。
 		if ev.Usage != nil {
 			m.usage = ev.Usage
 		}
-		var warn tea.Cmd
+		var texts []string
 		if ev.StopReason != agent.StopAborted {
-			warn = m.warnContextPressure()
+			if w := m.contextPressureText(); w != "" {
+				texts = append(texts, w)
+			}
+			if ev.StopReason == agent.StopCompleted && m.turnStart.After(time.Time{}) {
+				texts = append(texts, dim(fmt.Sprintf("（耗时 %s · %s 完成）",
+					human.Duration(time.Since(m.turnStart)), time.Now().Format("15:04"))))
+			}
+		} else {
+			texts = append(texts, dim("（已中止）"))
 		}
-		if ev.StopReason == agent.StopAborted {
-			cmd = m.printScroll(dim("（已中止）"))
-		}
-		// tea.Batch 无顺序保证（bubbletea 文档明示），多个 Println 会竞速；
-		// 耗时落款须排在上下文告警之后，故打印段走 Sequence。listenAgent
-		// 是长命命令，只能并发挂在 Batch 上。
-		cmd = tea.Batch(listenAgent(m.deps.Events), tea.Sequence(cmd, warn, stamp))
+		m.turnStart = time.Time{}
+		// listenAgent 是长命命令，只能并发挂在 Batch 上；打印段走排空链。
+		cmd = tea.Batch(listenAgent(m.deps.Events), m.printScroll(texts...))
 		return m, cmd
 
 	case agent.StatusEvent:

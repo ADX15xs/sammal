@@ -239,21 +239,61 @@ func (m Model) printMargin() int {
 	return 1
 }
 
-// printScroll 文本安全落盘：按预算分批，单批一次 Println，多批经
-// tea.Sequence 保序（Batch 无顺序保证）。
-func (m Model) printScroll(text string) tea.Cmd {
-	batches := splitForPrint(text, m.width, m.printMargin())
-	if len(batches) == 0 {
+// printQueue 落盘批次的全局 FIFO。病灶（T9 四次复现）：各调用点的
+// tea.Sequence 跑在各自的 goroutine 上，向 p.msgs 信道的发送彼此竞争——
+// 插话回显批与流式批的 printLineMessage 交错到达，insertAbove 位置失步
+// 吃行。信道总序 = 发送序，故让全部批次经单一在飞 Sequence 按入队序发出
+// 即全局保序。队列的进队/出队/状态翻转全部发生在事件循环（Update 串行
+// 段）与链尾消息回环里，无锁。
+type printQueue struct {
+	pending  []string
+	draining bool
+}
+
+// drainNextMsg 排空链的链尾：一段 Sequence 的批次消息全部发出后回环到
+// Update，由 drainNext 接续余批或收尾。
+type drainNextMsg struct{}
+
+// printScroll 文本安全落盘：每段文本按预算独立分批，批次按变参顺序入全局
+// 队列；仅当无在飞排空链时开启新的排空（tea.Sequence 串行发出 + 链尾
+// drainNextMsg 接续），否则只入队返回 nil——跨调用批次全局保序，不产生
+// 并行发送方。多段变参用于把语义成对的落盘（剩余 + 中断标记）原子入队。
+func (m Model) printScroll(texts ...string) tea.Cmd {
+	any := false
+	for _, text := range texts {
+		batches := splitForPrint(text, m.width, m.printMargin())
+		if len(batches) > 0 {
+			m.scrollQ.pending = append(m.scrollQ.pending, batches...)
+			any = true
+		}
+	}
+	if !any || m.scrollQ.draining {
 		return nil
 	}
-	if len(batches) == 1 {
-		return tea.Println(batches[0])
+	m.scrollQ.draining = true
+	return m.drainScrollCmd()
+}
+
+// drainScrollCmd 取走当前全部余批串成一条 Sequence，批尾挂链尾消息。
+func (m Model) drainScrollCmd() tea.Cmd {
+	batches := m.scrollQ.pending
+	m.scrollQ.pending = nil
+	cmds := make([]tea.Cmd, 0, len(batches)+1)
+	for _, b := range batches {
+		cmds = append(cmds, tea.Println(b))
 	}
-	cmds := make([]tea.Cmd, len(batches))
-	for i, b := range batches {
-		cmds[i] = tea.Println(b)
-	}
+	cmds = append(cmds, func() tea.Msg { return drainNextMsg{} })
 	return tea.Sequence(cmds...)
+}
+
+// drainNext 排空链接续：还有余批就续发下一段 Sequence；队列空则收尾，
+// 之后的 printScroll 会重新开启排空。
+func (m Model) drainNext() (tea.Model, tea.Cmd) {
+	if len(m.scrollQ.pending) > 0 {
+		return m, m.drainScrollCmd()
+	}
+	m.scrollQ.draining = false
+	return m, nil
 }
 
 // printLines 斜杠命令等小段输出的落盘出口，与流式文本同一条安全通道。

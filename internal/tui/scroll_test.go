@@ -267,6 +267,17 @@ func TestStreamProgressiveFlush(t *testing.T) {
 	}
 }
 
+// pumpDrain 驱动排空链尾直到队列排空，按序收集沿途落盘消息体（测试接缝：
+// 排空在飞时 printScroll 只入队，余批经链尾回环陆续发出）。
+func pumpDrain(m Model, prints []string) (Model, []string) {
+	for m.scrollQ.draining {
+		next, cmd := m.Update(drainNextMsg{})
+		m = next.(Model)
+		prints = append(prints, printedLines(cmd)...)
+	}
+	return m, prints
+}
+
 // 定稿补余：流式块剩余（含未闭合行）落盘后清空、标记复位；
 // 渐进前缀 + 补余 == 全文。
 func TestFinalizeFlushesRemainder(t *testing.T) {
@@ -280,6 +291,7 @@ func TestFinalizeFlushesRemainder(t *testing.T) {
 	prints = append(prints, printedLines(cmd)...)
 	m, cmd = ev(t, m, agent.MessageFinalEvent{Text: full})
 	prints = append(prints, printedLines(cmd)...)
+	m, prints = pumpDrain(m, prints)
 
 	var got strings.Builder
 	for _, p := range prints {
@@ -305,7 +317,9 @@ func TestStreamRestartedMarker(t *testing.T) {
 		t.Fatal("前置：应已触发过落盘")
 	}
 	m, cmd = ev(t, m, agent.StreamRestartedEvent{})
-	prints := printedLines(cmd)
+	var prints []string
+	prints = append(prints, printedLines(cmd)...)
+	m, prints = pumpDrain(m, prints)
 	if len(prints) != 1 || !strings.Contains(prints[0], "已作废") {
 		t.Fatalf("已落盘后重连应打作废标记: %q", prints)
 	}
@@ -329,6 +343,7 @@ func TestInterruptedFinalize(t *testing.T) {
 
 	m, cmd := ev(t, m, agent.MessageFinalEvent{Text: "abc", Interrupted: true})
 	prints := printedLines(cmd)
+	m, prints = pumpDrain(m, prints)
 	if len(prints) != 2 || prints[0] != "abc" || !strings.Contains(prints[1], "以上内容被中断") {
 		t.Fatalf("有剩余的中止应打印剩余 + 标记: %q", prints)
 	}
@@ -337,6 +352,7 @@ func TestInterruptedFinalize(t *testing.T) {
 	m, _ = ev(t, m, agent.TextDeltaEvent{Text: strings.Repeat("x\n", 8)}) // 触发落盘
 	m, cmd = ev(t, m, agent.MessageFinalEvent{Text: "x", Interrupted: true})
 	prints = printedLines(cmd)
+	m, prints = pumpDrain(m, prints)
 	if len(prints) != 1 || !strings.Contains(prints[0], "以上内容被中断") {
 		t.Fatalf("无剩余但已落盘的中止应只打标记: %q", prints)
 	}
@@ -369,6 +385,54 @@ func TestUserEchoBatchedSafePrint(t *testing.T) {
 	for i, p := range prints {
 		if rows := wrappedRows(p, m.width); rows > m.printMargin() {
 			t.Errorf("回显批 %d 占行 %d 超预算 %d", i, rows, m.printMargin())
+		}
+	}
+}
+
+// TestPrintScrollSingleQueueOrder 锁定 T9 修复：跨调用批次经单一队列全局
+// 保序——插话回显与流式批次交错入队时，printLineMessage 仍按入队序发出；
+// 排空期间的新入队由链尾接续，不产生并行发送方。
+func TestPrintScrollSingleQueueOrder(t *testing.T) {
+	m := New(Deps{ModelName: "t"})
+	m.width = 80
+	m.height = 40
+
+	c1 := m.printScroll("回显行")
+	if c1 == nil {
+		t.Fatal("首呼应返回排空链")
+	}
+	if !m.scrollQ.draining || len(m.scrollQ.pending) != 0 {
+		t.Fatalf("draining=%v pending=%d, 期望 true/0", m.scrollQ.draining, len(m.scrollQ.pending))
+	}
+	// 排空在飞时再入队（插话回显/流式批次的交错形态）：只入队，不开并行排空。
+	c2 := m.printScroll("流式1\n流式2\n流式3")
+	if c2 != nil {
+		t.Fatal("排空期间应只入队返回 nil")
+	}
+	if len(m.scrollQ.pending) != 1 || m.scrollQ.pending[0] != "流式1\n流式2\n流式3" {
+		t.Fatalf("pending = %q, 期望恰为流式批", m.scrollQ.pending)
+	}
+	// 链尾回环：余批续发，队列空后收尾。
+	_, c3 := m.Update(drainNextMsg{})
+	if c3 == nil {
+		t.Fatal("有余批应续发排空链")
+	}
+	if len(m.scrollQ.pending) != 0 {
+		t.Fatalf("续发应取走余批, pending=%d", len(m.scrollQ.pending))
+	}
+	_, c4 := m.Update(drainNextMsg{})
+	if c4 != nil || m.scrollQ.draining {
+		t.Fatalf("队列空应结束排空: c4=%v draining=%v", c4, m.scrollQ.draining)
+	}
+	// 全局序：回显批在前，流式批在后（真实运行时由信道 FIFO 兑现同序写入）。
+	got := append(printedLines(c1), printedLines(c3)...)
+	want := []string{"回显行", "流式1\n流式2\n流式3"}
+	if len(got) != len(want) {
+		t.Fatalf("落盘消息数 = %d (%q), 期望 %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("落盘序 = %q, 期望 %q", got, want)
 		}
 	}
 }

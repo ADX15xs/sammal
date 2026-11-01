@@ -5,8 +5,6 @@ import (
 	"strings"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
-
 	"sammal/internal/compaction"
 	"sammal/internal/human"
 )
@@ -14,18 +12,19 @@ import (
 // warnRatio ctx% 变黄预警线（压缩触发线 compaction.TriggerRatio 变红）。
 const warnRatio = 0.7
 
-// warnContextPressure 投影逼近压缩触发线时提示一次（把「下一轮要压缩、
-// 会变慢且缓存重建」提前解释给用户）。TurnEnded 时判定，一轮只报一次。
-func (m Model) warnContextPressure() tea.Cmd {
+// contextPressureText 投影逼近压缩触发线时返回提示文本（把「下一轮要压缩、
+// 会变慢且缓存重建」提前解释给用户）；未达线或已报过返回空串。
+// TurnEnded 时判定，一轮只报一次。
+func (m Model) contextPressureText() string {
 	if m.windowTokens <= 0 || m.usage == nil {
-		return nil
+		return ""
 	}
 	if r := float64(m.usage.PromptTokens) / float64(m.windowTokens); r >= compaction.TriggerRatio && !m.ctxWarned {
 		m.ctxWarned = true
-		return m.printScroll(dim(fmt.Sprintf("| 上下文已达窗口 %d%%（压缩触发线 %d%%）：下一轮可能自动压缩并重建 KV 缓存",
-			int(r*100), int(compaction.TriggerRatio*100))))
+		return dim(fmt.Sprintf("| 上下文已达窗口 %d%%（压缩触发线 %d%%）：下一轮可能自动压缩并重建 KV 缓存",
+			int(r*100), int(compaction.TriggerRatio*100)))
 	}
-	return nil
+	return ""
 }
 
 // statusSeg 是状态栏的一个显示段。
