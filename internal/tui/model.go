@@ -50,6 +50,7 @@ type Model struct {
 	stream        *strings.Builder // 当前流式块未落盘尾部（闭合行 + 半行，可变区）
 	streamPrinted bool             // 本条消息已有内容落进滚动缓冲区（重试作废标记的依据）
 	scrollQ       *printQueue      // 滚动区落盘批次的全局 FIFO（scroll.go，T9 保序）
+	frameHold     *frameHoldState  // 帧高冻结态（队列未排空时禁止帧行数变化，T9 根因对策）
 	thinking      bool
 	reason        strings.Builder // 思考累积文本（定稿即弃，只取最新行渲染）
 	reasonCur     string          // 当前未闭合行的缓存（增量里无换行时也要能显示）
@@ -76,7 +77,7 @@ type Model struct {
 }
 
 func New(deps Deps) Model {
-	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}, windowTokens: deps.ContextWindow, editor: NewEditor(), scrollQ: &printQueue{}}
+	return Model{deps: deps, modelName: deps.ModelName, stream: &strings.Builder{}, windowTokens: deps.ContextWindow, editor: NewEditor(), scrollQ: &printQueue{}, frameHold: &frameHoldState{}}
 }
 
 // InputText 返回当前输入内容（测试用）。
@@ -109,6 +110,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// 尺寸变化由渲染器的 resize/pendingErase 路径处理，冻结帧让位。
+		if m.frameHold != nil {
+			m.frameHold.lines = nil
+		}
 		return m, nil
 
 	case tea.PasteMsg:
@@ -561,10 +566,27 @@ func (m Model) View() tea.View {
 	}
 	edLines, curLineIdx, cursorCol := m.editor.Render(prompt, width, m.editorMaxLines())
 	lines = append(lines, edLines...)
+	curY := len(lines) - len(edLines) + curLineIdx
+
+	// 帧高冻结（T9 根因对策）：队列未排空期间禁止帧行数变化——frameArea
+	// 高度变化会令渲染器 Erase→ED 全量重绘，而 ED 从 insertAbove 遗留在
+	// 历史区的真实光标处向下擦，吞掉在屏历史（缺行 + 残句碎片）。沿用上
+	// 一帧行集与光标，内容照常累积，排空后的下一次 flush 再落地新帧——
+	// 那时光标下方恰是本该让位的旧帧区，擦除无损。
+	if m.frameHold != nil {
+		busy := m.scrollQ.draining || len(m.scrollQ.pending) > 0
+		sameHeight := m.frameHold.lines != nil && len(m.frameHold.lines) == len(lines)
+		switch {
+		case !busy || sameHeight:
+			m.frameHold.lines, m.frameHold.curX, m.frameHold.curY = lines, cursorCol, curY
+		default:
+			lines, cursorCol, curY = m.frameHold.lines, m.frameHold.curX, m.frameHold.curY
+		}
+	}
 
 	v := tea.NewView(strings.Join(lines, "\n"))
 	v.Cursor = &tea.Cursor{
-		Position: tea.Position{X: cursorCol, Y: len(lines) - len(edLines) + curLineIdx},
+		Position: tea.Position{X: cursorCol, Y: curY},
 		Shape:    tea.CursorBar,
 		Blink:    true,
 	}

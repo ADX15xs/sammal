@@ -436,3 +436,38 @@ func TestPrintScrollSingleQueueOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestFrameHoldWhileDraining 锁定帧高冻结：队列排空期间帧行数不得变化。
+// frameArea 高度变化会令渲染器 Erase→ED 全量重绘，而 ED 从 insertAbove
+// 遗留在历史区的真实光标处向下擦——在屏历史被吞（T9 根因）。排空结束
+// 后才落地新帧高。
+func TestFrameHoldWhileDraining(t *testing.T) {
+	m := New(Deps{ModelName: "m", Events: closedEvents()})
+	m.width, m.height = 80, 30
+	m, _ = ev(t, m, agent.TurnStartedEvent{})
+
+	m, cmd := ev(t, m, agent.TextDeltaEvent{Text: strings.Repeat("x\n", 8)}) // 触发落盘，排空链在飞
+	if cmd == nil {
+		t.Fatal("前置：应已触发落盘")
+	}
+	v1 := m.View()
+	h1 := len(strings.Split(v1.Content, "\n"))
+
+	// 排空在飞：尾部块长出内容，帧行数必须冻结在上一帧。
+	m, _ = ev(t, m, agent.TextDeltaEvent{Text: "y\n"})
+	v2 := m.View()
+	if h2 := len(strings.Split(v2.Content, "\n")); h2 != h1 {
+		t.Fatalf("排空期间帧高变化: %d -> %d（应冻结）", h1, h2)
+	}
+
+	// 排空结束后落地新帧高。
+	for m.scrollQ.draining {
+		next, cmd := m.Update(drainNextMsg{})
+		m = next.(Model)
+		_ = cmd
+	}
+	v3 := m.View()
+	if h3 := len(strings.Split(v3.Content, "\n")); h3 == h1 {
+		t.Fatalf("排空后帧高应落地新值，仍为 %d", h3)
+	}
+}

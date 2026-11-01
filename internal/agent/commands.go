@@ -122,9 +122,23 @@ func (a *Agent) switchSession(sess *session.Session) {
 	if a.sess != nil && a.sess != sess {
 		a.sess.Close()
 	}
-	a.sess = sess
-	a.cp = checkpoint.New(sess.Dir(), h.Cwd)
-	a.gitHintShown = false
+	// 收件箱是 Agent 级状态，不属于任何会话：换会话时未吸收的插话已失去
+	// 归属（原会话日志已关闭），留着必然泄露进新会话的下一请求。
+	discarded := 0
+	for {
+		select {
+		case <-a.inbox:
+			discarded++
+		default:
+			if discarded > 0 {
+				a.emit(StatusEvent{Text: fmt.Sprintf("已丢弃 %d 条未吸收插话（会话已切换）", discarded)})
+			}
+			a.sess = sess
+			a.cp = checkpoint.New(sess.Dir(), h.Cwd)
+			a.gitHintShown = false
+			return
+		}
+	}
 }
 
 // newSession 以当前会话的身份事实开新会话。AGENTS.md 从磁盘重读而非

@@ -254,6 +254,13 @@ type printQueue struct {
 // Update，由 drainNext 接续余批或收尾。
 type drainNextMsg struct{}
 
+// frameHoldState 帧高冻结态：队列未排空期间 View 沿用上一帧行集（T9
+// 根因对策，见 model.go View）。指针挂 Model 供 View 直接改写。
+type frameHoldState struct {
+	lines      []string
+	curX, curY int
+}
+
 // printScroll 文本安全落盘：每段文本按预算独立分批，批次按变参顺序入全局
 // 队列；仅当无在飞排空链时开启新的排空（tea.Sequence 串行发出 + 链尾
 // drainNextMsg 接续），否则只入队返回 nil——跨调用批次全局保序，不产生
