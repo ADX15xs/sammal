@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -75,74 +76,114 @@ func TestInterjectDispatchedOnceWithStreamFlush(t *testing.T) {
 	}
 }
 
-// TestInterjectDedupeInWindow 同一内容在 500ms 内重复提交应被去重
-func TestInterjectDedupeInWindow(t *testing.T) {
+// 生成中插话：回显与灰字提示必须同批落盘且两行相邻——提示若拖到段末吸收时
+// 才发，会在长输出尾部堆成一片；提示也不得暗示「还要你再发一条」。
+func TestInterjectHintFollowsEcho(t *testing.T) {
+	var sent []string
 	m := New(Deps{
 		ModelName: "m",
 		Events:    closedEvents(),
-		Send:      func(string, []string) {},
+		Send:      func(text string, _ []string) { sent = append(sent, text) },
 	})
-	m.width, m.height = 80, 30
-	m.busy = true
-	m.stream.WriteString("正在输出第一行\n半")
-
-	// 第一次 Enter
-	m.editor.Insert("插话")
-	next, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
-	m = next.(Model)
-
-	prints1 := printedLines(cmd)
-	joined1 := strings.Join(prints1, "\n")
-	if strings.Count(joined1, "插话") != 1 {
-		t.Fatalf("首次插话应出现 1 次，实际 %d 次: %q", strings.Count(joined1, "插话"), joined1)
-	}
-
-	// 第二次 Enter（相同内容，500ms 窗口内）
-	m.editor.Insert("插话")
-	next, cmd = m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
-	m = next.(Model)
-
-	// 由于去重，第二次不应产生新的输出
-	if len(printedLines(cmd)) != 0 {
-		t.Fatalf("去重生效：第二次相同插话不应产生输出")
-	}
-	if len(m.interject) != 0 {
-		t.Fatalf("interject 应清空，实际 %d 条", len(m.interject))
-	}
-}
-
-// TestInterjectDedupeExpiredWindow 时间窗口过期后相同内容可再次入队
-// 注意：测试无法直接操控时间，只能验证去重逻辑存在
-func TestInterjectDedupeExpiredWindow(t *testing.T) {
-	m := New(Deps{
-		ModelName: "m",
-		Events:    closedEvents(),
-		Send:      func(string, []string) {},
-	})
-	m.width, m.height = 80, 30
+	m.width, m.height = 80, 24
 	m.busy = true
 	m.stream.WriteString("正在输出\n")
 
-	// 第一次插话
-	m.editor.Insert("相同内容")
+	m.editor.Insert("先停一下")
 	next, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = next.(Model)
 
-	prints1 := printedLines(cmd)
-	joined1 := strings.Join(prints1, "\n")
-	if strings.Count(joined1, "相同内容") != 1 {
-		t.Fatalf("首次插话应出现 1 次: %q", joined1)
+	if len(sent) != 1 || sent[0] != "先停一下" {
+		t.Fatalf("插话须以原文投递一次，实际 %q", sent)
 	}
+	joined := strings.Join(printedLines(cmd), "\n")
+	lines := strings.Split(strings.TrimSuffix(joined, "\n"), "\n")
+	idx := -1
+	for i, ln := range lines {
+		if strings.Contains(ln, "> 先停一下") {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("回显应落盘: %q", joined)
+	}
+	if idx+1 >= len(lines) || !strings.Contains(lines[idx+1], "消息已发出") {
+		t.Fatalf("提示应紧跟回显下一行: %q", joined)
+	}
+	for _, bad := range []string{"下一请求", "再发", "下一条"} {
+		if strings.Contains(joined, bad) {
+			t.Errorf("提示不得含 %q（会被读成要用户再发一条）: %q", bad, joined)
+		}
+	}
+}
 
-	// 再次插入相同内容（时间窗口内，会被去重）
-	m.editor.Insert("相同内容")
+// 连按 Enter 的重复提交：回显与投递一起跳过并出声。
+// 此前只压回显、Send 照发——模型收两条，屏幕只显示一条。
+func TestInterjectDedupeWithinWindow(t *testing.T) {
+	var sent []string
+	m := New(Deps{
+		ModelName: "m",
+		Events:    closedEvents(),
+		Send:      func(text string, _ []string) { sent = append(sent, text) },
+	})
+	m.width, m.height = 80, 24
+	m.busy = true
+	m.stream.WriteString("正在输出\n")
+
+	m.editor.Insert("插话")
+	next, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(Model)
+	if joined := strings.Join(printedLines(cmd), "\n"); strings.Count(joined, "> 插话") != 1 {
+		t.Fatalf("首次插话应回显一次: %q", joined)
+	}
+	// 排空，否则 draining 会让下一次 printScroll 返回 nil，断言变成空转
+	m, _ = drainAll(t, m)
+
+	m.editor.Insert("插话")
 	next, cmd = m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = next.(Model)
 
-	prints2 := printedLines(cmd)
-	// 窗口内去重，第二次无输出
-	if len(prints2) != 0 {
-		t.Fatalf("时间窗口内重复应去重，无输出: %q", prints2)
+	if len(sent) != 1 {
+		t.Fatalf("重复插话不应再次投递，实际 %d 条: %q", len(sent), sent)
+	}
+	joined := strings.Join(printedLines(cmd), "\n")
+	if strings.Contains(joined, "> 插话") {
+		t.Fatalf("重复插话不应再回显: %q", joined)
+	}
+	if !strings.Contains(joined, "已忽略") {
+		t.Fatalf("去重必须出声，不能静默吞: %q", joined)
+	}
+}
+
+// 超出 500ms 窗口后，相同内容可以再次发送。
+func TestInterjectDedupeExpires(t *testing.T) {
+	var sent []string
+	m := New(Deps{
+		ModelName: "m",
+		Events:    closedEvents(),
+		Send:      func(text string, _ []string) { sent = append(sent, text) },
+	})
+	m.width, m.height = 80, 24
+	m.busy = true
+	m.stream.WriteString("正在输出\n")
+
+	m.editor.Insert("继续")
+	next, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(Model)
+	_ = printedLines(cmd)
+	m, _ = drainAll(t, m)
+
+	m.lastInterject.at = time.Now().Add(-time.Second) // 窗口过期，不 sleep
+
+	m.editor.Insert("继续")
+	next, cmd = m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(Model)
+
+	if len(sent) != 2 {
+		t.Fatalf("窗口过期后相同内容应可重发，实际 %d 条: %q", len(sent), sent)
+	}
+	if joined := strings.Join(printedLines(cmd), "\n"); strings.Count(joined, "> 继续") != 1 {
+		t.Fatalf("重发应重新回显: %q", joined)
 	}
 }
 
@@ -197,45 +238,6 @@ func TestInterjectMultiFlushMultiInterject(t *testing.T) {
 	joined = strings.Join(printed, "\n")
 	if strings.Contains(joined, "确认") || strings.Contains(joined, "取消") {
 		t.Fatalf("第 3 个 chunk 不应重复插话: %q", joined)
-	}
-}
-
-// TestInterjectWhileBusyDedupe 生成中插话去重
-func TestInterjectWhileBusyDedupe(t *testing.T) {
-	m := New(Deps{
-		ModelName: "m",
-		Events:    closedEvents(),
-		Send:      func(string, []string) {},
-	})
-	m.width, m.height = 80, 30
-	m.busy = true
-	m.stream.WriteString("正在输出第一行\n半")
-
-	// 用户快速连按两次 Enter
-	m.editor.Insert("插话")
-	next, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
-	m = next.(Model)
-
-	prints1 := printedLines(cmd)
-	joined1 := strings.Join(prints1, "\n")
-	if !strings.Contains(joined1, "> 插话") {
-		t.Fatalf("首次插话回显应随流式批落盘: %q", joined1)
-	}
-	if strings.Count(joined1, "插话") != 1 {
-		t.Fatalf("首次插话回显出现 %d 次（应为 1）：%q", strings.Count(joined1, "插话"), joined1)
-	}
-
-	// 第二次相同内容（去重）
-	m.editor.Insert("插话")
-	next, cmd = m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
-	m = next.(Model)
-
-	prints2 := printedLines(cmd)
-	if len(prints2) != 0 {
-		t.Fatalf("去重生效：第二次相同插话不应产生输出，实际 %q", prints2)
-	}
-	if len(m.interject) != 0 {
-		t.Fatalf("插话已派发，interject 应清空，实际 %d 条", len(m.interject))
 	}
 }
 

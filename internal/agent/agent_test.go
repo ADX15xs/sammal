@@ -491,6 +491,29 @@ func TestSteeringAbsorbedAtStepBoundary(t *testing.T) {
 	}
 }
 
+// 吸收插话不再发状态行：提示由 TUI 在回显处即时打印（「消息已发出，请等待
+// 模型响应」）。吸收发生在段末，此时再报一次只会在长输出尾部堆成一片。
+func TestAbsorbInboxEmitsNoStatus(t *testing.T) {
+	fp := &fakeProvider{streams: [][]provider.Chunk{
+		toolCallChunks("c1", "write", `{"path":"s.txt","content":"s"}`),
+		textChunks("after steering"),
+	}}
+	slow := newSlowTool(300 * time.Millisecond)
+	fx := newFixture(t, fp, slow)
+	events := fx.ag.Events()
+
+	go fx.ag.Run(context.Background(), "q1")
+	waitFor(t, slow.started)
+	fx.ag.Steering("改用 PowerShell")
+	evs := drainEvents(t, events, turnEnded)
+
+	for _, e := range evs {
+		if st, ok := e.(StatusEvent); ok && strings.Contains(st.Text, "插话") {
+			t.Fatalf("吸收插话不应再发状态行: %q", st.Text)
+		}
+	}
+}
+
 // 纯文本回答没有 step 边界：插话须在段末吸收并续答，而不是拖到下一次 Submit。
 func TestSteeringAbsorbedAfterPlainTextStep(t *testing.T) {
 	fp := &fakeProvider{streams: [][]provider.Chunk{

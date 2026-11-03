@@ -50,6 +50,7 @@ type Model struct {
 	stream        *strings.Builder // 当前流式块未落盘尾部（闭合行 + 半行，可变区）
 	streamPrinted bool             // 本条消息已有内容落进滚动缓冲区（重试作废标记的依据）
 	interject     []interjectEntry // 待随流式批落盘的插话/工具行；不单独 insertAbove（T9 根因）
+	lastInterject interjectMark    // 上一次生成中插话：连按 Enter 去重
 	scrollQ       *printQueue      // 滚动区落盘批次的全局 FIFO（scroll.go，T9 保序）
 	frameHold     *frameHoldState  // 帧高冻结态（队列未排空时禁止帧行数变化，T9 根因对策）
 	thinking      bool
@@ -77,26 +78,39 @@ type Model struct {
 	inputBeforePopup string // Esc 关闭弹窗时还原
 }
 
-// interjectEntry 待落盘的插话/工具行。
-// entryAt 用于 500ms 窗口去重：连按 Enter 会重复提交同一内容。
+// interjectEntry 待落盘的一行（插话回显、工具行或状态提示）。
 type interjectEntry struct {
 	content string
-	entryAt time.Time
 }
 
-const interjectDedupWindow = 500 * time.Millisecond
+// interjectMark 记录最近一次生成中插话：连按 Enter 会重复提交同一内容，
+// 判据是「内容相同且在上一次投递的 500ms 内」。
+type interjectMark struct {
+	text string
+	at   time.Time
+}
+
+const (
+	interjectDedupWindow = 500 * time.Millisecond
+	// interjectSentHint 生成中插话的灰字提示。措辞只承诺「已递交给模型、
+	// 正在排队」——不能说「下一请求」，那会被读成「要你再发一条」。
+	interjectSentHint = "（消息已发出，请等待模型响应）"
+)
 
 func (m *Model) addInterject(content string) {
 	if strings.TrimSpace(content) == "" {
 		return
 	}
-	now := time.Now()
-	for _, e := range m.interject {
-		if e.content == content && now.Sub(e.entryAt) < interjectDedupWindow {
-			return
-		}
-	}
-	m.interject = append(m.interject, interjectEntry{content: content, entryAt: now})
+	m.interject = append(m.interject, interjectEntry{content: content})
+}
+
+// duplicateInterject 报告本次插话是否与上一次投递重复（连按 Enter）。
+func (m Model) duplicateInterject(text string) bool {
+	return m.lastInterject.text == text && time.Since(m.lastInterject.at) < interjectDedupWindow
+}
+
+func (m *Model) noteInterject(text string) {
+	m.lastInterject = interjectMark{text: text, at: time.Now()}
 }
 
 func New(deps Deps) Model {
@@ -197,8 +211,18 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				flush, _ := m.flushPendingStream(false)
 				return m, flush
 			}
-			m.addInterject(renderUserEcho(echo))
+			// 连按 Enter 的重复提交：回显与投递一起跳过并出声。此前只压回显、
+			// Send 照发，结果是模型收两条而屏幕只显示一条。
+			if m.duplicateInterject(text) {
+				m.addInterject(dim("（与上一条相同，已忽略）"))
+				flush, _ := m.flushPendingStream(false)
+				return m, flush
+			}
 			m.deps.Send(text, nil)
+			m.noteInterject(text)
+			// 回显与提示同属一个 entry：两行永远相邻、同批落盘。提示若留到
+			// 段末吸收时再发，会在长输出尾部堆成一片。
+			m.addInterject(renderUserEcho(echo) + "\n" + dim(interjectSentHint))
 			flush, _ := m.flushPendingStream(false)
 			return m, flush
 		}

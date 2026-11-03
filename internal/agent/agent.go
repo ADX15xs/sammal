@@ -361,6 +361,8 @@ func (a *Agent) appendFatal(evType string, data any) error {
 func (a *Agent) hasInbox() bool { return len(a.inbox) > 0 }
 
 // absorbInbox 清空收件箱：把生成期间的用户插话吸收为 user 消息。
+// 逐条吸收、不在这里发声——插话的「已发出」提示由 TUI 在回显处即时打印，
+// 吸收发生在段末，此时再报一次只会在长输出尾部堆成一片。
 func (a *Agent) absorbInbox() {
 	for {
 		select {
@@ -368,7 +370,6 @@ func (a *Agent) absorbInbox() {
 			if a.appendFatal(session.TypeUserMessage, session.UserMessageData{Text: msg, Date: TodayLocal()}) != nil {
 				return // 失败已上报；本请求不含该插话（未落盘即模型不可见）
 			}
-			a.emit(StatusEvent{Text: "已吸收插话，将随下一请求发送"})
 		default:
 			return
 		}
