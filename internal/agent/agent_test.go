@@ -514,6 +514,98 @@ func TestAbsorbInboxEmitsNoStatus(t *testing.T) {
 	}
 }
 
+// 同一批吸收的多条插话合并成一条 user 消息：逐条写成连续 user 消息会被模型
+// 读成「同一指令的重复」，只回应最后一条（实机 20261104-003832-1800）。
+func TestSteeringBatchMergedIntoOneUserMessage(t *testing.T) {
+	fp := &fakeProvider{streams: [][]provider.Chunk{
+		toolCallChunks("c1", "write", `{"path":"s.txt","content":"s"}`),
+		textChunks("after steering"),
+	}}
+	slow := newSlowTool(300 * time.Millisecond)
+	fx := newFixture(t, fp, slow)
+	events := fx.ag.Events()
+
+	go fx.ag.Run(context.Background(), "q1")
+	waitFor(t, slow.started)
+	for _, s := range []string{"第 50 行是什么", "第 100 行是什么", "第 200 行是什么"} {
+		fx.ag.Steering(s)
+	}
+	drainEvents(t, events, turnEnded)
+
+	if len(fp.calls) < 2 {
+		t.Fatalf("calls = %d", len(fp.calls))
+	}
+	var absorbed []string
+	for _, msg := range fp.calls[1].Messages {
+		if msg.Role == "user" && strings.Contains(provider.ContentText(msg.Content), "行是什么") {
+			absorbed = append(absorbed, provider.ContentText(msg.Content))
+		}
+	}
+	if len(absorbed) != 1 {
+		t.Fatalf("同批插话应合并成 1 条 user 消息，实际 %d 条: %q", len(absorbed), absorbed)
+	}
+	body := absorbed[0]
+	if !strings.Contains(body, "3 条") {
+		t.Errorf("合并消息应标明批次大小: %q", body)
+	}
+	prev := -1
+	for _, want := range []string{"第 50 行是什么", "第 100 行是什么", "第 200 行是什么"} {
+		i := strings.Index(body, want)
+		if i < 0 {
+			t.Fatalf("合并消息缺少 %q: %q", want, body)
+		}
+		if i <= prev {
+			t.Errorf("合并消息顺序错乱（%q）: %q", want, body)
+		}
+		prev = i
+	}
+
+	// 合并后的日志仍可逐字节重放（I1）。
+	pairs, err := fx.sess.ReplayRequestHashes(fx.system(), fx.reg.Defs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, p := range pairs {
+		if p[0] != p[1] {
+			t.Errorf("合并插话后 request %d 重放不一致", i)
+		}
+	}
+}
+
+// 单条插话的日志形态不变：原样写入，不加抬头、不加序号。
+func TestSteeringSingleMessageUnchanged(t *testing.T) {
+	fp := &fakeProvider{streams: [][]provider.Chunk{
+		toolCallChunks("c1", "write", `{"path":"s.txt","content":"s"}`),
+		textChunks("after steering"),
+	}}
+	slow := newSlowTool(300 * time.Millisecond)
+	fx := newFixture(t, fp, slow)
+	events := fx.ag.Events()
+
+	go fx.ag.Run(context.Background(), "q1")
+	waitFor(t, slow.started)
+	fx.ag.Steering("改用 PowerShell")
+	drainEvents(t, events, turnEnded)
+
+	var absorbed []string
+	for _, msg := range fp.calls[1].Messages {
+		if msg.Role == "user" && strings.Contains(provider.ContentText(msg.Content), "PowerShell") {
+			absorbed = append(absorbed, provider.ContentText(msg.Content))
+		}
+	}
+	if len(absorbed) != 1 {
+		t.Fatalf("应恰有 1 条插话消息，实际 %q", absorbed)
+	}
+	// 投影会给 user 消息加 "Today: <date>" 前缀，去掉后应与原文逐字节一致。
+	body := absorbed[0]
+	if i := strings.Index(body, "\n\n"); i >= 0 {
+		body = body[i+2:]
+	}
+	if body != "改用 PowerShell" {
+		t.Fatalf("单条插话应原样写入，实际 %q", body)
+	}
+}
+
 // 纯文本回答没有 step 边界：插话须在段末吸收并续答，而不是拖到下一次 Submit。
 func TestSteeringAbsorbedAfterPlainTextStep(t *testing.T) {
 	fp := &fakeProvider{streams: [][]provider.Chunk{

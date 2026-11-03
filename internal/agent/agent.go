@@ -361,19 +361,46 @@ func (a *Agent) appendFatal(evType string, data any) error {
 func (a *Agent) hasInbox() bool { return len(a.inbox) > 0 }
 
 // absorbInbox 清空收件箱：把生成期间的用户插话吸收为 user 消息。
-// 逐条吸收、不在这里发声——插话的「已发出」提示由 TUI 在回显处即时打印，
-// 吸收发生在段末，此时再报一次只会在长输出尾部堆成一片。
+// 同一批的多条合并成一条（见 mergeInterjects）：逐条写成连续 user 消息会被
+// 模型读成「同一指令的重复」，只回应最后一条（实机 20261104-003832-1800：
+// 三条全部送达、messageCount=5，模型只答最后一条）。
+// 不在这里发状态行——提示由 TUI 在回显处即时打印。
 func (a *Agent) absorbInbox() {
+	texts := a.drainInbox()
+	if len(texts) == 0 {
+		return
+	}
+	if a.appendFatal(session.TypeUserMessage, session.UserMessageData{Text: mergeInterjects(texts), Date: TodayLocal()}) != nil {
+		return // 失败已上报；本请求不含该插话（未落盘即模型不可见）
+	}
+}
+
+// drainInbox 取走收件箱当前全部内容（时间序）。
+func (a *Agent) drainInbox() []string {
+	var texts []string
 	for {
 		select {
 		case msg := <-a.inbox:
-			if a.appendFatal(session.TypeUserMessage, session.UserMessageData{Text: msg, Date: TodayLocal()}) != nil {
-				return // 失败已上报；本请求不含该插话（未落盘即模型不可见）
-			}
+			texts = append(texts, msg)
 		default:
-			return
+			return texts
 		}
 	}
+}
+
+// mergeInterjects 把同一批插话合成一条 user 消息。单条原样返回（日志形态
+// 与旧的逐条行为逐字节一致）；多条加批次抬头与序号——序号是「逐条回应」
+// 可判定化的唯一抓手，抬头则消除「后一条覆盖前一条」的解读空间。
+func mergeInterjects(texts []string) string {
+	if len(texts) == 1 {
+		return texts[0]
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "（生成中插话 %d 条，按先后顺序，请逐条纳入处理）", len(texts))
+	for i, t := range texts {
+		fmt.Fprintf(&b, "\n%d. %s", i+1, t)
+	}
+	return b.String()
 }
 
 // streamStep 驱动一次流式请求：日志留痕 chunk 增量与定稿
