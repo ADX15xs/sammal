@@ -496,6 +496,37 @@ func (a *Agent) executeTools(ctx context.Context, calls []provider.ToolCall) str
 		}
 
 		args := json.RawMessage(tc.Function.Arguments)
+
+		// 双重门控：语法合法 + 语义完整（必填字段齐全）。
+		// 上游 SSE 截断常产出「语法合法但必填字段缺失」（如 {"path":"a.txt"} 缺 content）
+		// 或「语法非法」（如 {"path":"a.txt","content":"trun）。统一拦截，走重试路径。
+		if !a.isArgsComplete(tc.Function.Name, args) {
+			// 原始截断文本（tc.Function.Arguments 是字符串）转为 JSON 字符串占位，
+			// 保证日志每行合法 JSON、I1 重放逐字节一致（占位整体可序列化）。
+			invalidRaw, _ := json.Marshal(tc.Function.Arguments)
+			if a.appendFatal(session.TypeToolCall, session.ToolCallData{ID: tc.ID, Name: tc.Function.Name, Args: invalidRaw}) != nil {
+				logFailed = true
+				continue
+			}
+			a.emit(ToolCallEvent{ID: tc.ID, Name: tc.Function.Name, ArgsSummary: argsSummary(invalidRaw)})
+
+			// 结构化错误码：模型可程序化识别「截断」并强制重试同名工具。
+			// Extra.code 为机器可读标识；Err 保留人类可读文案（兼容旧版模型）。
+			res := tool.Result{
+				Err: "tool call arguments were truncated upstream (invalid or incomplete JSON); please retry with complete arguments",
+				Extra: map[string]any{
+					"code":   "TRUNCATED_ARGS",
+					"detail": "upstream SSE stream truncated; required fields missing or JSON syntax invalid",
+				},
+			}
+			if a.appendFatal(session.TypeToolResult, session.ToolResultData{ID: tc.ID, Canonical: res}) != nil {
+				logFailed = true
+				continue
+			}
+			a.emit(ToolResultEvent{ID: tc.ID, Name: tc.Function.Name, Result: res})
+			continue
+		}
+
 		if a.appendFatal(session.TypeToolCall, session.ToolCallData{ID: tc.ID, Name: tc.Function.Name, Args: args}) != nil {
 			logFailed = true // 剩余调用补合成结果后终止 turn
 			continue
@@ -516,6 +547,57 @@ func (a *Agent) executeTools(ctx context.Context, calls []provider.ToolCall) str
 		return StopAborted
 	}
 	return ""
+}
+
+// isArgsComplete 检查工具参数是否语法合法且语义完整（必填字段齐全）。
+// 返回 false 表示参数被截断或损坏，应走重试路径而非执行工具。
+func (a *Agent) isArgsComplete(toolName string, args json.RawMessage) bool {
+	// 1. 语法合法性：非法 JSON 直接拦截
+	if !json.Valid(args) {
+		return false
+	}
+
+	// 2. 语义完整性：按工具 Schema 的 required 字段校验
+	tl, ok := a.reg.Get(toolName)
+	if !ok {
+		// 未知工具：仅做语法校验，语义由工具执行层兜底
+		return true
+	}
+
+	// 解析工具 Schema 的 required 字段
+	var schema map[string]any
+	if err := json.Unmarshal(tl.Schema(), &schema); err != nil {
+		return true // Schema 解析失败时放行，避免误拦
+	}
+	requiredRaw, ok := schema["required"]
+	if !ok {
+		return true // 无 required 字段视为完整
+	}
+	requiredList, ok := requiredRaw.([]any)
+	if !ok {
+		return true
+	}
+
+	// 反序列化参数并检查必填字段是否存在且非空
+	var argMap map[string]any
+	if err := json.Unmarshal(args, &argMap); err != nil {
+		return false // 反序列化失败视为不完整
+	}
+	for _, req := range requiredList {
+		field, ok := req.(string)
+		if !ok {
+			continue
+		}
+		val, exists := argMap[field]
+		if !exists || val == nil {
+			return false // 必填字段缺失
+		}
+		// 字符串类型的必填字段不得为空串
+		if s, ok := val.(string); ok && s == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *Agent) runTool(ctx context.Context, name string, args json.RawMessage) tool.Result {

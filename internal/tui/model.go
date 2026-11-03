@@ -49,7 +49,7 @@ type Model struct {
 	busy          bool
 	stream        *strings.Builder // 当前流式块未落盘尾部（闭合行 + 半行，可变区）
 	streamPrinted bool             // 本条消息已有内容落进滚动缓冲区（重试作废标记的依据）
-	interject     []string         // 生成中待随流落盘的插话/工具行（dim 行，不单独 insertAbove）
+	interject     []interjectEntry // 生成中待随流落盘的插话/工具行（去重、带时间戳，不单独 insertAbove）
 	scrollQ       *printQueue      // 滚动区落盘批次的全局 FIFO（scroll.go，T9 保序）
 	frameHold     *frameHoldState  // 帧高冻结态（队列未排空时禁止帧行数变化，T9 根因对策）
 	thinking      bool
@@ -75,6 +75,41 @@ type Model struct {
 	pickerSel        int
 	pickerOffset     int    // 选择器可视窗口起始下标（>maxShown 项时跟随选中滚动）
 	inputBeforePopup string // Esc 关闭弹窗时还原
+}
+
+// interjectEntry 待落盘的插话/工具行条目。
+// 含内容、去重哈希、时间戳，支持基于内容+时间窗口的去重。
+type interjectEntry struct {
+	content string
+	hash    string // 内容哈希，用于去重
+	time    int64  // 纳秒时间戳，用于时间窗口去重
+}
+
+// interjectDedupWindow 去重时间窗口：500ms 内相同内容视为重复。
+const interjectDedupWindow = 500 * time.Millisecond
+
+// addInterject 向插话队列添加条目，带去重。
+// 同一内容在 interjectDedupWindow 内重复提交会被忽略，避免用户连按 Enter 产生视觉重复。
+// 空白内容不入队。
+func (m *Model) addInterject(content string) {
+	if strings.TrimSpace(content) == "" {
+		return // 空白内容不入队
+	}
+	now := time.Now().UnixNano()
+	h := hashContent(content)
+	// 检查现有队列中是否有相同哈希且在时间窗口内
+	for _, e := range m.interject {
+		if e.hash == h && now-e.time < int64(interjectDedupWindow) {
+			return // 去重：忽略重复提交
+		}
+	}
+	m.interject = append(m.interject, interjectEntry{content: content, hash: h, time: now})
+}
+
+// hashContent 计算内容的简单哈希（用于去重）。
+func hashContent(s string) string {
+	// 简单哈希：使用字符串本身作为键（内容通常较短），避免引入 crypto 依赖
+	return s
 }
 
 func New(deps Deps) Model {
@@ -162,6 +197,15 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.rememberInput(text)
 		}
 		echo := text
+
+		// 生成中：Enter 视为插话/中断，不发起新 turn，只入 interject 随流落盘
+		if m.busy {
+			m.addInterject(renderUserEcho(echo))
+			flush, _ := m.flushPendingStream(false)
+			return m, flush
+		}
+
+		// 空闲中：正常提交新 turn
 		if strings.HasPrefix(text, "/") {
 			switch cmd, expanded, out := m.slashSkill(text); cmd {
 			case skillPickerOpen:
@@ -184,9 +228,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.deps.Send(text, imgs)
 		// 插话回显随流式块落盘（不单独 insertAbove——舞蹈间的位移错位是
 		// T9 根因）：先在尾部窗口显示，随下一次 flush 进滚动区。
-		m.interject = append(m.interject, renderUserEcho(echo))
+		m.addInterject(renderUserEcho(echo))
 		if len(imgs) > 0 {
-			m.interject = append(m.interject, dim(fmt.Sprintf("  📎 %s", imagesSummary(imgs))))
+			m.addInterject(dim(fmt.Sprintf("  📎 %s", imagesSummary(imgs))))
 		}
 		// 提交即挂心跳：TurnStarted 回来之前是用户最紧张的等待期，
 		// spinner 帧必须动起来，不能等事件回环才起步。
@@ -373,11 +417,11 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.toolCalls++
 		// 工具行随流式块落盘（不单独 insertAbove）：工具调用 = 消息边界，
 		// 未闭合的模型文本语义完整，一并落盘。
-		m.interject = append(m.interject, dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
+		m.addInterject(dim(fmt.Sprintf("-> %s %s", ev.Name, ev.ArgsSummary)))
 		cmd, _ = m.flushPendingStream(true)
 
 	case agent.ToolResultEvent:
-		m.interject = append(m.interject, dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
+		m.addInterject(dim(fmt.Sprintf("<- %s: %s", ev.Name, tool.ForTUI(ev.Result))))
 		cmd, _ = m.flushPendingStream(true)
 
 	case agent.MessageFinalEvent:
@@ -657,7 +701,9 @@ func (m Model) streamBlockLines(width int) []string {
 	}
 	// 待发插话/工具行随块渲染（在尾部文本之后——它们晚于这些文本到达），
 	// 随下一次 flush 进滚动区；不单独 insertAbove（T9 根因）。
-	lines = append(lines, m.interject...)
+	for _, e := range m.interject {
+		lines = append(lines, e.content)
+	}
 	return lines
 }
 
@@ -689,7 +735,12 @@ func (m *Model) flushPendingStream(closePartial bool) (tea.Cmd, bool) {
 		}
 	}
 	if len(m.interject) > 0 {
-		texts = append(texts, strings.Join(m.interject, "\n"))
+		// 将 interjectEntry 转为字符串切片
+		interjectStrs := make([]string, len(m.interject))
+		for i, e := range m.interject {
+			interjectStrs[i] = e.content
+		}
+		texts = append(texts, strings.Join(interjectStrs, "\n"))
 		m.interject = nil
 	}
 	if len(texts) == 0 {
