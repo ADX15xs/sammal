@@ -496,6 +496,26 @@ func (a *Agent) executeTools(ctx context.Context, calls []provider.ToolCall) str
 		}
 
 		args := json.RawMessage(tc.Function.Arguments)
+		// 按 DEBT 008.19：上游 SSE 截断致死会话（uoma 慢速输出，实机 20261102-080457-4000）
+		// 在 tc 边界加 json.Valid 门：非法参数按提供方错误走既有重试路径返给模型
+		//（重试机制：step 边界断流重连），日志只记合法占位（保 I1 可重放）。
+		if !json.Valid(args) {
+			// 非法参数原文本（截断前） -> 转为 JSON 字符串占位，避免日志写入失败
+			invalidRaw, _ := json.Marshal(tc.Function.Arguments)
+			if a.appendFatal(session.TypeToolCall, session.ToolCallData{ID: tc.ID, Name: tc.Function.Name, Args: invalidRaw}) != nil {
+				logFailed = true
+				continue
+			}
+			a.emit(ToolCallEvent{ID: tc.ID, Name: tc.Function.Name, ArgsSummary: argsSummary(invalidRaw)})
+			// 工具失败应返给模型重试（DEBT 用户预期）
+			res := tool.Result{Err: "tool call arguments were truncated upstream (invalid JSON); please retry with complete arguments"}
+			if a.appendFatal(session.TypeToolResult, session.ToolResultData{ID: tc.ID, Canonical: res}) != nil {
+				logFailed = true
+				continue
+			}
+			a.emit(ToolResultEvent{ID: tc.ID, Name: tc.Function.Name, Result: res})
+			continue
+		}
 		if a.appendFatal(session.TypeToolCall, session.ToolCallData{ID: tc.ID, Name: tc.Function.Name, Args: args}) != nil {
 			logFailed = true // 剩余调用补合成结果后终止 turn
 			continue
