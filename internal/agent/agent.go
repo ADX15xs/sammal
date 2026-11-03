@@ -332,7 +332,12 @@ func (a *Agent) runSteps(ctx context.Context, imageRefs []string, imageParts []p
 			return StopError, usage
 		}
 		if len(toolCalls) == 0 {
-			return StopCompleted, usage
+			// 纯文本回答没有 step 边界：插话若只等下一次 Submit 就永远迟到。
+			// 收件箱非空则再走一步，让本轮内把插话吸收成 user 消息续答。
+			if !a.hasInbox() {
+				return StopCompleted, usage
+			}
+			continue
 		}
 		if stop := a.executeTools(ctx, msg.ToolCalls); stop != "" {
 			return stop, usage
@@ -351,6 +356,9 @@ func (a *Agent) appendFatal(evType string, data any) error {
 	}
 	return nil
 }
+
+// hasInbox 报告是否有待吸收插话（非阻塞、不消费）。
+func (a *Agent) hasInbox() bool { return len(a.inbox) > 0 }
 
 // absorbInbox 清空收件箱：把生成期间的用户插话吸收为 user 消息。
 func (a *Agent) absorbInbox() {

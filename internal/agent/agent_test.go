@@ -491,6 +491,38 @@ func TestSteeringAbsorbedAtStepBoundary(t *testing.T) {
 	}
 }
 
+// 纯文本回答没有 step 边界：插话须在段末吸收并续答，而不是拖到下一次 Submit。
+func TestSteeringAbsorbedAfterPlainTextStep(t *testing.T) {
+	fp := &fakeProvider{streams: [][]provider.Chunk{
+		textChunks(strings.Repeat("a", 2000)), // 够长：插话必然落在流式进行中
+		textChunks("after steering"),
+	}}
+	fx := newFixture(t, fp)
+	events := fx.ag.Events()
+
+	go fx.ag.Run(context.Background(), "q1")
+	for e := range events {
+		if _, ok := e.(TextDeltaEvent); ok {
+			fx.ag.Steering("改用 PowerShell")
+			break
+		}
+	}
+	drainEvents(t, events, turnEnded)
+
+	if len(fp.calls) != 2 {
+		t.Fatalf("calls = %d, want 2（段末吸收插话续答）", len(fp.calls))
+	}
+	found := false
+	for _, msg := range fp.calls[1].Messages {
+		if msg.Role == "user" && strings.Contains(provider.ContentText(msg.Content), "PowerShell") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("插话未进入续答请求: %+v", fp.calls[1].Messages)
+	}
+}
+
 // /rewind 同时回滚文件与对话。
 func TestRewindRollsBackFilesAndConversation(t *testing.T) {
 	fp := &fakeProvider{streams: [][]provider.Chunk{

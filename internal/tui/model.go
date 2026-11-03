@@ -49,7 +49,7 @@ type Model struct {
 	busy          bool
 	stream        *strings.Builder // 当前流式块未落盘尾部（闭合行 + 半行，可变区）
 	streamPrinted bool             // 本条消息已有内容落进滚动缓冲区（重试作废标记的依据）
-	interject     []interjectEntry // 生成中待随流落盘的插话/工具行（去重、带时间戳，不单独 insertAbove）
+	interject     []interjectEntry // 待随流式批落盘的插话/工具行；不单独 insertAbove（T9 根因）
 	scrollQ       *printQueue      // 滚动区落盘批次的全局 FIFO（scroll.go，T9 保序）
 	frameHold     *frameHoldState  // 帧高冻结态（队列未排空时禁止帧行数变化，T9 根因对策）
 	thinking      bool
@@ -77,33 +77,26 @@ type Model struct {
 	inputBeforePopup string // Esc 关闭弹窗时还原
 }
 
-// interjectEntry 待落盘的插话/工具行条目。
-// 含内容、去重哈希、时间戳，支持基于内容+时间窗口的去重。
+// interjectEntry 待落盘的插话/工具行。
+// entryAt 用于 500ms 窗口去重：连按 Enter 会重复提交同一内容。
 type interjectEntry struct {
 	content string
-	hash    string // 内容哈希，用于去重
-	time    int64  // 纳秒时间戳，用于时间窗口去重
+	entryAt time.Time
 }
 
-// interjectDedupWindow 去重时间窗口：500ms 内相同内容视为重复。
-// FIXME: 若需配置化改为从配置读取
 const interjectDedupWindow = 500 * time.Millisecond
 
-// addInterject 向插话队列添加条目，带去重。
-// 同一内容在 interjectDedupWindow 内重复提交会被忽略，避免用户连按 Enter 产生视觉重复。
-// 空白内容不入队。
 func (m *Model) addInterject(content string) {
 	if strings.TrimSpace(content) == "" {
-		return // 空白内容不入队
+		return
 	}
-	now := time.Now().UnixNano()
-	h := content // 简单哈希：内容本身（内容通常较短），避免引入 crypto 依赖
+	now := time.Now()
 	for _, e := range m.interject {
-		if e.hash == h && now-e.time < int64(interjectDedupWindow) {
-			return // 去重：忽略重复提交
+		if e.content == content && now.Sub(e.entryAt) < interjectDedupWindow {
+			return
 		}
 	}
-	m.interject = append(m.interject, interjectEntry{content: content, hash: h, time: now})
+	m.interject = append(m.interject, interjectEntry{content: content, entryAt: now})
 }
 
 func New(deps Deps) Model {
@@ -192,9 +185,20 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		echo := text
 
-		// 生成中：Enter 视为插话/中断，不发起新 turn，只入 interject 随流落盘
+		// 生成中：Enter 是插话——回显随流落盘（视觉），原文投收件箱（语义，
+		// agent.Submit 在 Running() 时转 Steering）。带图插话无承载者（DEBT），
+		// 丢弃时必须出声，否则用户以为图已发。
 		if m.busy {
+			if len(m.pendingImages) > 0 {
+				m.pendingImages = nil
+				m.addInterject(dim("（生成中不支持带图，图片未发送）"))
+			}
+			if text == "" {
+				flush, _ := m.flushPendingStream(false)
+				return m, flush
+			}
 			m.addInterject(renderUserEcho(echo))
+			m.deps.Send(text, nil)
 			flush, _ := m.flushPendingStream(false)
 			return m, flush
 		}
@@ -729,12 +733,11 @@ func (m *Model) flushPendingStream(closePartial bool) (tea.Cmd, bool) {
 		}
 	}
 	if len(m.interject) > 0 {
-		// 将 interjectEntry 转为字符串切片
-		interjectStrs := make([]string, len(m.interject))
+		lines := make([]string, len(m.interject))
 		for i, e := range m.interject {
-			interjectStrs[i] = e.content
+			lines[i] = e.content
 		}
-		texts = append(texts, strings.Join(interjectStrs, "\n"))
+		texts = append(texts, strings.Join(lines, "\n"))
 		m.interject = nil
 	}
 	if len(texts) == 0 {

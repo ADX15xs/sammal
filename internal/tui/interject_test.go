@@ -10,6 +10,18 @@ import (
 	"sammal/internal/tool"
 )
 
+// drainAll 手动跑完排空链（测试无事件循环），返回期间落盘的行。
+func drainAll(t *testing.T, m Model) (Model, []string) {
+	t.Helper()
+	var printed []string
+	for m.scrollQ.draining {
+		next, cmd := m.Update(drainNextMsg{})
+		m = next.(Model)
+		printed = append(printed, printedLines(cmd)...)
+	}
+	return m, printed
+}
+
 // T9 短期方案（调研报告「实施路径」）：插话/工具行从 interject 队列随流式
 // 块一起落盘（不单独 insertAbove——舞蹈间的位移错位是根因），且不得重复
 // 渲染。Enter 回显恰好在滚动区出现一次；派发后 interject 清空、自绘帧内
@@ -40,11 +52,7 @@ func TestInterjectDispatchedOnceWithStreamFlush(t *testing.T) {
 		t.Fatalf("回显不应残留在自绘帧内（已进滚动区）：%q", v)
 	}
 	// 排空链收尾（测试无事件循环，手动回环 drainNextMsg）
-	for m.scrollQ.draining {
-		next, c := m.Update(drainNextMsg{})
-		m = next.(Model)
-		_ = c
-	}
+	m, _ = drainAll(t, m)
 
 	// 工具调用/结果行：入 interject 后立即随 flush 派发（消息边界），不残留
 	m, cmd = ev(t, m, agent.ToolCallEvent{ID: "c1", Name: "bash", ArgsSummary: `{"cmd":"ls"}`})
@@ -55,11 +63,7 @@ func TestInterjectDispatchedOnceWithStreamFlush(t *testing.T) {
 	if len(m.interject) != 0 {
 		t.Fatalf("工具行应已派发，interject 残留 %d 条", len(m.interject))
 	}
-	for m.scrollQ.draining {
-		next, c := m.Update(drainNextMsg{})
-		m = next.(Model)
-		_ = c
-	}
+	m, _ = drainAll(t, m)
 
 	m, cmd = ev(t, m, agent.ToolResultEvent{ID: "c1", Name: "bash", Result: tool.Result{Output: `{"output":"a.txt"}`}})
 	joined = strings.Join(printedLines(cmd), "\n")
@@ -254,21 +258,13 @@ func TestInterjectToolResultOrder(t *testing.T) {
 	m = next.(Model)
 	_ = printedLines(cmd) // 回显落盘
 	// 排空
-	for m.scrollQ.draining {
-		next, c := m.Update(drainNextMsg{})
-		m = next.(Model)
-		_ = printedLines(c)
-	}
+	m, _ = drainAll(t, m)
 
 	// 2. 工具调用事件到达
 	m, cmd = ev(t, m, agent.ToolCallEvent{ID: "c1", Name: "bash", ArgsSummary: `{"cmd":"ls"}`})
 	_ = printedLines(cmd) // 工具调用行落盘
 	// 排空
-	for m.scrollQ.draining {
-		next, c := m.Update(drainNextMsg{})
-		m = next.(Model)
-		_ = printedLines(c)
-	}
+	m, _ = drainAll(t, m)
 
 	// 3. 工具执行期间用户再次输入
 	m.editor.Insert("插话1")
@@ -276,22 +272,14 @@ func TestInterjectToolResultOrder(t *testing.T) {
 	m = next.(Model)
 	_ = printedLines(cmd) // 插话1落盘
 	// 排空
-	for m.scrollQ.draining {
-		next, c := m.Update(drainNextMsg{})
-		m = next.(Model)
-		_ = printedLines(c)
-	}
+	m, _ = drainAll(t, m)
 
 	m.editor.Insert("插话2")
 	next, cmd = m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = next.(Model)
 	_ = printedLines(cmd) // 插话2落盘
 	// 排空
-	for m.scrollQ.draining {
-		next, c := m.Update(drainNextMsg{})
-		m = next.(Model)
-		_ = printedLines(c)
-	}
+	m, _ = drainAll(t, m)
 
 	// 4. 工具结果事件到达
 	m, cmd = ev(t, m, agent.ToolResultEvent{ID: "c1", Name: "bash", Result: tool.Result{Output: "ok"}})
@@ -325,17 +313,11 @@ func TestInterjectFlushWhileDraining(t *testing.T) {
 	// 在排空链进行中（draining=true）添加 interject
 	m.addInterject("排空中插话")
 
-	// 排空链继续
-	for m.scrollQ.draining {
-		next, c := m.Update(drainNextMsg{})
-		m = next.(Model)
-		if c != nil {
-			printed := printedLines(c)
-			joined := strings.Join(printed, "\n")
-			if strings.Contains(joined, "排空中插话") {
-				t.Fatalf("排空链进行中新增 interject 不应在本轮派发: %q", joined)
-			}
-		}
+	// 排空链继续：新入队条目不得在本轮派发
+	var during []string
+	m, during = drainAll(t, m)
+	if joined := strings.Join(during, "\n"); strings.Contains(joined, "排空中插话") {
+		t.Fatalf("排空链进行中新增 interject 不应在本轮派发: %q", joined)
 	}
 
 	// 排空链结束后，interject 应仍在队列中
@@ -355,32 +337,59 @@ func TestInterjectFlushWhileDraining(t *testing.T) {
 	}
 }
 
-// TestAddInterjectConcurrentSafety addInterject 并发安全（单线程事件循环下无竞争，
-// 但显式验证无数据竞争）。Go race detector 会捕获并发写 slice 的问题。
-func TestAddInterjectConcurrentSafety(t *testing.T) {
+// TestInterjectWhileBusyDeliveredToAgent 生成中 Enter 必须把原文交给 agent
+// （Submit 在 Running() 时转 Steering 收件箱）。回显是视觉、投递是语义，两者
+// 缺一即「插话不生效」——b9b1cb1 只留了视觉，实机表现为回显正常但零响应。
+func TestInterjectWhileBusyDeliveredToAgent(t *testing.T) {
+	var sent []string
 	m := New(Deps{
 		ModelName: "m",
 		Events:    closedEvents(),
-		Send:      func(string, []string) {},
+		Send:      func(text string, _ []string) { sent = append(sent, text) },
 	})
 	m.width, m.height = 80, 30
+	m.busy = true
+	m.stream.WriteString("正在输出第一行\n半")
 
-	// 顺序调用 addInterject（模拟事件循环串行化）
-	for i := 0; i < 100; i++ {
-		m.addInterject("并发测试")
+	m.editor.Insert("先停一下")
+	next, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(Model)
+
+	if len(sent) != 1 || sent[0] != "先停一下" {
+		t.Fatalf("插话须以原文投递一次，实际 %q", sent)
 	}
-
-	// 去重应只保留 1 条（同一内容、时间窗口内）
-	if len(m.interject) != 1 {
-		t.Fatalf("顺序 100 次相同内容应去重为 1 条，实际 %d 条", len(m.interject))
+	if strings.Contains(sent[0], "\x1b") || strings.Contains(sent[0], "> ") {
+		t.Fatalf("投递内容不得含回显样式：%q", sent[0])
 	}
+	if joined := strings.Join(printedLines(cmd), "\n"); strings.Count(joined, "先停一下") != 1 {
+		t.Fatalf("回显应落盘一次: %q", joined)
+	}
+}
 
-	// flush 派发
-	cmd, _ := m.flushPendingStream(false)
-	printed := printedLines(cmd)
-	joined := strings.Join(printed, "\n")
-	if strings.Count(joined, "并发测试") != 1 {
-		t.Fatalf("并发测试内容应只派发 1 次，实际 %d 次: %q", strings.Count(joined, "并发测试"), joined)
+// TestBusyEnterWithImagesDiscardsWithNotice 生成中带图插话无承载者（DEBT）：
+// 图片必须丢弃且出声，不能静默挂到用户的下一条消息上。
+func TestBusyEnterWithImagesDiscardsWithNotice(t *testing.T) {
+	var sent []string
+	m := New(Deps{
+		ModelName: "m",
+		Events:    closedEvents(),
+		Send:      func(text string, _ []string) { sent = append(sent, text) },
+	})
+	m.width, m.height = 80, 30
+	m.busy = true
+	m.pendingImages = []string{"a.png"}
+
+	next, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(Model)
+
+	if len(sent) != 0 {
+		t.Fatalf("无文本时不应投递，实际 %q", sent)
+	}
+	if len(m.pendingImages) != 0 {
+		t.Fatalf("图片应就地丢弃，实际残留 %d 张", len(m.pendingImages))
+	}
+	if joined := strings.Join(printedLines(cmd), "\n"); !strings.Contains(joined, "图片未发送") {
+		t.Fatalf("丢弃图片必须出声: %q", joined)
 	}
 }
 
@@ -409,11 +418,7 @@ func TestInterjectViewNoLeak(t *testing.T) {
 	_ = printedLines(cmd)
 
 	// 完成排空链
-	for m.scrollQ.draining {
-		next, c := m.Update(drainNextMsg{})
-		m = next.(Model)
-		_ = printedLines(c)
-	}
+	m, _ = drainAll(t, m)
 
 	view = m.View().Content
 	if strings.Contains(view, "测试内容") {
