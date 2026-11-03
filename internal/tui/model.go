@@ -86,6 +86,7 @@ type interjectEntry struct {
 }
 
 // interjectDedupWindow 去重时间窗口：500ms 内相同内容视为重复。
+// FIXME: 若需配置化改为从配置读取
 const interjectDedupWindow = 500 * time.Millisecond
 
 // addInterject 向插话队列添加条目，带去重。
@@ -96,20 +97,13 @@ func (m *Model) addInterject(content string) {
 		return // 空白内容不入队
 	}
 	now := time.Now().UnixNano()
-	h := hashContent(content)
-	// 检查现有队列中是否有相同哈希且在时间窗口内
+	h := content // 简单哈希：内容本身（内容通常较短），避免引入 crypto 依赖
 	for _, e := range m.interject {
 		if e.hash == h && now-e.time < int64(interjectDedupWindow) {
 			return // 去重：忽略重复提交
 		}
 	}
 	m.interject = append(m.interject, interjectEntry{content: content, hash: h, time: now})
-}
-
-// hashContent 计算内容的简单哈希（用于去重）。
-func hashContent(s string) string {
-	// 简单哈希：使用字符串本身作为键（内容通常较短），避免引入 crypto 依赖
-	return s
 }
 
 func New(deps Deps) Model {

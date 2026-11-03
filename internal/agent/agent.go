@@ -560,11 +560,9 @@ func (a *Agent) isArgsComplete(toolName string, args json.RawMessage) bool {
 	// 2. 语义完整性：按工具 Schema 的 required 字段校验
 	tl, ok := a.reg.Get(toolName)
 	if !ok {
-		// 未知工具：仅做语法校验，语义由工具执行层兜底
-		return true
+		return true // 未知工具：仅做语法校验，语义由工具执行层兜底
 	}
 
-	// 解析工具 Schema 的 required 字段
 	var schema map[string]any
 	if err := json.Unmarshal(tl.Schema(), &schema); err != nil {
 		return true // Schema 解析失败时放行，避免误拦
@@ -578,7 +576,6 @@ func (a *Agent) isArgsComplete(toolName string, args json.RawMessage) bool {
 		return true
 	}
 
-	// 反序列化参数并检查必填字段是否存在且非空
 	var argMap map[string]any
 	if err := json.Unmarshal(args, &argMap); err != nil {
 		return false // 反序列化失败视为不完整
@@ -592,7 +589,7 @@ func (a *Agent) isArgsComplete(toolName string, args json.RawMessage) bool {
 		if !exists || val == nil {
 			return false // 必填字段缺失
 		}
-		// 字符串类型的必填字段不得为空串
+		// 仅校验 string 空串；其他类型（[]/{}/0）零值由工具执行层兜底
 		if s, ok := val.(string); ok && s == "" {
 			return false
 		}
