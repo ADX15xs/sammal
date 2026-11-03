@@ -19,10 +19,11 @@ func applyEvent(t *testing.T, m Model, evs ...agent.Event) Model {
 	return m
 }
 
-// 思考流式只展示最新一行；ReasonFinal 撤行；答案文本照常流入。
-func TestReasoningStreamsSingleLineThenDrops(t *testing.T) {
-	m := New(Deps{ModelName: "m"})
-	m.width = 80
+// 思考流式只展示最新一行；ReasonFinal 把该行「下沉」进滚动区（不是撤走），
+// 答案文本照常流入——撤走会在滚动区留一个空洞（用户回显与答案之间的空行）。
+func TestThinkingLinePersistsOnceOnFinal(t *testing.T) {
+	m := New(Deps{ModelName: "m", Events: closedEvents()})
+	m.width, m.height = 80, 24
 	m = applyEvent(t, m,
 		agent.TurnStartedEvent{},
 		agent.ReasonDeltaEvent{Text: "第一行思考"},
@@ -41,15 +42,63 @@ func TestReasoningStreamsSingleLineThenDrops(t *testing.T) {
 		t.Fatalf("应只显示当前行: %q", lines)
 	}
 
-	m = applyEvent(t, m,
-		agent.ReasonFinalEvent{},
-		agent.TextDeltaEvent{Text: "答案"},
-	)
+	next, cmd := m.applyAgentEvent(agent.ReasonFinalEvent{})
+	m = next.(Model)
 	if m.thinking {
 		t.Error("ReasonFinal 后 thinking 应为 false")
 	}
+	prints := printedLines(cmd)
+	if len(prints) != 1 {
+		t.Fatalf("思考结束应恰落盘一行，实际 %d 行: %q", len(prints), prints)
+	}
+	plain := stripANSI(prints[0])
+	if !strings.Contains(plain, "第二行思考") {
+		t.Errorf("落盘行应含当前思考正文: %q", plain)
+	}
+	if strings.Contains(plain, "思考中") {
+		t.Errorf("已结束的思考不应再说「思考中」: %q", plain)
+	}
+	if strings.TrimSpace(plain) == "" {
+		t.Errorf("落盘行不得为空（会重新制造空洞）: %q", plain)
+	}
+
+	// 帧内思考行已让位，答案接在其后。
+	m = applyEvent(t, m, agent.TextDeltaEvent{Text: "答案"})
 	if lines := m.streamBlockLines(m.width); len(lines) != 1 || lines[0] != "答案" {
-		t.Fatalf("思考行应撤出视窗，仅剩答案: %q", lines)
+		t.Fatalf("思考行应已下沉，帧内只留答案: %q", lines)
+	}
+}
+
+// 只有计时、没有正文的思考也要落一行：否则帧缩 1 行而上无新增，空洞照旧。
+func TestThinkingLinePersistedEvenWithoutBody(t *testing.T) {
+	m := New(Deps{ModelName: "m", Events: closedEvents()})
+	m.width, m.height = 80, 24
+	m = applyEvent(t, m, agent.TurnStartedEvent{}, agent.ReasonDeltaEvent{Text: "\n"})
+
+	next, cmd := m.applyAgentEvent(agent.ReasonFinalEvent{})
+	m = next.(Model)
+	prints := printedLines(cmd)
+	if len(prints) != 1 {
+		t.Fatalf("无正文的思考也应落盘一行，实际 %q", prints)
+	}
+	if plain := stripANSI(prints[0]); !strings.Contains(plain, "思考") || strings.TrimSpace(plain) == "" {
+		t.Fatalf("落盘行应非空且标识为思考: %q", plain)
+	}
+}
+
+// 断流重连会作废本 attempt 的思考：作废内容不得下沉进滚动区。
+func TestThinkingNotPersistedOnStreamRestart(t *testing.T) {
+	m := New(Deps{ModelName: "m", Events: closedEvents()})
+	m.width, m.height = 80, 24
+	m = applyEvent(t, m, agent.TurnStartedEvent{}, agent.ReasonDeltaEvent{Text: "作废的思考"})
+
+	next, cmd := m.applyAgentEvent(agent.StreamRestartedEvent{Attempt: 1})
+	m = next.(Model)
+	if prints := printedLines(cmd); len(prints) != 0 {
+		t.Fatalf("重连作废的思考不应落盘: %q", prints)
+	}
+	if m.thinking {
+		t.Error("重连后 thinking 应为 false")
 	}
 }
 

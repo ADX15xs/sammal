@@ -371,11 +371,9 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		cmd = m.armTick()
 
 	case agent.TextDeltaEvent:
-		if m.thinking {
-			// 文本开始：思考行即刻让位（ReasonFinal 已保证，此处兜底）。
-			m.thinking = false
-			m.resetReason()
-		}
+		// 文本开始：思考行让位（ReasonFinal 已保证，此处兜底）。同样是「下沉」
+		// 而非「撤走」，否则异常时序下照样留空洞。
+		closeCmd := m.closeThinking()
 		m.stream.WriteString(ev.Text)
 		// 渐进落盘：闭合行超过触发线（或有待发插话/工具行）即把头部行落进
 		// 滚动缓冲区，帧内只留尾部窗口。整条回复攒到定稿一次性落盘会在长
@@ -390,6 +388,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 				m.streamPrinted = true
 			}
 		}
+		cmd = tea.Batch(closeCmd, cmd)
 
 	case agent.ReasonDeltaEvent:
 		m.thinking = true
@@ -397,8 +396,7 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		cmd = m.armTick()
 
 	case agent.ReasonFinalEvent:
-		m.thinking = false
-		m.resetReason()
+		cmd = m.closeThinking()
 
 	case agent.StreamRestartedEvent:
 		// 重连即重新生成：旧增量全部作废。已渐进落盘的部分收不回来，
@@ -517,6 +515,48 @@ func (m Model) reasonLine() string {
 		return m.reasonCur
 	}
 	return lastLine(m.reason.String())
+}
+
+// thinkingLine 思考行的纯文本（单行、不超终端宽）。closed=true 表示思考已结束，
+// 下沉进滚动区时用它——措辞不再说「思考中」。
+func (m Model) thinkingLine(width int, closed bool) string {
+	line := "- 思考中"
+	if closed {
+		line = "- 思考"
+	}
+	if m.turnStart.After(time.Time{}) {
+		line = fmt.Sprintf("%s %s", line, human.Duration(time.Since(m.turnStart)))
+	}
+	cur := m.reasonLine()
+	if cur == "" {
+		return clipLine(line, width-1)
+	}
+	prefix := line + " | "
+	body := strings.ReplaceAll(cur, "\t", " ")
+	// 前缀（"思考中 12s"）固定做锚点，正文超宽走尾部跟随：最新 token
+	// 永远可见、无省略号。不做定时动画（见 turnTick）。
+	if bodyW := width - 1 - widthOf(prefix); bodyW > 0 {
+		return prefix + tailWindow(body, bodyW)
+	}
+	return clipLine(prefix+body, width-1)
+}
+
+// closeThinking 结束思考：先把当前显示的那一行下沉进滚动区，再撤帧内思考行。
+// 滚动区 +1 / 帧 −1 正好抵消，思考行原地保留；直接撤行会在滚动区留一个空洞
+// （实机表现为用户回显与答案首行之间多一条空行）。
+// 只落这一行、不落全文：落盘增量与思考长度无关，/resume 也不受影响。
+func (m *Model) closeThinking() tea.Cmd {
+	if !m.thinking {
+		return nil
+	}
+	line := m.thinkingLine(m.width, true)
+	if strings.TrimSpace(line) == "" {
+		line = "- 思考"
+	}
+	cmd := m.printScroll(dim(line))
+	m.thinking = false
+	m.resetReason()
+	return cmd
 }
 
 // armTick 生成中挂一个心跳，驱动计时器与状态栏刷新。tickArmed 去重：
@@ -660,24 +700,9 @@ func (m Model) streamBlockLines(width int) []string {
 	var lines []string
 	if m.thinking {
 		// 思考只展示最新一行（dsh 方案）：恒定一行的自绘面 + 跳动的计时
-		// 数字就是「还活着」的口子。定稿即从视窗丢弃，全文在日志里。
-		line := "- 思考中"
-		if m.turnStart.After(time.Time{}) {
-			line = fmt.Sprintf("- 思考中 %s", human.Duration(time.Since(m.turnStart)))
-		}
-		if cur := m.reasonLine(); cur != "" {
-			// 前缀（"思考中 12s"）固定做锚点，正文超宽走尾部跟随：
-			// 最新 token 永远可见、无省略号。不做定时动画（见 turnTick）。
-			prefix := line + " | "
-			body := strings.ReplaceAll(cur, "\t", " ")
-			if bodyW := width - 1 - widthOf(prefix); bodyW > 0 {
-				lines = append(lines, dim(prefix+tailWindow(body, bodyW)))
-			} else {
-				lines = append(lines, dim(clipLine(prefix+body, width-1)))
-			}
-		} else {
-			lines = append(lines, dim(clipLine(line, width-1)))
-		}
+		// 数字就是「还活着」的口子。结束时不撤走而是下沉进滚动区
+		// （closeThinking），全文仍在日志里。
+		lines = append(lines, dim(m.thinkingLine(width, false)))
 	}
 	text := m.stream.String()
 	if text == "" && len(m.interject) == 0 {
