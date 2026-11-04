@@ -76,10 +76,12 @@ type fixture struct {
 	sess *session.Session
 	reg  *tool.Registry
 	cp   *checkpoint.Store
+	jobs *tool.JobRegistry
 	work string
 }
 
-// newFixture 装配真实 session + checkpoint + 工具；tools 非空时替换默认六件套。
+// newFixture 装配真实 session + checkpoint + 工具（与 main 同构：bash 挂
+// 后台注册表，job 双件在册）；tools 非空时替换默认列表。
 func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -96,14 +98,23 @@ func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture
 	if err != nil {
 		t.Fatal(err)
 	}
+	jobs := tool.NewJobRegistry()
+	jobs.OnComplete = func(info tool.JobInfo) {
+		_ = sess.Append(session.TypeJobCompleted, session.JobCompletedData{
+			ID: info.ID, Command: info.Command, Status: info.Status, ExitCode: info.ExitCode,
+			Tail: info.Tail, TotalBytes: info.TotalBytes, DurationMs: info.DurationMs,
+		})
+	}
 	if len(tools) == 0 {
 		tools = []tool.Tool{
 			&tool.ReadTool{WorkDir: work},
 			&tool.WriteTool{WorkDir: work},
 			&tool.EditTool{WorkDir: work},
-			&tool.BashTool{WorkDir: work, Shell: "sh"},
+			&tool.BashTool{WorkDir: work, Shell: "sh", Jobs: jobs},
 			&tool.GrepTool{WorkDir: work},
 			&tool.GlobTool{WorkDir: work},
+			&tool.JobOutputTool{Jobs: jobs},
+			&tool.JobKillTool{Jobs: jobs},
 		}
 	}
 	reg := tool.NewRegistry(tools...)
@@ -121,10 +132,11 @@ func newFixture(t *testing.T, fp provider.Provider, tools ...tool.Tool) *fixture
 	// agent 当前持有的那个，否则其句柄存活到 TempDir 清理，Windows 下报
 	// 「正由另一进程使用」。
 	t.Cleanup(func() {
+		jobs.Close()
 		ag.sess.Close()
 		sess.Close()
 	})
-	return &fixture{ag: ag, sess: sess, reg: reg, cp: cp, work: work}
+	return &fixture{ag: ag, sess: sess, reg: reg, cp: cp, jobs: jobs, work: work}
 }
 
 func (f *fixture) system() string {
