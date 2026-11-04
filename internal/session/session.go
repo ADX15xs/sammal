@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"sammal/internal/provider"
@@ -28,6 +29,7 @@ const (
 	TypeToolResult         = "tool/result"
 	TypeRequestHeader      = "request/header"
 	TypeCompactionHappened = "compaction/happened"
+	TypeJobCompleted       = "job/completed"
 	TypeTurnEnd            = "turn/end"
 )
 
@@ -119,6 +121,20 @@ type TurnEndData struct {
 	Synthetic  bool   `json:"synthetic,omitempty"` // 崩溃恢复补发的闭合事件
 }
 
+// JobCompletedData 后台 bash job 的结算事实（M5）。job 事件由注册表回调
+// 在结算时刻落盘（可与 turn 并发），投影时按日志序归属到紧随其后的第一个
+// user/message 的 turn 尾部（M5 归属规则：纯日志序确定性函数，I1 重放
+// 依赖）。Tail 每流截尾合计 ≤8KB，对齐剪枝阈值量级。
+type JobCompletedData struct {
+	ID         string `json:"id"`
+	Command    string `json:"command"`
+	Status     string `json:"status"` // done | failed | killed
+	ExitCode   int    `json:"exitCode,omitempty"`
+	Tail       string `json:"tail,omitempty"`
+	TotalBytes int64  `json:"totalBytes"`
+	DurationMs int64  `json:"durationMs"`
+}
+
 // modelToolBudget 是 deriveMessages 对工具结果的投影预算（I5 的截断
 // 策略）。必须是常量：请求前缀的确定性（I1/I2）依赖它。
 const modelToolBudget = 24 * 1024
@@ -132,6 +148,7 @@ type Session struct {
 	turn   int
 	header Header
 
+	mu     sync.RWMutex // 保护 events/seq/file（job 结算回调与 turn 并发落盘）
 	assets *Assets
 }
 
@@ -306,12 +323,15 @@ func splitLines(data []byte) [][]byte {
 	return out
 }
 
-// Append 追加一个事件：分配 seq/ts，写盘并缓存。
+// Append 追加一个事件：分配 seq/ts，写盘并缓存。并发安全（M5：job 结算
+// 回调可与 turn 并发落盘）。
 func (s *Session) Append(evType string, data any) error {
 	raw, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.seq++
 	env := Envelope{
 		Seq:  s.seq,
@@ -331,11 +351,23 @@ func (s *Session) Append(evType string, data any) error {
 	return nil
 }
 
-func (s *Session) Path() string       { return s.path }
-func (s *Session) Dir() string        { return filepath.Dir(s.path) }
-func (s *Session) Header() Header     { return s.header }
-func (s *Session) Turn() int          { return s.turn }
-func (s *Session) Events() []Envelope { return s.events }
+// snapshot 返回事件的稳定副本：迭代期间并发 Append 不会撕裂（读侧只承担
+// 一次拷贝；事件一经落盘不可变）。
+func (s *Session) snapshot() []Envelope {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Envelope, len(s.events))
+	copy(out, s.events)
+	return out
+}
+
+func (s *Session) Path() string   { return s.path }
+func (s *Session) Dir() string    { return filepath.Dir(s.path) }
+func (s *Session) Header() Header { return s.header }
+func (s *Session) Turn() int      { return s.turn }
+
+// Events 返回事件的稳定副本。
+func (s *Session) Events() []Envelope { return s.snapshot() }
 
 // Assets 返回会话的图片资产存储（<会话目录>/assets）。
 func (s *Session) Assets() *Assets {
@@ -360,6 +392,8 @@ type projector struct {
 	msgs    []taggedMessage
 	summary string
 	turn    int // 已闭合的 turn 数；进行中的 turn = turn+1
+
+	pendingJobs []*JobCompletedData // 已结算、待归属到下一个 user turn 的 job（M5）
 }
 
 type taggedMessage struct {
@@ -401,10 +435,22 @@ func (p *projector) apply(env Envelope) {
 		if d.Kind == ChunkReasoning {
 			return // 思考增量只落盘不投影：发给模型的历史不含思考（I5）
 		}
+	case TypeJobCompleted:
+		var d JobCompletedData
+		json.Unmarshal(env.Data, &d)
+		p.pendingJobs = append(p.pendingJobs, &d)
 	case TypeUserMessage:
 		var d UserMessageData
 		json.Unmarshal(env.Data, &d)
-		p.msgs = append(p.msgs, taggedMessage{msg: provider.Message{Role: "user", Content: provider.ContentFromText(withDatePrefix(d.Text, d.Date))}, turn: cur, seq: env.Seq})
+		text := withDatePrefix(d.Text, d.Date)
+		// M5 归属规则：job 结算注入到日志序中紧随其后的第一个 user turn
+		// 尾部。骑 user turn = I2 豁免区；随该 turn 被压缩遮蔽而消失，随
+		// 分支重放按同一日志序还原——投影是日志的确定性函数（I1）。
+		if len(p.pendingJobs) > 0 {
+			text += "\n\n" + jobNote(p.pendingJobs)
+			p.pendingJobs = nil
+		}
+		p.msgs = append(p.msgs, taggedMessage{msg: provider.Message{Role: "user", Content: provider.ContentFromText(text)}, turn: cur, seq: env.Seq})
 	case TypeAssistantMessage:
 		var d AssistantMessageData
 		json.Unmarshal(env.Data, &d)
@@ -449,11 +495,32 @@ func (p *projector) messages() []provider.Message {
 	return out
 }
 
+// jobNote 把待归属的 job 结算渲染为注入块（M5）。格式必须确定性：
+// 注入随 user turn 进请求前缀，I1 重放逐字节依赖。
+func jobNote(jobs []*JobCompletedData) string {
+	var b strings.Builder
+	b.WriteString("[background jobs completed since your last message]")
+	for _, j := range jobs {
+		switch j.Status {
+		case "done":
+			fmt.Fprintf(&b, "\n[%s done] %s", j.ID, tool.FirstLine(j.Command))
+		case "failed":
+			fmt.Fprintf(&b, "\n[%s failed exit %d] %s", j.ID, j.ExitCode, tool.FirstLine(j.Command))
+		default:
+			fmt.Fprintf(&b, "\n[%s killed] %s", j.ID, tool.FirstLine(j.Command))
+		}
+		if j.Tail != "" {
+			b.WriteString("\n" + j.Tail)
+		}
+	}
+	return b.String()
+}
+
 // DeriveMessages 从日志投影模型历史（resume/compaction/回放共用）。
 // 工具结果按 ForModel 预算投影（I5：投影不改日志）。
 func (s *Session) DeriveMessages() []provider.Message {
 	p := &projector{}
-	for _, env := range s.events {
+	for _, env := range s.snapshot() {
 		p.apply(env)
 	}
 	return p.messages()
@@ -463,7 +530,7 @@ func (s *Session) DeriveMessages() []provider.Message {
 // 与 DeriveMessages 同一投影器语义）。
 func (s *Session) MessagesUpTo(limit int) []provider.Message {
 	p := &projector{}
-	for _, env := range s.events {
+	for _, env := range s.snapshot() {
 		if env.Seq >= limit {
 			break
 		}
@@ -479,7 +546,7 @@ func (s *Session) MessagesUpTo(limit int) []provider.Message {
 func (s *Session) ReplayRequestHashes(system string, defs []provider.ToolDef) ([][2]string, error) {
 	var out [][2]string
 	p := &projector{}
-	for _, env := range s.events {
+	for _, env := range s.snapshot() {
 		if env.Type == TypeRequestHeader {
 			var d RequestHeaderData
 			json.Unmarshal(env.Data, &d)

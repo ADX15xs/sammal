@@ -375,6 +375,49 @@ func TestReplayRequestHashesWithImages(t *testing.T) {
 	}
 }
 
+// M5 归属规则单元：job/completed 注入紧随其后的第一个 user turn 尾部，
+// 投影是日志的确定性函数（重放两次逐字节一致）。
+func TestJobInjectionAttribution(t *testing.T) {
+	s := newSession(t)
+	defer s.Close()
+
+	s.Append(TypeUserMessage, UserMessageData{Text: "first"})
+	s.Append(TypeJobCompleted, JobCompletedData{ID: "j1", Command: "npm run dev\nlistening :3000", Status: "done", Tail: "listening on :3000", TotalBytes: 18})
+	s.Append(TypeJobCompleted, JobCompletedData{ID: "j2", Command: "make test", Status: "failed", ExitCode: 2, TotalBytes: 9})
+	s.Append(TypeUserMessage, UserMessageData{Text: "second", Date: "2026-11-02"})
+
+	msgs := s.DeriveMessages()
+	var users []string
+	for _, m := range msgs {
+		if m.Role == "user" {
+			users = append(users, provider.ContentText(m.Content))
+		}
+	}
+	if len(users) != 2 {
+		t.Fatalf("user 消息数 = %d", len(users))
+	}
+	if strings.Contains(users[0], "background jobs completed") {
+		t.Fatalf("注入泄漏到前一 turn：%q", users[0])
+	}
+	for _, want := range []string{
+		"[background jobs completed since your last message]",
+		"[j1 done] npm run dev",
+		"listening on :3000",
+		"[j2 failed exit 2] make test",
+	} {
+		if !strings.Contains(users[1], want) {
+			t.Fatalf("归属 turn 缺少 %q：\n%s", want, users[1])
+		}
+	}
+	// 确定性：重放两次逐字节一致。
+	again := s.DeriveMessages()
+	for i, m := range msgs {
+		if provider.ContentText(m.Content) != provider.ContentText(again[i].Content) {
+			t.Fatalf("投影不确定：消息 %d", i)
+		}
+	}
+}
+
 
 // 模型在工具 step 吐的纯换行正文不该在 /resume 回放里变成一行空行
 // （实机 20261104-174534-5500：/resume 剩 1 空行）。
