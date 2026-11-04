@@ -615,12 +615,12 @@ func (s *Session) Transcript() []string {
 			for _, tc := range d.ToolCalls {
 				lines = append(lines, dimLine("-> "+tc.Function.Name))
 			}
-			if d.Text != "" {
-				mark := ""
-				if d.Interrupted {
-					mark = "（中断）"
-				}
-				lines = append(lines, trimTrailing(d.Text)+mark)
+			text := strings.Trim(d.Text, "\n")
+			if d.Interrupted {
+				text += "（中断）"
+			}
+			if strings.TrimSpace(text) != "" {
+				lines = append(lines, text)
 			}
 		case TypeToolResult:
 			var d ToolResultData
@@ -634,8 +634,6 @@ func (s *Session) Transcript() []string {
 }
 
 func dimLine(s string) string { return "| " + s }
-
-func trimTrailing(s string) string { return strings.TrimRight(s, "\n") }
 
 // SessionInfo 是会话列表条目。
 type SessionInfo struct {

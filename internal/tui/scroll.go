@@ -268,6 +268,14 @@ type frameHoldState struct {
 func (m Model) printScroll(texts ...string) tea.Cmd {
 	any := false
 	for _, text := range texts {
+		// 模型会给正文加换行 padding（实机 20261104-191314-6300：定稿 text
+		// 以两个换行开头、以四个换行结尾）。前导换行会变成思考行与答案首行
+		// 之间的空行，尾部换行由 splitForPrint 自行收敛；整段无可见字符的
+		// 批次（只调工具的 step）直接丢弃。正文中间的段落空行不受影响。
+		text = strings.Trim(text, "\n")
+		if strings.TrimSpace(ansi.Strip(text)) == "" {
+			continue
+		}
 		batches := splitForPrint(text, m.width, m.printMargin())
 		if len(batches) > 0 {
 			m.scrollQ.pending = append(m.scrollQ.pending, batches...)

@@ -374,3 +374,45 @@ func TestReplayRequestHashesWithImages(t *testing.T) {
 		t.Error("资产缺失时重放应不一致（降级语义）")
 	}
 }
+
+
+// 模型在工具 step 吐的纯换行正文不该在 /resume 回放里变成一行空行
+// （实机 20261104-174534-5500：/resume 剩 1 空行）。
+func TestTranscriptSkipsBlankOnlyAssistantText(t *testing.T) {
+	s := newSession(t)
+	if err := s.Append(TypeAssistantMessage, AssistantMessageData{
+		Text: "\n\n\n",
+		ToolCalls: []provider.ToolCall{{
+			ID: "1", Type: provider.ToolTypeFunction,
+			Function: provider.FunctionCall{Name: "grep", Arguments: "{}"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.Append(TypeAssistantMessage, AssistantMessageData{Text: "正文\n\n"})
+	s.Append(TypeAssistantMessage, AssistantMessageData{Text: "\n", Interrupted: true})
+
+	lines := s.Transcript()
+	if len(lines) != 3 {
+		t.Fatalf("转录应为 工具行/正文/中断标记 三行: %q", lines)
+	}
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) == "" {
+			t.Fatalf("转录含空行: %q", lines)
+		}
+	}
+	if lines[0] != "| -> grep" || lines[1] != "正文" || lines[2] != "（中断）" {
+		t.Fatalf("转录内容不符: %q", lines)
+	}
+}
+
+
+// /resume 回放同样要裁掉模型正文前后的换行 padding，中间段落空行保留。
+func TestTranscriptTrimsBlankPadding(t *testing.T) {
+	s := newSession(t)
+	s.Append(TypeAssistantMessage, AssistantMessageData{Text: "\n\n第一段\n\n第二段\n\n\n"})
+	lines := s.Transcript()
+	if len(lines) != 1 || lines[0] != "第一段\n\n第二段" {
+		t.Fatalf("转录 = %q, want 单条裁净 padding 的正文", lines)
+	}
+}

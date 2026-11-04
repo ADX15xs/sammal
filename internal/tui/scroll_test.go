@@ -471,3 +471,89 @@ func TestFrameHoldWhileDraining(t *testing.T) {
 		t.Fatalf("排空后帧高应落地新值，仍为 %d", h3)
 	}
 }
+
+
+// 只调工具的 step 里模型会吐纯换行正文（实机 20261104-174534-5500
+// seq101/102 text="\n\n\n"）：整段无可见字符时不落盘；含正文的批次里的
+// 段落空行必须保留。
+func TestPrintScrollSkipsBlankOnlyText(t *testing.T) {
+	m := New(Deps{ModelName: "t"})
+	m.width = 80
+	m.height = 40
+
+	if cmd := m.printScroll("\n\n\n"); cmd != nil {
+		t.Fatalf("纯换行正文不应落盘: %q", printedLines(cmd))
+	}
+	if len(m.scrollQ.pending) != 0 {
+		t.Fatalf("纯换行正文不应入队: %q", m.scrollQ.pending)
+	}
+	if cmd := m.printScroll(dim("  \n ")); cmd != nil {
+		t.Fatalf("着色纯空白不应落盘: %q", printedLines(cmd))
+	}
+	cmd := m.printScroll("a\n\nb")
+	if cmd == nil {
+		t.Fatal("含正文的批次应正常落盘")
+	}
+	if got := printedLines(cmd); len(got) != 1 || got[0] != "a\n\nb" {
+		t.Fatalf("正文中的段落空行被误删: %q", got)
+	}
+}
+
+// 工具环端到端：思考行下沉后紧跟「纯换行正文 + 工具调用」，屏幕上
+// 思考行与工具行之间不得出现空行。
+func TestBlankOnlyToolStepHasNoBlankLine(t *testing.T) {
+	m := New(Deps{ModelName: "m", Events: closedEvents()})
+	m.width = 80
+	m.height = 40
+
+	var printed []string
+	step := func(e agent.Event) {
+		next, cmd := m.applyAgentEvent(e)
+		m = next.(Model)
+		printed = append(printed, printedLines(cmd)...)
+		for m.scrollQ.draining {
+			next, cmd := m.Update(drainNextMsg{})
+			m = next.(Model)
+			printed = append(printed, printedLines(cmd)...)
+		}
+	}
+	step(agent.TurnStartedEvent{})
+	step(agent.ReasonDeltaEvent{Text: "先看看仓库里有什么"})
+	step(agent.ReasonFinalEvent{})
+	step(agent.TextDeltaEvent{Text: "\n\n\n"})
+	step(agent.ToolCallEvent{ID: "1", Name: "grep", ArgsSummary: "x"})
+
+	var sawThinking, sawTool bool
+	for _, ln := range printed {
+		plain := strings.TrimSpace(ansi.Strip(ln))
+		if plain == "" {
+			t.Fatalf("出现纯空白落盘批: %q（全部 %q）", ln, printed)
+		}
+		if strings.Contains(plain, "- 思考") {
+			sawThinking = true
+		}
+		if strings.Contains(plain, "-> grep") {
+			sawTool = true
+		}
+	}
+	if !sawThinking || !sawTool {
+		t.Fatalf("思考行/工具行缺失: %q", printed)
+	}
+}
+
+
+// 模型正文前后的换行 padding 不该变成思考行与答案首行之间的空行；
+// 正文中间的段落空行必须保留（实机 20261104-191314-6300）。
+func TestPrintScrollTrimsBlankPadding(t *testing.T) {
+	m := New(Deps{ModelName: "t"})
+	m.width = 80
+	m.height = 40
+	cmd := m.printScroll("\n\n第一段\n\n第二段\n\n\n")
+	if cmd == nil {
+		t.Fatal("含正文的批次应正常落盘")
+	}
+	got := printedLines(cmd)
+	if len(got) != 1 || got[0] != "第一段\n\n第二段" {
+		t.Fatalf("padding 未裁净或段落空行被误删: %q", got)
+	}
+}
