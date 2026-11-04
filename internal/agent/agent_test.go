@@ -572,6 +572,45 @@ func TestSteeringBatchMergedIntoOneUserMessage(t *testing.T) {
 	}
 }
 
+// 同一批里的相同内容不折叠：照样逐条编号，条数一条不少。
+// 是否把两条一样的「继续」按一次执行，由模型判断——投递层替它去重，
+// 会连用户真想发两遍的意图一起吃掉。
+func TestSteeringIdenticalInterjectsNotCollapsed(t *testing.T) {
+	fp := &fakeProvider{streams: [][]provider.Chunk{
+		toolCallChunks("c1", "write", `{"path":"s.txt","content":"s"}`),
+		textChunks("after steering"),
+	}}
+	slow := newSlowTool(300 * time.Millisecond)
+	fx := newFixture(t, fp, slow)
+	events := fx.ag.Events()
+
+	go fx.ag.Run(context.Background(), "q1")
+	waitFor(t, slow.started)
+	fx.ag.Steering("继续")
+	fx.ag.Steering("继续")
+	drainEvents(t, events, turnEnded)
+
+	var absorbed []string
+	for _, msg := range fp.calls[1].Messages {
+		if msg.Role == "user" && strings.Contains(provider.ContentText(msg.Content), "继续") {
+			absorbed = append(absorbed, provider.ContentText(msg.Content))
+		}
+	}
+	if len(absorbed) != 1 {
+		t.Fatalf("同批插话应合并成 1 条 user 消息，实际 %d 条: %q", len(absorbed), absorbed)
+	}
+	body := absorbed[0]
+	if !strings.Contains(body, "2 条") {
+		t.Errorf("合并消息应标明批次大小: %q", body)
+	}
+	if n := strings.Count(body, "继续"); n != 2 {
+		t.Errorf("相同内容不应折叠，出现 %d 次（应为 2）: %q", n, body)
+	}
+	if !strings.Contains(body, "1. 继续") || !strings.Contains(body, "2. 继续") {
+		t.Errorf("两条都应有自己的序号: %q", body)
+	}
+}
+
 // 单条插话的日志形态不变：原样写入，不加抬头、不加序号。
 func TestSteeringSingleMessageUnchanged(t *testing.T) {
 	fp := &fakeProvider{streams: [][]provider.Chunk{

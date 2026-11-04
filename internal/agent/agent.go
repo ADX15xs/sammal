@@ -391,6 +391,8 @@ func (a *Agent) drainInbox() []string {
 // mergeInterjects 把同一批插话合成一条 user 消息。单条原样返回（日志形态
 // 与旧的逐条行为逐字节一致）；多条加批次抬头与序号——序号是「逐条回应」
 // 可判定化的唯一抓手，抬头则消除「后一条覆盖前一条」的解读空间。
+// 内容相同的条目照样逐条编号、不折叠：按一次还是分别执行属语义判断，交给
+// 模型；在这里去重会连用户真想发两遍的意图一起吃掉。
 func mergeInterjects(texts []string) string {
 	if len(texts) == 1 {
 		return texts[0]
