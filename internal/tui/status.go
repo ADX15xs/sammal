@@ -47,6 +47,13 @@ func (m Model) statusLine() string {
 			statusSeg{text: m.ctxPart(), pri: 1},
 		)
 	}
+	// 后台 job 徽标（M5）：运行数 >0 才出现。决策信息（有无在跑的东西），
+	// 但让位于 ctx/cache——窄终端下丢弃顺序同 cache。
+	if m.deps.Jobs != nil {
+		if n := m.deps.Jobs.ActiveCount(); n > 0 {
+			segs = append(segs, statusSeg{text: fmt.Sprintf("bg %d", n), pri: 3})
+		}
+	}
 	if m.busy && m.toolCalls > 0 {
 		segs = append(segs, statusSeg{text: fmt.Sprintf("工具 %d", m.toolCalls), pri: 5})
 	}

@@ -39,6 +39,9 @@ type Deps struct {
 	ContextWindow int
 	// StartupHints 启动即打印的提示行（滚动区常驻，如 api_key_env 缺失警告）。
 	StartupHints []string
+	// Jobs 后台 job 注册表（M5）：状态栏徽标、/jobs 与退出警告的数据源；
+	// nil = 未装配（测试可省）。
+	Jobs *tool.JobRegistry
 }
 
 type Model struct {
@@ -103,16 +106,29 @@ func New(deps Deps) Model {
 func (m Model) InputText() string { return m.editor.Text() }
 
 func (m Model) Init() tea.Cmd {
+	var cmds []tea.Cmd
 	if len(m.deps.StartupHints) > 0 {
-		return tea.Batch(listenAgent(m.deps.Events),
-			m.printScroll(dim("[!] "+strings.Join(m.deps.StartupHints, "\n  "))))
+		cmds = append(cmds, m.printScroll(dim("[!] "+strings.Join(m.deps.StartupHints, "\n  "))))
 	}
-	return listenAgent(m.deps.Events)
+	cmds = append(cmds, listenAgent(m.deps.Events))
+	if m.deps.Jobs != nil {
+		cmds = append(cmds, listenJobs(m.deps.Jobs.Settled()))
+	}
+	return tea.Batch(cmds...)
 }
 
 type agentEventMsg struct{ ev agent.Event }
 type agentClosedMsg struct{}
-type turnTickMsg struct{} // 生成中的每秒心跳：刷新计时器/状态栏
+type turnTickMsg struct{}   // 生成中的每秒心跳：刷新计时器/状态栏
+type jobSettledMsg struct{} // 后台 job 结算：刷新状态栏徽标
+
+// listenJobs 等 job 结算通知；通道不关闭，程序退出即随进程终止。
+func listenJobs(ch <-chan tool.JobInfo) tea.Cmd {
+	return func() tea.Msg {
+		<-ch
+		return jobSettledMsg{}
+	}
+}
 
 func listenAgent(ch <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
@@ -144,6 +160,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentEventMsg:
 		return m.applyAgentEvent(msg.ev)
+
+	case jobSettledMsg:
+		return m, listenJobs(m.deps.Jobs.Settled()) // 徽标随重渲染自动刷新
 
 	case turnTickMsg:
 		return m.turnTick()
@@ -249,6 +268,19 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.quitArmed {
 			return m, tea.Quit
+		}
+		// 退出警告（M5）：存在运行中 job 时，第一次 ctrl+c 只警告——
+		// 退出会击杀全部 job（孤儿进程继续跑，输出不再可收取）。
+		if m.deps.Jobs != nil {
+			if n := m.deps.Jobs.ActiveCount(); n > 0 {
+				m.quitArmed = true
+				return m, tea.Batch(
+					m.printScroll(dim(fmt.Sprintf("| ⚠ %d 个后台 job 正在运行：退出会将其全部击杀（输出不再可收取）。再按一次 ctrl+c 确认退出", n))),
+					tea.Tick(3*time.Second, func(time.Time) tea.Msg {
+						return quitArmExpiredMsg{}
+					}),
+				)
+			}
 		}
 		if m.editor.Empty() {
 			return m, tea.Quit
@@ -489,77 +521,6 @@ func (m Model) applyAgentEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(listenAgent(m.deps.Events), cmd)
 }
 
-// appendReason 追加思考增量并维护「当前行」缓存：增量按 token 到达，
-// 大多不含换行——只有换行时才把缓存行落定、开新行。渲染取当前行，
-// 所以同一行内的每个 token 都能看到流畅的逐词增长（而非只闪最后一个）。
-func (m *Model) appendReason(delta string) {
-	for {
-		if i := strings.IndexByte(delta, '\n'); i >= 0 {
-			m.reasonCur = "" // 行闭合，开新行
-			delta = delta[i+1:]
-			continue
-		}
-		m.reasonCur += delta
-		return
-	}
-}
-
-func (m *Model) resetReason() {
-	m.reason.Reset()
-	m.reasonCur = ""
-}
-
-// reasonLine 当前正在书写的思考行（无内容时回退到累积文本的最后一行，
-// 覆盖首块增量前有历史行的边界）。
-func (m Model) reasonLine() string {
-	if m.reasonCur != "" {
-		return m.reasonCur
-	}
-	return lastLine(m.reason.String())
-}
-
-// thinkingLine 思考行的纯文本（单行、不超终端宽）。closed=true 表示思考已结束，
-// 下沉进滚动区时用它——措辞不再说「思考中」。
-func (m Model) thinkingLine(width int, closed bool) string {
-	line := "- 思考中"
-	if closed {
-		line = "- 思考"
-	}
-	if m.turnStart.After(time.Time{}) {
-		line = fmt.Sprintf("%s %s", line, human.Duration(time.Since(m.turnStart)))
-	}
-	cur := m.reasonLine()
-	if cur == "" {
-		return clipLine(line, width-1)
-	}
-	prefix := line + " | "
-	body := strings.ReplaceAll(cur, "\t", " ")
-	// 前缀（"思考中 12s"）固定做锚点，正文超宽走尾部跟随：最新 token
-	// 永远可见、无省略号。不做定时动画（见 turnTick）。
-	if bodyW := width - 1 - widthOf(prefix); bodyW > 0 {
-		return prefix + tailWindow(body, bodyW)
-	}
-	return clipLine(prefix+body, width-1)
-}
-
-// closeThinking 结束思考：先把当前显示的那一行下沉进滚动区，再撤帧内思考行。
-// 滚动区 +1 / 帧 −1 正好抵消，思考行原地保留；直接撤行会在滚动区留一个空洞
-// （实机表现为用户回显与答案首行之间多一条空行）。
-// 只落这一行、不落全文：落盘增量与思考长度无关，/resume 也不受影响。
-func (m *Model) closeThinking() tea.Cmd {
-	if !m.thinking {
-		return nil
-	}
-	line := m.thinkingLine(m.width, true)
-	if strings.TrimSpace(line) == "" {
-		line = "- 思考"
-	}
-	cmd := m.printScroll(dim(line))
-	m.thinking = false
-	m.resetReason()
-	return cmd
-}
-
 // armTick 生成中挂一个心跳，驱动计时器与状态栏刷新。tickArmed 去重：
 // 事件高频到达时（每个 reasoning 增量都会尝试挂表），保证任意时刻至多
 // 一个未触发的 tick，否则定时器指数堆积。延时对齐 turnStart 的整秒边界：
@@ -591,44 +552,6 @@ func (m Model) turnTick() (tea.Model, tea.Cmd) {
 // spinnerFrames 等待期 spinner 的帧序列：心跳每秒推进一帧，给「还活着」
 // 一个可见信号（turn 开始后由跳动的计时数字接管）。
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-
-// lastLine 返回文本最后一个非空行（思考流式只展示最新一行）。
-func lastLine(s string) string {
-	s = strings.TrimRight(s, "\n")
-	if i := strings.LastIndex(s, "\n"); i >= 0 {
-		s = s[i+1:]
-	}
-	return s
-}
-
-const (
-	ansiDim    = "\x1b[2m"
-	ansiCyan   = "\x1b[36m"
-	ansiRed    = "\x1b[31m"
-	ansiYellow = "\x1b[33m"
-	ansiReset  = "\x1b[0m"
-)
-
-func dim(s string) string      { return ansiDim + s + ansiReset }
-func errStyle(s string) string { return ansiRed + s + ansiReset }
-
-// renderUserEcho 用户消息的滚动区回显：首行加前缀，续行原样。
-func renderUserEcho(text string) string {
-	lines := strings.Split(text, "\n")
-	lines[0] = ansiCyan + "> " + lines[0] + ansiReset
-	return strings.Join(lines, "\n")
-}
-
-// imagesSummary 把图片路径集合渲染为简短摘要（文件名 + 数量）。
-func imagesSummary(paths []string) string {
-	if len(paths) == 0 {
-		return ""
-	}
-	if len(paths) == 1 {
-		return filepath.Base(paths[0])
-	}
-	return fmt.Sprintf("%s +%d more", filepath.Base(paths[0]), len(paths)-1)
-}
 
 // View 渲染唯一可变区：当前流式块 → 状态行 → 输入行。
 // 光标用终端原生 bar 形状绘制（CJK 安全：不遮盖双宽字素）。

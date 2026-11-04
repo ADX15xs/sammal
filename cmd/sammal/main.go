@@ -90,13 +90,27 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	}
 	defer sess.Close()
 
+	// 后台 job 注册表（M5）：结算回调在 job goroutine 落 job/completed
+	// 事件（Session.Append 并发安全），TUI 徽标与 /jobs 读同一份注册表。
+	jobs := tool.NewJobRegistry()
+	jobs.OnComplete = func(info tool.JobInfo) {
+		_ = sess.Append(session.TypeJobCompleted, session.JobCompletedData{
+			ID: info.ID, Command: info.Command, Status: info.Status, ExitCode: info.ExitCode,
+			Tail: info.Tail, TotalBytes: info.TotalBytes, DurationMs: info.DurationMs,
+		})
+	}
+	// 退出先于 sess.Close（LIFO）：击杀全部 job 并把 killed 结算落日志。
+	defer jobs.Close()
+
 	registry := tool.NewRegistry(
 		&tool.ReadTool{WorkDir: cwd},
 		&tool.WriteTool{WorkDir: cwd},
 		&tool.EditTool{WorkDir: cwd},
-		&tool.BashTool{WorkDir: cwd, Shell: facts.Shell},
+		&tool.BashTool{WorkDir: cwd, Shell: facts.Shell, Jobs: jobs},
 		&tool.GrepTool{WorkDir: cwd},
 		&tool.GlobTool{WorkDir: cwd},
+		&tool.JobOutputTool{Jobs: jobs},
+		&tool.JobKillTool{Jobs: jobs},
 	)
 
 	// secrets 兜底：%APPDATA%\sammal\.env（进程环境变量优先，第 7.2 节）。
@@ -134,6 +148,7 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 		EditorCmd:     editorCommand(cfg.UI.Editor),
 		ContextWindow: modelCfg.ContextWindow,
 		StartupHints:  missingAPIKeyHints(cfg, secrets, config.EnvFile(configPath)),
+		Jobs:          jobs,
 	}), opts...)
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("启动 TUI 失败：%w", err)

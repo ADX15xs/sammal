@@ -61,6 +61,7 @@ func skillNameLines(skills []skill.Skill) []string {
 
 // handleSlash 处理不需要 agent 参与的 TUI 专属斜杠命令，返回 (输出行, 已处理)。
 // /attach 是典型例子：它操作 TUI 的 pendingImages，无需请求模型。
+// /jobs 同理：直读 job 注册表、直杀不经模型（M5 人侧通道）。
 // （/skill 亦为 TUI 专属，但在命令分发改路之前拦截展开，见 slashSkill。）
 func (m *Model) handleSlash(input string) ([]string, bool) {
 	fields := strings.Fields(input)
@@ -70,8 +71,41 @@ func (m *Model) handleSlash(input string) ([]string, bool) {
 	switch fields[0] {
 	case "/attach":
 		return m.slashAttach(fields), true
+	case "/jobs":
+		return m.slashJobs(fields), true
 	}
 	return nil, false
+}
+
+// slashJobs 处理 /jobs：
+// - /jobs            列出后台 job（id/状态/命令/时长/输出量）
+// - /jobs kill <id>  击杀指定 job 的 shell 进程，不经模型
+func (m *Model) slashJobs(fields []string) []string {
+	if m.deps.Jobs == nil {
+		return []string{"后台 job 不可用（未装配注册表）"}
+	}
+	if len(fields) >= 3 && fields[1] == "kill" {
+		view, ok := m.deps.Jobs.Kill(fields[2])
+		if !ok {
+			return []string{fmt.Sprintf("未知 job %q（/jobs 查看列表）", fields[2])}
+		}
+		if view.Status != "running" {
+			return []string{fmt.Sprintf("[%s %s] 已结束，无需击杀", view.ID, view.Status)}
+		}
+		return []string{fmt.Sprintf("已击杀 %s（%s）；后代进程按孤儿语义继续", view.ID, view.Command)}
+	}
+	jobs := m.deps.Jobs.List()
+	if len(jobs) == 0 {
+		return []string{"没有后台 job（bash 配 run_in_background 可启动）"}
+	}
+	lines := []string{"后台 job："}
+	for _, j := range jobs {
+		lines = append(lines, fmt.Sprintf("  [%s %s] %s（%s，%s）", j.ID, j.Status, j.Command, j.Elapsed, humanBytes(j.Total)))
+	}
+	if n := m.deps.Jobs.ActiveCount(); n > 0 {
+		lines = append(lines, "提示：/jobs kill <id> 直杀；退出时全部 job 会被击杀结算")
+	}
+	return lines
 }
 
 // slashAttach 处理 /attach 命令：
