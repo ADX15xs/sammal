@@ -30,7 +30,7 @@
 
 **统一写法**：日期 `YYYY-MM-DD`；会话号 `YYYYMMDD-HHMMSS-XXXX`；提交号用 7 位短 hash 并加反引号；仓库内路径用相对路径加反引号；截图存 `docs/image/SMOKE/`，新增文件命名 `wt-<用例>-<时间>-<语义>.png`，历史数字命名文件保持原名（重命名会断链）。未完成事项集中登记在 `DEBT.md`「未完成事项总览」，原文位置保留交叉引用。
 
-**换行符现状**：`README.md`、`docs/PLAN-20261104.md`、`docs/SMOKE.md` 为 LF，`docs/SPEC.md` 为 CRLF，`DEBT.md` 为混合（主体 CRLF）。是否统一为单一风格属 ⚠️ 待确认：统一会产生整文件 diff，且 `PLAN-20261104.md` §0.1 记录过这条约束。
+**换行符现状**：`README.md`、`docs/PLAN-20261104.md`、`docs/SMOKE.md` 为 LF，`docs/SPEC.md` 为 CRLF，`DEBT.md` 为混合（主体 CRLF）。是否统一为单一风格已裁决维持现状（2026-11-05，见 `DEBT.md` C4）：统一会产生整文件 diff，且 `PLAN-20261104.md` §0.1 记录过这条约束。
 
 ## 苔藓哲学
 
