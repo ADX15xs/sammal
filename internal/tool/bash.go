@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 )
 
@@ -23,6 +27,46 @@ const (
 	bashOutputCap         = 200 * 1024
 	bashWaitDelay         = time.Second
 )
+
+// bashExecutable 避开 Windows 上的 WSL 启动器：PATH 里第一个 bash.exe 常是
+// System32/WindowsApps 的 WSL launcher，命令跑进 WSL 发行版后看不到 Windows
+// CLI（keenable.exe 等），且 command not found 只进 stderr。优先用 Git/MSYS
+// 的 bash.exe；找不到则退回原解析结果，保持旧行为。
+func bashExecutable() string {
+	if runtime.GOOS != "windows" {
+		return "bash"
+	}
+	p, err := exec.LookPath("bash")
+	if err != nil {
+		return "bash"
+	}
+	low := strings.ToLower(filepath.ToSlash(p))
+	if !strings.Contains(low, "/system32/") && !strings.Contains(low, "/windowsapps/") {
+		return p
+	}
+	var candidates []string
+	for _, base := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)"), os.Getenv("LOCALAPPDATA")} {
+		if base == "" {
+			continue
+		}
+		candidates = append(candidates,
+			filepath.Join(base, "Git", "bin", "bash.exe"),
+			filepath.Join(base, "Programs", "Git", "bin", "bash.exe"))
+	}
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if strings.Contains(strings.ToLower(dir), "git") {
+			candidates = append(candidates,
+				filepath.Join(dir, "bash.exe"),
+				filepath.Join(dir, "usr", "bin", "bash.exe"))
+		}
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return p
+}
 
 func (t *BashTool) Name() string   { return "bash" }
 func (t *BashTool) ReadOnly() bool { return false }
@@ -68,7 +112,11 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, e
 	var cmd *exec.Cmd
 	switch t.Shell {
 	case "bash", "sh":
-		cmd = exec.CommandContext(tctx, t.Shell, "-c", a.Command)
+		shell := t.Shell
+		if shell == "bash" {
+			shell = bashExecutable()
+		}
+		cmd = exec.CommandContext(tctx, shell, "-c", a.Command)
 	case "powershell":
 		ps := "powershell"
 		if _, err := exec.LookPath("pwsh"); err == nil {
@@ -106,7 +154,16 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, e
 		"stderr":     stderr.String(),
 		"durationMs": duration.Milliseconds(),
 	}
-	res := Result{Output: stdout.String(), Truncated: stdout.truncated || stderr.truncated, Extra: extra}
+	output := stdout.String()
+	// 失败命令的 stderr 不能只留在 Extra：ForModel/ForTUI 都只读 Output，
+	// command not found 会变成一片空白，模型只能反复重试或误装依赖。
+	if se := stderr.String(); se != "" && (output == "" || exitCode != 0) {
+		if output != "" {
+			output += "\n"
+		}
+		output += "[stderr] " + se
+	}
+	res := Result{Output: output, Truncated: stdout.truncated || stderr.truncated, Extra: extra}
 	if timedOut {
 		res.Err = fmt.Sprintf("command timed out after %ds (killed); partial output follows", a.TimeoutSec)
 	} else if runErr != nil && exitCode == -1 {

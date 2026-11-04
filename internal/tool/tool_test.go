@@ -348,3 +348,73 @@ func TestForTUIDuration(t *testing.T) {
 		t.Errorf("亚秒不应显示耗时: %q", got)
 	}
 }
+
+
+// 失败命令的 stderr 必须进 Output：ForModel/ForTUI 只读 Output，否则
+// command not found 变成一片空白，模型只能反复重试或误装依赖。
+func TestBashStderrVisibleOnFailure(t *testing.T) {
+	if shellForTest(t) != "bash" {
+		t.Skip("非 bash 路径的语义不同")
+	}
+	r, _ := testRegistry(t)
+	res := runTool(t, r, "bash", `{"command":"echo boom >&2; exit 3"}`)
+	if !strings.Contains(res.Output, "[stderr]") || !strings.Contains(res.Output, "boom") {
+		t.Fatalf("失败命令的 stderr 应可见: %q", res.Output)
+	}
+	if got := res.Extra["exitCode"]; got != 3 {
+		t.Errorf("exitCode = %v, want 3", got)
+	}
+	if got := ForTUI(res); !strings.Contains(got, "boom") {
+		t.Errorf("界面摘要也应带错误: %q", got)
+	}
+}
+
+func TestBashStderrNotMergedOnSuccess(t *testing.T) {
+	if shellForTest(t) != "bash" {
+		t.Skip("非 bash 路径的语义不同")
+	}
+	r, _ := testRegistry(t)
+	res := runTool(t, r, "bash", `{"command":"printf ok"}`)
+	if res.Output != "ok" {
+		t.Fatalf("Output = %q, want ok", res.Output)
+	}
+}
+
+// Windows 上 PATH 第一个 bash.exe 可能是 WSL launcher；有 Git Bash 时
+// 必须改用它，否则 Windows CLI 在 WSL 发行版里不可见。
+func TestBashExecutableSkipsWSLLauncher(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("仅 Windows 存在 WSL launcher")
+	}
+	got := bashExecutable()
+	low := strings.ToLower(filepath.ToSlash(got))
+	gitBash := filepath.Join(os.Getenv("ProgramFiles"), "Git", "bin", "bash.exe")
+	if _, err := os.Stat(gitBash); err == nil &&
+		(strings.Contains(low, "/system32/") || strings.Contains(low, "/windowsapps/")) {
+		t.Fatalf("存在 Git Bash 却仍用 WSL launcher: %q", got)
+	}
+	out, err := exec.Command(got, "-c", "printf posix-ok").CombinedOutput()
+	if err != nil || string(out) != "posix-ok" {
+		t.Fatalf("bashExecutable()=%q 不能执行 POSIX 命令: out=%q err=%v", got, out, err)
+	}
+}
+
+
+// 实机回归：修复前 bash 工具跑进 WSL 发行版，Windows PATH 里的 CLI 不可见。
+// 未安装该 CLI 的机器跳过，不影响 CI。
+func TestBashSeesWindowsCLI(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("仅 Windows 存在 WSL launcher 问题")
+	}
+	if _, err := exec.LookPath("keenable"); err != nil {
+		t.Skip("本机未安装 keenable")
+	}
+	bt := &BashTool{WorkDir: t.TempDir(), Shell: "bash"}
+	res, err := bt.Execute(context.Background(), json.RawMessage(`{"command":"keenable --version"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Output, "keenable") {
+		t.Fatalf("Windows CLI 在 bash 工具中不可见: output=%q err=%q", res.Output, res.Err)
+	}
+}
