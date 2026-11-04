@@ -305,9 +305,11 @@ func ForTUI(r Result) string
 | `read` | 读文件，行号前缀；offset/limit 参数；canonical 含 `content` + `truncated` |
 | `write` | 整文件写入；父目录自动创建 |
 | `edit` | `old_string`/`new_string` 精确匹配且**必须唯一**；命中 0 或 >1 次都报错并回显命中数与上下文（不做 fuzzy 容错——YAGNI，模型自己会修正） |
-| `bash` | 命令 + 超时（默认 120s）；工作目录 = 会话根；**平台降级**：PATH 中无 bash 的 Windows 自动切 PowerShell，并向模型注入"写 PowerShell 语法，不要用 bash 语法、不要用 `&&`"提示（Reasonix 验证过的一行解决一类错误） |
+| `bash` | 命令 + 超时（默认 120s）；工作目录 = 会话根；**平台降级**：PATH 中无 bash 的 Windows 自动切 PowerShell，并向模型注入"写 PowerShell 语法，不要用 bash 语法、不要用 `&&`"提示（Reasonix 验证过的一行解决一类错误）；⚠️ 见下方实现差异注记 |
 | `grep` | 内容搜索；PATH 中有 ripgrep 则委托，否则纯 Go 实现（walk + regexp）；输出 `path:line:text`，上限截断 |
 | `glob` | 模式匹配文件列表，上限截断 |
+
+> ⚠️ **实现差异（2026-11-04 治理注记）**：上表「PATH 中无 bash 的 Windows 自动切 PowerShell」描述的是降级分支。实机发现本机 PATH 中有 `bash` 但它是 WSL launcher（`C:\Windows\System32\bash.exe`），命令会跑进 WSL 而看不到 Windows CLI；现行 `BashTool` 由 `bashExecutable()` 优先解析 Git/MSYS 的 `bash.exe`，命令失败时把 stderr 并入 `Result.Output`（见 `DEBT.md` 对应行、`docs/SMOKE.md` §6）。`DetectShell()` 仍按 `exec.LookPath("bash")` 定格会话 shell。是否正式改写本行规格正文：⚠️ 待确认。
 
 工具 schema 合计目标 < 1500 token（Pi 用 4 工具做到 <1000；六件套略宽，可观测后收窄描述）。
 
@@ -385,6 +387,8 @@ turn/end            {"turn":n,"stopReason":"...","synthetic":false}
 - **内容经安全通道渐进追加进原生滚动缓冲区**（`tea.Println` 语义）：assistant 回答随流式渐进落盘（闭合行超触发线即落盘、定稿补余），工具结果投影、状态行、用户回显同通道——终端原生滚动/搜索/复制全保留。单次落盘的折行总行数不得超过视口安全预算（宽度归一化 + 分批 + 巨行硬拆，见 `internal/tui/scroll.go`）：bubbletea 内联渲染器的 insertAbove 在打印块超出视口时永久失步，此预算是 I4 在应用侧的细化不变量
 - **唯一的可变区**：底部一块——当前流式块（尾部至多 8 行）+ 思考行 + 状态栏一行 + 底部输入框（原地重绘仅限这一块，宽字符变化时整块全量重绘——显式策略，不做平台补丁）
 - **思考行**（reasoning 增量，dsh 方案）：只渲染最新一行暗色文字 `- 思考中 <计时> | <正文>`，超宽走尾部跟随；定稿即整行撤出视窗（行为细节见 8.3）
+
+> ⚠️ **实现差异（2026-11-04 治理注记）**：思考结束已改为把当前显示的那 1 行下沉进滚动区并在原位置保留（`closeThinking` / R1），不再整行撤出；落盘增量恒 1 行、`/resume` 不含思考。见 `docs/SMOKE.md` T11 与 `DEBT.md`。本行原文保留为当时的设计意图，是否改写规格正文：⚠️ 待确认。
 - **状态栏**：常驻一行，段构成与丢弃优先级见 8.3
 - **弹窗状态用一个枚举集中管理**（none / modelPicker…），避开 Reasonix 的 nil 链互斥
 - `Ctrl+P` 模型选择器：输入框上方的内嵌列表，自带模糊过滤（不依赖外部 fzf）
@@ -493,7 +497,7 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 
 - 文本增量：闭合行数超过触发线（6 行）即把头部行渐进落盘进滚动缓冲区（经 scroll.go 安全通道：单次落盘折行总行数 ≤ 视口预算），可变区只留尾部窗口；定稿补打剩余行。事件契约：`MessageFinal.Text` 与 TextDelta 累积逐字节一致，故「已落盘前缀 + 定稿补余 == 全文」。流中断重连（StreamRestarted）即重新生成，已落盘部分不可撤回，追加一行暗色作废标记
 - 思考增量：只更新"当前流式块"（可变区）
-- 思考（reasoning）：只渲染**最新一行**暗色文字 + 计时器（缓解等待焦虑的最小口子，dsh 方案）；增量按 token 到达，正文超宽走尾部跟随（保留最新 token，无省略号）；思考块闭合即整行撤出视窗，不留摘要。全文经 `assistant/chunk kind=reasoning` 落日志（人类回看），**不进模型投影**——发给模型的历史不含思考
+- 思考（reasoning）：只渲染**最新一行**暗色文字 + 计时器（缓解等待焦虑的最小口子，dsh 方案）；增量按 token 到达，正文超宽走尾部跟随（保留最新 token，无省略号）；思考块闭合即整行撤出视窗，不留摘要（⚠️ 2026-11-04 起改为下沉 1 行保留，见 `docs/SMOKE.md` T11 与本文思考行实现差异注记）。全文经 `assistant/chunk kind=reasoning` 落日志（人类回看），**不进模型投影**——发给模型的历史不含思考
 - 工具调用：`tool/call` 到达时输出一行摘要（工具名 + 参数摘要）；`tool/result` 到达时追加投影（截断至可读长度）
 - 状态行：当前模型、token 用量、缓存命中指标（I2 的可观测出口）、上下文窗口占用 `ctx %`（≥70% 黄、≥80% 压缩触发线红）、生成中显示 turn 计时与本轮工具调用数；usage 随每个 step 定稿更新，ctx% 因此跟随工具环推进。空间不足时按丢弃优先级裁剪：工具数(5) → cache(3) → in/out 与计时器(同优先级 2，先丢更靠左的 in/out) → ctx(1)；模型名与生成中标记永不丢（负优先级段不可裁剪）。等待期（已提交、TurnStarted 未到）状态栏显示「生成中 <spinner>」，spinner 帧随心跳每秒推进，避免静止误判卡死。达到压缩触发线时 turn 结束后追加一次文字预警（一轮只报一次），且该预警须排在耗时落款之前
 - 回合耗时标记：turn 正常完成时在回答最后追加一行暗色「（耗时 1m30s · HH:MM 完成）」——自 TurnStarted 起算、覆盖工具环全程，并附本地完成时刻；中止/出错回合不打（用户中止的时长无信息量，错误详情已含原因），TurnStarted 之前的失败路径无计时起点同样不打
@@ -515,7 +519,7 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 
 范围：六件套工具 + agent 多 step 循环 + 收件箱 steering + 中止语义 + per-turn 快照 + `/rewind`。
 
-- 验收：模型能用工具完成"读文件→改文件→跑命令验证"闭环；中止后日志可重放；`/rewind` 同时回滚文件与对话；无 bash 的 Windows 上 PowerShell 降级生效
+- 验收：模型能用工具完成"读文件→改文件→跑命令验证"闭环；中止后日志可重放；`/rewind` 同时回滚文件与对话；无 bash 的 Windows 上 PowerShell 降级生效（⚠️ 该验收条件在本机不可达：PATH 有 WSL launcher 形态的 bash，现行规避见 6.3 实现差异注记）
 - 不变量测试：I1 golden 请求重放、I5 投影分离单测
 
 ### M2 会话全套 —— 已交付（e8ba2f6，2026-08-23）

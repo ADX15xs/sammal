@@ -8,7 +8,7 @@
 | internal/tui/editor.go | 多行内联编辑已落地（字素级光标 + 大粘贴折叠 + 垂直窗口），但超宽逻辑行不做 word-wrap（沿用 clipLine 截断，与 Pi 的词级折行不同）；Ctrl+E 外部编辑器仍保留为逃生舱 | 若内联 word-wrap 成为实际痛点再补词级折行 + 光标列重定位 | 按需 |
 | internal/agent/agent.go | reasoning 增量已落盘（assistant/chunk kind=reasoning）并实时渲染为单行流式（dsh 方案）；结束时不撤走而是把该行下沉进滚动区（2026-11-04，只落 1 行、不落全文，`/resume` 不含思考）；DeepSeek 官方端点 thinking mode 要求 tools 请求回传 reasoning_content，sammal 尚不回传——本地端点（Ollama/vLLM/LM Studio）无此要求不受影响 | 接入 DeepSeek 官方端点跑工具环时：provider.Message 加 reasoning 字段 + 按端点开关的序列化回传 | 首个 DeepSeek 官方 thinking 端点接入时 |
 | 全项目 | CJK 预组合文本的 输入编辑 / 光标列计算 / 流式渲染 / 日志落盘 已全自动化（uniseg+runewidth 单测、E2E 断言中文回复渲染）。不可自动化的剩余部分：真实 IME 组合输入流程（候选窗、组合态光标）与三大终端产品（Windows Terminal / iTerm2 / Linux 终端）上的视觉效果、原生滚动复制 | 发布前实机冒烟：每端各过一遍「IME 敲中文 → 删除/移动光标 → Esc 中止 → 选区复制」 | 每次发版前（M4 时点已过且无入账证据，转为常设项） |
-| internal/tool/bash.go | PowerShell **执行路径**已自动化验证（powershell.exe/pwsh 端到端：输出、非零退出码、超时杀进程，见 TestBashToolPowerShellPath）。剩余未覆盖：本机 System32 存在 WSL bash.exe，exec.LookPath("bash") 恒命中，「PATH 无 bash → 降级」检测分支不可达 | 在无 bash 的 Windows 实机触发一次降级（或该分支由 3 行 fallback 与 prompt golden 互补覆盖，评估可接受） | 首个无 bash 的 Windows 实机出现时 |
+| internal/tool/bash.go | PowerShell **执行路径**已自动化验证（powershell.exe/pwsh 端到端：输出、非零退出码、超时杀进程，见 TestBashToolPowerShellPath）。剩余未覆盖：本机 System32 存在 WSL bash.exe，exec.LookPath("bash") 恒命中，「PATH 无 bash → 降级」检测分支不可达 | 在无 bash 的 Windows 实机触发一次降级（或该分支由 3 行 fallback 与 prompt golden 互补覆盖，评估可接受） | 首个无 bash 的 Windows 实机出现时；⚠️ 部分过时：`BashTool` 执行路径已由 `bashExecutable()` 规避 WSL launcher（见下方新行），`DetectShell` 的会话 shell 定格仍按原文；是否改写本行待确认 |
 | internal/tool/grep.go | rg 委托与纯 Go 后备的正则方言存在细微差异（rg 为 Rust regex 语法，后备为 RE2）；常见模式两者一致 | 遇到实际分歧模式时在 schema description 中声明方言边界，或统一为仅 RE2 | 按需（首个实际分歧出现时） |
 | internal/agent/agent.go | 压缩只在 turn 开始触发：单个 turn 内多 step 工具环撑爆上下文时不自动恢复（请求会收到上下文溢出错误，turn 以 error 结束；下一 turn 开始时自动压缩后可重试） | 溢出分类（InterruptContextOverflow）已就绪；实测出现该场景再加「溢出 → turn 内压缩重试」 | 按需（首个实际溢出出现时） |
 | internal/provider/chunk.go | 限流信号识别面收敛：头部只认标准 Retry-After（整数秒/HTTP-date）与常见 x-ratelimit-reset（unix 秒/RFC3339），其余变体格式（如 Go duration 串 "6m30s"、各家自定义头）退化为盲指数退避；配额窗口判档依赖响应体英文特征串，非英文报错可能漏判成普通限流 | 遇到实际端点时按其格式扩展 parseRetryAfter / quotaMarkers | 按需（首个未识别格式实际影响重试效果时） |
@@ -27,3 +27,60 @@
 | internal/tui/scroll.go printScroll / internal/session/session.go Transcript | 实机复现（Windows Terminal T11 会话 20261104-174534-5500、T9 会话 -181108-3800；截图 1793785671006.png、1793787374486.png、1793785748922.png）：思考行与工具行之间 2-3 行空行，`/resume` 回放剩 1 空行。**不是残余项③**（打印与 ticker 交错），也与「已调用工具数量」无关。日志实锤：模型在「只调工具、不写正文」的 step 吐纯换行正文（174534-5500 seq101 `kind=text` delta 为 3 个换行、seq102 `assistant/message` text 同为 3 个换行且带 grep toolCall；181108-3800 seq1358 为 2 个换行）。`ToolCallEvent` 的 `flushPendingStream(true)` 把该段当正文落盘；`Transcript` 的 `trimTrailing` 把纯换行变空串后仍 append 成一行。 | 已落地（2026-11-04）：`printScroll` 跳过剥离 ANSI 后整段无可见字符的 text（含正文的批次里的段落空行保留）；`Transcript` 对纯空白 text 不生成行，中断标记仍保留。三个回归测试（TestPrintScrollSkipsBlankOnlyText / TestBlankOnlyToolStepHasNoBlankLine / TestTranscriptSkipsBlankOnlyAssistantText），关掉修复即红，精确复现思考行与工具行之间的纯换行落盘批、以及回放里的空串行。**只过滤显示层，日志与模型投影仍保留原文**：不动 I1「写什么发什么」，纯空白 assistant 消息仍进下一轮请求，属有意保留的边界。 | ✅ 已复测通过并核销（2026-11-04 23:11，会话 20261104-231110-6400）：三轮对话未见新空行、`/resume` 无空行；第一刀（18:41）只挡整段纯空白，19:14 复测确认「思考行→工具行」0 空行；第二刀（19:41）裁掉正文前后换行 padding（191314-6300 的 seq214/385/655 text 以前导换行开头、以多个换行结尾），`printScroll` / `Transcript` 均用 `strings.Trim(text, "\n")` 裁首尾、正文中间段落空行保留，配 TestPrintScrollTrimsBlankPadding / TestTranscriptTrimsBlankPadding。纯空白 assistant 消息仍进日志与下一轮请求（I1 不动）；若造成 token 或语义干扰，再评估在 agent 侧归一化（须同步改 provider.Message 与重放哈希）。T9 步骤 5 已于 191314-6300 补测通过（seq65 合并 2 条相同「继续」）；23:11 日志 seq2520 等仍含前导/尾随换行 padding，显示层裁掉后屏幕 0 空行（I1 不动），非回归。 |
 | internal/tool/bash.go BashTool / internal/agent/prompt.go DetectShell | 实机复现（Windows Terminal，会话 20261104-190849-8200，截图 docs/image/SMOKE/wt-keenable-190849-wsl.png）：`/skill keen able-search` 后连续 3 次 `keenable search` 的 `<- bash:` 全空，模型据此误判未安装并尝试装依赖；用户在本机外部三种终端里均能正常搜索。**根因两层**：① `exec.LookPath("bash")` 在本机命中 `C:\Windows\System32\bash.exe`（WSL launcher，另有 WindowsApps 同名），命令跑进 WSL 发行版（HOME=/home/xiaos），Linux PATH 里的 Windows CLI 必须带 `.exe` 才可见，`keenable` 因此 command not found（实测 Git Bash 下 `keenable --version` = 0.2.3，WSL 下报 command not found）；DEBT 既有「System32 存在 WSL bash.exe 使降级分支不可达」正是同一事实的另一面。② `BashTool.Execute` 把 stderr 只放进 `Extra`，而 `Result.Output`（ForModel/ForTUI 唯一数据源）只有 stdout → command not found 变成空输出，模型无从诊断。 | 已落地（2026-11-04 19:41）：`bashExecutable()` 在 Windows 上跳过 System32/WindowsApps，优先解析 Git/MSYS 的 bash.exe（ProgramFiles / LOCALAPPDATA / PATH 含 git 的目录），找不到则退回原解析；失败时（stdout 空或退出码非 0）把 stderr 以 `[stderr] ` 并入 Output，Extra 保留原始值。测试：TestBashExecutableSkipsWSLLauncher、TestBashSeesWindowsCLI（本机装了 keenable 才跑，否则 skip）、TestBashStderrVisibleOnFailure、TestBashStderrNotMergedOnSuccess。 | ✅ 已复测通过（2026-11-04 23:11，会话 20261104-231110-6400：seq1017 `keenable 0.2.3` exitCode=0、多次 search/fetch 返回真实内容；4 次 `unknown tool` 报错是模型把 CLI 名当工具名误调，非 bash 环境故障）；SPEC 6.3「PATH 中无 bash 才降级」的表述未同步：本机是「PATH 里有 bash 但它是 WSL launcher」，需要时补写该特例 |
 | internal/tui/model.go loadHistory / handleKey KeyUp | 用户实机反馈「↑ 键在当前输入框没有召回上一条」。**功能写了但从未生效**：`loadHistory` 是值接收者 `func (m Model)`，`Editor.Set → Clear()` 会重新赋值 `lines`/`pastes`，改动全落在 Model 副本上，调用方 `m.editor` 不变；且原条件 `m.editor.Empty()` 使召回一条后输入框非空，第二次 ↑ 被静默吞掉。注意 PLAN-20261104 §0.1 的红队推演曾以「↑ 召回 + Enter 约 300-600ms」为据删除 500ms 去重——该前提当时并不成立，但去重删除仍由用户约束④（不猜重复）支撑，不翻案。 | 已落地（2026-11-04 19:41）：`loadHistory` 改指针接收者；KeyUp 条件放宽为 `editor.Empty() 或 histDepth>0`，支持连续上翻、↓ 回到实时输入。新增 TestArrowKeysRecallInputHistory（改回值接收者即红）。**保留的设计限制**：输入框已有草稿（histDepth=0 且非空）时不召回，避免吞掉正在编辑的内容；多行输入时 ↑ 优先移动光标。 | ✅ 已复测通过（2026-11-04 23:11：空输入框 ↑ 连续上翻、↓ 回到清空，有输入时正确拦截上翻）；若需要「带草稿召回」再另立需求 |
+
+---
+
+## 未完成事项总览（治理 2026-11-04）
+
+> 本节只做集中索引，不替代上表各行；每条保留原位置与「何时还」，状态以上表为准。状态标记含义见 `README.md`「文档地图与治理约定」。历史判读与失败登记一律保留原文，过时内容只标注不删除。
+
+### A. 条件触发型（有触发条件才动手，不算逾期）
+
+| 原位置（上表） | 事项 | 触发条件 |
+|---|---|---|
+| `internal/tui/editor.go` | 超宽逻辑行不做 word-wrap | 内联 word-wrap 成为实际痛点 |
+| `internal/agent/agent.go` | DeepSeek 官方 thinking 端点不回传 reasoning_content | 首个官方 thinking 端点接入 |
+| `internal/tool/bash.go` | 无 bash 的 Windows 降级分支不可达 | 首个无 bash 的 Windows 实机；⚠️ 见 C1 |
+| `internal/tool/grep.go` | rg 与 RE2 正则方言差异 | 出现实际分歧模式 |
+| `internal/agent/agent.go` | turn 内多 step 工具环不自动压缩 | 首个实际上下文溢出 |
+| `internal/provider/chunk.go` | 限流信号识别面收敛 | 未识别格式实际影响重试 |
+| `internal/agent/agent.go runSteps` | 无 step 数软上限 | 首个工具失控循环 |
+| `internal/agent/agent.go captureBeforeWrite` | 按 path 启发式识别写类工具 | 首个非 path 参数的写工具 |
+| `internal/skill/skill.go` | frontmatter 不支持 YAML 块标量 | 首个不符合预期的真实 skill |
+| `internal/agent/agent.go Submit` | 运行标记微秒级竞态窗口 | 出现程序化紧邻调用 Submit / Slash |
+| `internal/compaction/compaction.go` | 压缩估算不计图片 token | 首个实际溢出 |
+| `internal/agent/agent.go Submit` | 生成中带图无承载者 | 带图插话成为实际用法 |
+| `internal/tui/model.go loadHistory` | 带草稿时召回历史（既定设计限制） | 用户另立需求 |
+
+### B. 常设 / 未覆盖（不阻塞关闭，发版前复核）
+
+| 原位置 | 事项 |
+|---|---|
+| 上表「全项目」 | 每次发版前三终端 IME 冒烟；Windows Terminal 已过，iTerm2 / Linux 终端未测 |
+| `docs/SMOKE.md` §4 | WSL + tmux、macOS iTerm2 两列未测；T11 步骤 5 断流重连未单列复测；无 reasoning 模型环境未测 |
+| `docs/SMOKE.md` §5 | T12 steer 真打断尚未立项；仅当 T9 出现「只回应最后一条」时触发翻案 |
+| `docs/SPEC.md` I6 / 本文件第 4 行 | 每里程碑收尾核对账本与代码内 `TODO/FIXME` 一致（治理时代码内 0 处，一致） |
+
+### C. ⚠️ 待人工确认（一律不删、不改、不推）
+
+| # | 条目 | 为什么待确认 |
+|---|---|---|
+| C1 | `docs/SPEC.md` 6.3「PATH 中无 bash 的 Windows 自动切 PowerShell」及 M1 验收条目 | 本机 PATH 有 bash 但它是 WSL launcher；现行实现由 `bashExecutable()` 优先 Git Bash 规避。规格正文已加 ⚠️ 注记，是否正式改写需人工裁决 |
+| C2 | `docs/SPEC.md` 思考行「定稿即整行撤出视窗」两处、`README.md` 旧特性描述 | 2026-11-04 起改为下沉 1 行保留；已标注现况，是否改写规格正文待确认 |
+| C3 | 未被引用的 3 张截图：`080457-d480fa8f1817cb8091f880887e5fbd2a.png`、`1793719821322.png`、`1793785744869.png` | 无法判断是否仍有证据价值；不删除、不重命名 |
+| C4 | 五份文档的换行符是否统一 | README / PLAN / SMOKE 为 LF、SPEC 为 CRLF、DEBT 混合；统一会产生整文件 diff，`PLAN-20261104.md` §0.1 记录过该约束 |
+| C5 | `docs/PLAN-20261104.md` §0.7「T1 回归未做」及标题「供新会话接手」 | 23:11 复测含长回答但未单列 T1 登记；计划书已加归档标注，是否改标题 / 补登 T1 待确认 |
+| C6 | `main` 领先 `origin/main` 5 个提交（`4420f37..70f1cb6`） | 推送属外部动作，需用户明确指示；治理不擅自推 |
+| C7 | `D:/Temp/handoff-20261104.md`、`D:/Temp/plan-20261104-iterate.md` | 两份仓库外的交接原件仍存在；`PLAN-20261104.md` §0.1 称其易失，是否需长期留档待确认 |
+| C8 | `docs/SMOKE.md` T10 历史判读里的「删除 cmd/imeprobe」 | 目录已不存在（已执行）；该句属历史记录，是否精简待确认，治理保留原文 |
+| C9 | `docs/SMOKE.md` §0 头部「总耗时」估算与 T1-T11 用例清单 | 冒烟已关闭，估算是否仍适用、是否改按归档口径表述待确认；治理保留原文并就地标 ⚠️ |
+| C10 | `docs/SPEC.md` 决策变更记录止于 2026-11-02，未收录 2026-11-04 迭代 | 本轮 D1-D6、思考行下沉、插话合并/去重删除、显示层空行过滤、WSL bash、↑ 召回均记在 `PLAN-20261104.md` / `SMOKE.md` / `DEBT.md`；是否补进规格决策记录待确认 |
+
+### D. 已完结索引（原文保留，仅列结论）
+
+| 原位置 | 结论 |
+|---|---|
+| `internal/tui/scroll.go` 主条目 | ✅ 已冒烟（2026-11-04，Windows Terminal，见 `docs/SMOKE.md` §4 关闭结论） |
+| T9 插话回显覆盖 / 投递缺失 / 500ms 去重 / 纯空白正文 / 正文换行 padding / WSL bash / ↑ 历史召回 | ✅ 均已核销或已复测通过（2026-11-04，见 `docs/SMOKE.md` §4、§6） |
+| `internal/agent/agent.go:498` 截断参数 | ✅ 已还（`129a1f2`） |
+| `internal/session/assets.go` 图片资产 | ✅ 物理边界，无需偿还（原文保留为边界说明） |
