@@ -27,7 +27,7 @@
 
 **规模不设上限，质量下限设死。**
 
-Sammal 是一个随需求生长、始终满足六条不变量（第 2 章）、零隐性债的个人 agent harness。它不以"媲美生产产品"为目标——Reasonix 的 72.8 万行和 dsh 的 24 万行中，绝大部分是为产品化广度（终端兼容矩阵、多前端、插件生态、企业功能）支付的，个人 harness 不支付这部分。
+Sammal 是一个随需求生长、始终满足七条不变量（第 2 章）、零隐性债的个人 agent harness。它不以"媲美生产产品"为目标——Reasonix 的 72.8 万行和 dsh 的 24 万行中，绝大部分是为产品化广度（终端兼容矩阵、多前端、插件生态、企业功能）支付的，个人 harness 不支付这部分。
 
 成功标准（可验证）：
 
@@ -47,7 +47,7 @@ Sammal 是一个随需求生长、始终满足六条不变量（第 2 章）、�
 
 ---
 
-## 第 2 章 六条不变量
+## 第 2 章 七条不变量
 
 这是本项目的稳固机制。此前考虑过"硬性 Non-goals 栅栏"并被否决——按需生长不限制功能数量；取而代之，**质量下限以不变量的形式设死**：任何功能生长不得击穿以下边界，每条附可测试定义。
 
@@ -103,6 +103,13 @@ resume、branch、compaction、TUI 重绘、回放全部是同一份事件日志
 
 - **测试**：每里程碑收尾核对账本与代码内 `TODO/FIXME` 一致；新增 workaround 而未记账视为验收失败
 
+### I7 非请求不输出
+
+除用户请求触发的回答与工具环的直接结果外，不产生任何自发输出；每一次提问、确认、提示都必须值回其注意力成本；需要澄清时一次只问一个问题。
+
+- **测试**：回放形状断言——事件日志中 assistant 输出（assistant/chunk、assistant/message）只能位于某次 user/message 开启、turn/end 尚未闭合的回合内；每条不变量必须有测试锚点，由 internal/specdoc 契约测试锁定
+- **来源**：dsh-superagent 哲学「不打扰是默认值，打扰要付预算」（其 docs/000-philosophy.md:5）的 sammal 化转写，2026-11-02 决策变更记录
+
 ---
 
 ## 第 3 章 纯净开发纪律
@@ -135,7 +142,7 @@ resume、branch、compaction、TUI 重绘、回放全部是同一份事件日志
 每个里程碑（第 9 章）结束前执行：
 
 1. `git diff` 逐项过本次改动：命名表意？注释少而精？无死代码/调试残留？无顺手过度设计？
-2. 不变量测试全绿（I1–I5 的自动化测试）
+2. 不变量测试全绿（I1–I7；internal/specdoc 契约测试保证每条不变量有测试锚点，不靠人记）
 3. `DEBT.md` 核对：新增妥协全部入账，到期条目处理或改期
 4. 缓存影响自查（继承 dsh 的审查文化，不做 CI 机器）：本次改动是否触及请求前缀？触及则回答"如何保持字节级稳定"
 
@@ -197,7 +204,7 @@ cmd/sammal          薄入口：解析参数、装配、启动
 internal/tui        Bubble Tea v2 内联滚动模式（唯一前端，事件流的订阅者）
 internal/skill      /skill 的扫描、解析与展开（prompt 简化器，TUI 叶子包）
 internal/agent      turn/step 状态机、消息收件箱、中止语义（无 UI）
-internal/tool       Tool 接口 + 六件套 + canonical/render 投影
+internal/tool       Tool 接口 + 六件套与 job 双件 + canonical/render 投影
 internal/provider   OpenAI 兼容 SSE 客户端（流式 + 工具调用聚合 + 看门狗）
 internal/session    事件溯源 JSONL 日志（唯一真相）、恢复、分支、崩溃恢复
 internal/compaction 上下文压缩（剪枝 + 摘要 + 前缀重放）
@@ -504,7 +511,7 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 
 ---
 
-## 第 9 章 里程碑 M0–M4
+## 第 9 章 里程碑 M0–M5
 
 每个里程碑的验收 = **功能测试 + 不变量测试 + 收尾纯净清单**（3.4 节）三重门。
 
@@ -542,6 +549,22 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 
 - 验收：六个平台产物可运行；文档与实现一致；账本无未核对的 TODO/FIXME
 - 不变量测试：全量回归
+
+### M5 后台 bash —— 已实现（2026-11-02，方案经红队压测修订；代码+测试交付，T12-T14 实机冒烟待跑）
+
+范围（第一期，方案 A 惰性拾取）：
+
+- `bash` 工具新增 `run_in_background`：命令即入 job 注册表、立即返回 job id；**前台命令超时不杀，晋升为后台 job**，返回 `[still running after Ns; moved to background job <id>]` 并携带已有输出（promoteOnTimeout，学 dsh-tool-bash）。`timeout_seconds` 的 schema 语义由"Kill after N seconds"改为"前台阶段限时，到点晋升"——TestBashTimeout 语义断言与 SMOKE 用例连锁更新
+- 新增 `job_output`（无参 = 列出全部 job 及状态；带 id = 非阻塞读增量输出）与 `job_kill`（进程树击杀，复用 WaitDelay 孤儿语义）。**不设阻塞等待参数**——"等完成"走前台路径由晋升兜底
+- 完成注入（方案 A）：`job/completed` 事件落日志（tail 8KB 对齐 pruneThreshold + totalBytes + status done|killed|failed；全量溢出文件暂不做）；**归属规则 = 日志序中紧随 job/completed 的第一个 user/message 的 turn 尾部**——纯日志序确定性函数，compaction 遮蔽与 /branch 分叉随被归属 turn 自然处理；模型侧不自动唤醒回合（I7 形状不变），TUI 状态栏徽标提示
+- 人侧通道：`/jobs`（列表：id/命令摘要/时长/状态）+ `/jobs kill <id>` 直杀不经模型；退出时存在活跃 job → 确认警告"将被放弃"
+- 防御：并发上限 4（超限拒绝并提示）；同命令行已有运行中 job → 返回既有 id（幂等，防本地小模型对"still running"反应性重试叠加）
+- 边界声明：正常退出时全部 job 击杀结算（killed 事件落日志、tail 留痕），后代进程按孤儿语义继续；崩溃（kill -9）无处理，job 随进程消失，**不跨进程恢复**；bash 与 PowerShell 双执行路径行为一致
+
+- 验收：长命令不再锁死终端（前台晋升 + 后台立返，用户可继续输入）；下次提交时已完成 job 的输出出现在模型上下文且 golden 重放逐字节还原；`/jobs` 杀 job 不经模型；kill -9 后 resume 不产生幽灵 job
+- 不变量测试：I1 注入 golden 重放、I2 注入不触系统提示词前缀、I3 无幽灵 job；specdoc 锚点全绿
+
+压测修订（红队 → 方案变化）：砍阻塞等待（与前台晋升功能重叠，且免 superagent"等待即反模式"教训）；砍 30 分钟自动上限（dev server 会被误杀，改退出警告 + `/jobs` 人侧兜底）；新增幂等防御与并发上限；输出体积策略定案 tail+totalBytes；注入归属显式化为日志序纯函数。二期（完成通知即时打进滚动区，**待 T9 单队列落盘修复后**）与三期（唤醒回合，job/complete 作为合法回合开启者，**按需立项**）在此声明触发条件，防"顺手"蔓延。
 
 里程碑之外的特性生长以「决策变更记录」为记录；修复与测试类提交见 git log。
 
@@ -599,4 +622,6 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-11-04 | Windows `bash` 执行路径修正：`BashTool` 通过 `bashExecutable()` 跳过 `System32` / `WindowsApps` 的 WSL launcher，优先 Git/MSYS `bash.exe`；无 bash 时仍降级 PowerShell；命令失败时把 stderr 并入 `Result.Output` | 实机 `keenable search` 因 `exec.LookPath("bash")` 命中 WSL launcher 而看不到 Windows CLI，stderr 缺失使模型误判未安装 |
 | 2026-11-04 | 显示层空行过滤：`printScroll` 与 `Transcript` 跳过纯空白 assistant 文本，并对正文首尾换行 padding 做 `strings.Trim(text, "\n")`；日志与模型投影保留原文 | 模型在「只调工具、不写正文」的 step 吐纯换行，工具边界 flush 后污染滚动区与回放；只改显示层，不动 I1「写什么发什么」 |
 | 2026-11-04 | `↑` / `↓` 输入历史召回修复：`loadHistory` 改指针接收者；KeyUp 允许已召回后连续上翻，`↓` 回到实时输入；输入框有草稿时不召回 | 原值接收者导致历史写入副本而失效；连续上翻需要保持草稿边界，避免吞掉正在编辑内容 |
-| 2026-11-04 | 本轮明确不做项：不引入 steer 真打断（T12 预留）；`/resume` 不补思考；思考落盘不加时长抬头 | 用户约束「暂不做打断」；思考落盘与回放长度受约束②限制，保持最小改动 |
+| 2026-11-04 | 本轮明确不做项：不引入 steer 真打断（T15 预留）；`/resume` 不补思考；思考落盘不加时长抬头 | 用户约束「暂不做打断」；思考落盘与回放长度受约束②限制，保持最小改动 |
+| 2026-11-02 | 新增 I7「非请求不输出」（第 2 章六条→七条，README 同步）+ internal/specdoc 契约测试（不变量↔测试映射、I4 禁 alt-screen、I6 禁裸 TODO、文档交叉引用、800 行棘轮）+ I7 回放形状测试（agent_test）；superagent 启发 3a「bash 等待守卫」评估后**暂缓** | superagent 调研启发落地（3b/3c）：I1–I6 全是工程不变量，产品行为缺一条「对人的输出」约束；I4/I6 原为审查清单项，棘轮化后由机器把守。3a 暂缓理由：sammal 六件套无后台作业等「等待承接物」，照搬 noWait 拒绝文案（「结果会自己送达」）是空头承诺；待决定是否引入最小后台机制再动（superagent 参照 src/app/sessions.ts:77-86） |
+| 2026-11-02 | M5「后台 bash」立项（第 9 章，方案 A 惰性拾取）：bash `run_in_background` + promoteOnTimeout（前台超时晋升不杀）+ job_output/job_kill + `/jobs` 人侧直杀 + `job/completed` 事件按日志序归属下一个 user turn 尾部注入；六家调研（dsh/superagent/Reasonix/Claude Code/ZCode/Pi）证据落盘 `D:\\Temp\\sammal-3a-background-bash-research-2026-11-02.md`；红队压测修订：砍阻塞等待与 30min 自动上限、加幂等防御与并发上限 4、注入归属显式化为日志序纯函数 | superagent 启发 3a 复活为完整承接物：2026-10-23 bash 等待修复证实长命令阻塞是真实痛点；dsh 证明守卫与承接物可合一（晋升不杀）；Pi 列的四项成本 sammal 已有两项现成答案（I5 分离、WaitDelay 孤儿语义）。二期（空闲期滚动区通知，待 T9 修复）与三期（唤醒回合，按需）触发条件已在 M5 节声明 |
