@@ -16,9 +16,14 @@ import (
 // BashTool 执行命令。Windows 上无 bash 时自动降级 PowerShell（系统提示词
 // 已同步注入「写 PowerShell 语法」提示，第 6.3 节）。bash 副作用不入快照
 // （第 6.4 节如实声明）。
+//
+// Jobs 非 nil 时走 M5 后台路径：run_in_background 立即返回 job id；前台
+// 命令超时不杀、晋升为后台 job（promoteOnTimeout）。Jobs 为 nil（测试裸
+// 构造）保持旧语义：超时即杀。
 type BashTool struct {
 	WorkDir string
 	Shell   string // "bash" 或 "powershell"，会话创建时探测定格
+	Jobs    *JobRegistry
 }
 
 const (
@@ -71,7 +76,7 @@ func bashExecutable() string {
 func (t *BashTool) Name() string   { return "bash" }
 func (t *BashTool) ReadOnly() bool { return false }
 func (t *BashTool) Description() string {
-	return "Run a shell command in the working directory. Returns stdout, stderr and exit code. Non-zero exit is not an error by itself."
+	return "Run a shell command in the working directory. Returns stdout, stderr and exit code. Non-zero exit is not an error by itself. Supports background jobs: run_in_background returns a job id at once, and a foreground command that outlives its timeout is moved to a background job instead of killed."
 }
 
 func (t *BashTool) Schema() json.RawMessage {
@@ -85,7 +90,8 @@ func (t *BashTool) Schema() json.RawMessage {
 	"type": "object",
 	"properties": {
 		"command": {"type": "string", "description": "` + shellNote + `"},
-		"timeout_seconds": {"type": "integer", "description": "Kill after N seconds (default 120, max 600)", "minimum": 1}
+		"timeout_seconds": {"type": "integer", "description": "Foreground time limit in seconds (default 120, max 600). On expiry a long command is moved to a background job (not killed); its result arrives with the user's next message", "minimum": 1},
+		"run_in_background": {"type": "boolean", "description": "Start as a background job: returns a job id at once and keeps running across turns. Collect output with job_output; list or stop with /jobs (or job_kill). Choose this for servers/watchers and other commands whose deliverable is that they keep running, or when the user should keep the terminal now and the result can arrive with their next message"}
 	},
 	"required": ["command"]
 }`)
@@ -93,8 +99,9 @@ func (t *BashTool) Schema() json.RawMessage {
 
 func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, error) {
 	var a struct {
-		Command    string `json:"command"`
-		TimeoutSec int    `json:"timeout_seconds"`
+		Command         string `json:"command"`
+		TimeoutSec      int    `json:"timeout_seconds"`
+		RunInBackground bool   `json:"run_in_background"`
 	}
 	if err := decodeArgs(args, &a); err != nil {
 		return Result{Err: err.Error()}, nil
@@ -107,7 +114,140 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, e
 	}
 	a.TimeoutSec = min(a.TimeoutSec, bashMaxTimeoutSec)
 
-	tctx, cancel := context.WithTimeout(ctx, time.Duration(a.TimeoutSec)*time.Second)
+	if t.Jobs != nil {
+		return t.executeWithJobs(ctx, a.Command, a.TimeoutSec, a.RunInBackground), nil
+	}
+	return t.executeLegacy(ctx, a.Command, a.TimeoutSec), nil
+}
+
+// buildCmd 构造命令（双 shell）。后台路径不使用 CommandContext——晋升后
+// 的 job 必须脱离 turn ctx 存活，击杀一律走 Process.Kill。
+func (t *BashTool) buildCmd(command string) *exec.Cmd {
+	var cmd *exec.Cmd
+	switch t.Shell {
+	case "bash", "sh":
+		shell := t.Shell
+		if shell == "bash" {
+			shell = bashExecutable()
+		}
+		cmd = exec.Command(shell, "-c", command)
+	case "powershell":
+		ps := "powershell"
+		if _, err := exec.LookPath("pwsh"); err == nil {
+			ps = "pwsh"
+		}
+		cmd = exec.Command(ps, "-NoProfile", "-NonInteractive", "-Command", command)
+	}
+	if cmd != nil {
+		cmd.Dir = t.WorkDir
+		// shell 被杀死或先于后台任务退出时，持有输出管道的后代进程会让
+		// Wait 阻塞到管道关闭：WaitDelay 强关管道立即返回（2026-10-23）。
+		cmd.WaitDelay = bashWaitDelay
+	}
+	return cmd
+}
+
+// mergeStderrIntoOutput 失败命令的 stderr 不能只留在 Extra：ForModel/ForTUI
+// 都只读 Output，command not found 会变成一片空白，模型只能反复重试或误装
+// 依赖。后台路径与旧路径共用同一形状（I5）。
+func mergeStderrIntoOutput(output, stderr string, exitCode int) string {
+	if stderr != "" && (output == "" || exitCode != 0) {
+		if output != "" {
+			output += "\n"
+		}
+		output += "[stderr] " + stderr
+	}
+	return output
+}
+
+// executeWithJobs 后台路径：后台立返；前台超时晋升。进程等待的唯一所有者
+// 是注册表的 wait goroutine，晋升只是补注册。
+func (t *BashTool) executeWithJobs(ctx context.Context, command string, timeoutSec int, runInBackground bool) Result {
+	stdout, stderr := newJobBuffer(), newJobBuffer()
+	cmd := t.buildCmd(command)
+	if cmd == nil {
+		return Result{Err: fmt.Sprintf("unknown shell %q", t.Shell)}
+	}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+
+	if runInBackground {
+		if existing := t.Jobs.findRunning(command); existing != nil {
+			return Result{Output: fmt.Sprintf("identical command already running as background job %s; collect its output with job_output", existing.id)}
+		}
+		if t.Jobs.ActiveCount() >= maxBackgroundJobs {
+			return Result{Err: fmt.Sprintf("后台 job 已达上限 %d：先 /jobs kill 或 job_kill 释放", maxBackgroundJobs)}
+		}
+		if err := cmd.Start(); err != nil {
+			return Result{Err: err.Error()}
+		}
+		j := t.Jobs.Spawn(command, cmd, stdout, stderr)
+		id := t.Jobs.Register(j)
+		return Result{Output: fmt.Sprintf("background job %s started: %s\nCollect output with job_output (id %q); /jobs lists all; /jobs kill %s or job_kill stops it. Its completion arrives with the user's next message.", id, FirstLine(command), id, id)}
+	}
+
+	if err := cmd.Start(); err != nil {
+		return Result{Err: err.Error()}
+	}
+	j := t.Jobs.Spawn(command, cmd, stdout, stderr)
+
+	// turn 中止要能杀死仍在前台跑的命令：挂 watcher 监听 ctx；晋升后以
+	// stop 收刀——job 脱离 turn 生命周期，后续中止不波及。
+	stopAbort := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			j.kill()
+		case <-j.done:
+		case <-stopAbort:
+		}
+	}()
+
+	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-j.done:
+		return jobForegroundResult(j, stdout, stderr)
+	case <-timer.C:
+		close(stopAbort)
+		id := t.Jobs.Register(j)
+		soFar := mergeStderrIntoOutput(stdout.snapshot(), stderr.snapshot(), 1)
+		msg := fmt.Sprintf("[still running after %ds; moved to background job %s]\n%s", timeoutSec, id, soFar)
+		return Result{
+			Output:    msg,
+			Truncated: stdout.truncated(),
+			Extra: map[string]any{
+				"stderr":     stderr.snapshot(),
+				"durationMs": time.Since(j.started).Milliseconds(),
+			},
+		}
+	}
+}
+
+// jobForegroundResult 前台正常结束的结果装配：与旧路径同一形状（I5）。
+func jobForegroundResult(j *backgroundJob, stdout, stderr *jobBuffer) Result {
+	j.mu.Lock()
+	exitCode := j.exitCode
+	j.mu.Unlock()
+	output := mergeStderrIntoOutput(stdout.snapshot(), stderr.snapshot(), exitCode)
+	res := Result{
+		Output:    output,
+		Truncated: stdout.truncated() || stderr.truncated(),
+		Extra: map[string]any{
+			"exitCode":   exitCode,
+			"stderr":     stderr.snapshot(),
+			"durationMs": time.Since(j.started).Milliseconds(),
+		},
+	}
+	if exitCode == -1 {
+		res.Err = "command was killed before exit (aborted?)"
+	}
+	return res
+}
+
+// executeLegacy 无注册表的旧路径：CommandContext 超时即杀（裸构造的测试
+// 与既有语义保持不变）。
+func (t *BashTool) executeLegacy(ctx context.Context, command string, timeoutSec int) Result {
+	tctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 	var cmd *exec.Cmd
 	switch t.Shell {
@@ -116,15 +256,15 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, e
 		if shell == "bash" {
 			shell = bashExecutable()
 		}
-		cmd = exec.CommandContext(tctx, shell, "-c", a.Command)
+		cmd = exec.CommandContext(tctx, shell, "-c", command)
 	case "powershell":
 		ps := "powershell"
 		if _, err := exec.LookPath("pwsh"); err == nil {
 			ps = "pwsh"
 		}
-		cmd = exec.CommandContext(tctx, ps, "-NoProfile", "-NonInteractive", "-Command", a.Command)
+		cmd = exec.CommandContext(tctx, ps, "-NoProfile", "-NonInteractive", "-Command", command)
 	default:
-		return Result{Err: fmt.Sprintf("unknown shell %q", t.Shell)}, nil
+		return Result{Err: fmt.Sprintf("unknown shell %q", t.Shell)}
 	}
 	cmd.Dir = t.WorkDir
 	// shell 被超时杀死或先于后台任务退出时，持有输出管道的后代进程会让
@@ -154,22 +294,14 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, e
 		"stderr":     stderr.String(),
 		"durationMs": duration.Milliseconds(),
 	}
-	output := stdout.String()
-	// 失败命令的 stderr 不能只留在 Extra：ForModel/ForTUI 都只读 Output，
-	// command not found 会变成一片空白，模型只能反复重试或误装依赖。
-	if se := stderr.String(); se != "" && (output == "" || exitCode != 0) {
-		if output != "" {
-			output += "\n"
-		}
-		output += "[stderr] " + se
-	}
+	output := mergeStderrIntoOutput(stdout.String(), stderr.String(), exitCode)
 	res := Result{Output: output, Truncated: stdout.truncated || stderr.truncated, Extra: extra}
 	if timedOut {
-		res.Err = fmt.Sprintf("command timed out after %ds (killed); partial output follows", a.TimeoutSec)
+		res.Err = fmt.Sprintf("command timed out after %ds (killed); partial output follows", timeoutSec)
 	} else if runErr != nil && exitCode == -1 {
 		res.Err = runErr.Error()
 	}
-	return res, nil
+	return res
 }
 
 // limitBuffer 截断到上限的输出缓冲（超限记 truncated）。
