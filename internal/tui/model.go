@@ -275,7 +275,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case msg.Code == tea.KeyUp:
 		if m.editor.lineCount() > 1 && m.editor.curRow > 0 {
 			m.editor.Up()
-		} else if m.editor.Empty() && len(m.history) > 0 {
+		} else if (m.editor.Empty() || m.histDepth > 0) && len(m.history) > 0 {
 			m.histDepth = min(m.histDepth+1, len(m.history))
 			m.loadHistory()
 		}
@@ -343,7 +343,7 @@ func (m Model) editorDone(msg editorDoneMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) loadHistory() {
+func (m *Model) loadHistory() {
 	if m.histDepth == 0 {
 		m.editor.Clear()
 		return

@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	tea "charm.land/bubbletea/v2"
 )
 
 func TestInputLineBasicEditing(t *testing.T) {
@@ -95,5 +97,28 @@ func TestInputLineMultilinePaste(t *testing.T) {
 	}
 	if !strings.Contains(display, "+3L") {
 		t.Errorf("display = %q, 应标注 3 行", display)
+	}
+}
+
+
+// ↑/↓ 召回输入历史：loadHistory 曾用值接收者，Editor.Clear 重新赋值 lines
+// 后改动全落在 Model 副本上，功能写了却完全不生效。
+func TestArrowKeysRecallInputHistory(t *testing.T) {
+	m := New(Deps{ModelName: "m"})
+	m.history = []string{"第一条", "第二条"}
+	up := tea.KeyPressMsg{Code: tea.KeyUp}
+	down := tea.KeyPressMsg{Code: tea.KeyDown}
+
+	for _, tc := range []struct {
+		key  tea.KeyPressMsg
+		want string
+	}{
+		{up, "第二条"}, {up, "第一条"}, {down, "第二条"}, {down, ""},
+	} {
+		next, _ := m.handleKey(tc.key)
+		m = next.(Model)
+		if got := m.InputText(); got != tc.want {
+			t.Fatalf("按键后输入 = %q, want %q", got, tc.want)
+		}
 	}
 }
