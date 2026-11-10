@@ -512,7 +512,7 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 
 ---
 
-## 第 9 章 里程碑 M0–M5
+## 第 9 章 里程碑 M0–M6
 
 每个里程碑的验收 = **功能测试 + 不变量测试 + 收尾纯净清单**（3.4 节）三重门。
 
@@ -566,6 +566,19 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 - 不变量测试：I1 注入 golden 重放、I2 注入不触系统提示词前缀、I3 无幽灵 job；specdoc 锚点全绿
 
 压测修订（红队 → 方案变化）：砍阻塞等待（与前台晋升功能重叠，且免 superagent"等待即反模式"教训）；砍 30 分钟自动上限（dev server 会被误杀，改退出警告 + `/jobs` 人侧兜底）；新增幂等防御与并发上限；输出体积策略定案 tail+totalBytes；注入归属显式化为日志序纯函数。二期（完成通知即时打进滚动区，**待 T9 单队列落盘修复后**）与三期（唤醒回合，job/complete 作为合法回合开启者，**按需立项**）在此声明触发条件，防"顺手"蔓延。
+
+### M6 M5 收尾 + 二期通知 —— 立项（2026-11-11，计划见 docs/PLAN-20261111.md）
+
+范围：
+
+1. **T12-T14 实机冒烟**：SMOKE §4 三列登记（M5 唯一验收欠账）
+2. **M5 二期：job/completed 即时通知滚动区**（触发条件「待 T9 单队列落盘修复后」已于 2026-11-04 满足）：job 完成时滚动区即时出现单行暗色通知（复用 printScroll 安全通道），状态栏徽标联动清除；不唤醒回合（三期维持按需另立项）
+3. **文档治理收尾**（2026-11-11 已落地）：DEBT 索引 A 区补登 switchSession 与 jobs.go、WSL bash 行 stale 注记收口；调研稿 PLAN-NEXT.md 经三项拍板重写为 docs/PLAN-20261111.md（D2/D3/D4 拍板见决策变更记录）
+
+验收：后台 job 完成时滚动区即时出现单行通知、`/resume` 重放不重复轰炸；T12-T14 全过；全量回归绿。
+不变量测试：I7 通知对同一 job 只出现一次、重放收敛为历史暗色行（形状测试锁定）。
+
+设计约束：通知是 `job/completed` 既有事件的 TUI 投影，不新增日志事件；若实现中发现必须新增事件，须过 I1 golden 重放并在决策变更记录补登记。
 
 里程碑之外的特性生长以「决策变更记录」为记录；修复与测试类提交见 git log。
 
@@ -628,3 +641,6 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-11-02 | M5「后台 bash」立项（第 9 章，方案 A 惰性拾取）：bash `run_in_background` + promoteOnTimeout（前台超时晋升不杀）+ job_output/job_kill + `/jobs` 人侧直杀 + `job/completed` 事件按日志序归属下一个 user turn 尾部注入；六家调研（dsh/superagent/Reasonix/Claude Code/ZCode/Pi）证据落盘 `D:\\Temp\\sammal-3a-background-bash-research-2026-11-02.md`；红队压测修订：砍阻塞等待与 30min 自动上限、加幂等防御与并发上限 4、注入归属显式化为日志序纯函数 | superagent 启发 3a 复活为完整承接物：2026-10-23 bash 等待修复证实长命令阻塞是真实痛点；dsh 证明守卫与承接物可合一（晋升不杀）；Pi 列的四项成本 sammal 已有两项现成答案（I5 分离、WaitDelay 孤儿语义）。二期（空闲期滚动区通知，待 T9 修复）与三期（唤醒回合，按需）触发条件已在 M5 节声明 |
 | 2026-11-10 | 配置面新增 `shell` 键（7.2）：空 = 平台默认（Windows PowerShell，优先 pwsh），可填 bash/sh/powershell（含 pwsh 与 `.exe` 写法）或 bash 兼容 shell 的可执行文件（如 `niu.exe`）；启动时 `exec.LookPath` 校验，配置错误即时报错；**否决内置 niubash** | 用户故事：Windows 上要能绕开 PATH 顺序直接指定 shell（niu.exe 等），避免"命令到底跑在哪"不可控。内置否决理由：niubash Windows 载荷约 16MB/平台且携带 GPLv2 的 niu-git（再分发义务）、解压目录进 PATH 会换掉 agent 的 git、未签名二进制触发 SmartScreen/Defender、非 Windows 系统 bash 已足够；配置项 + 用户自行安装即可获得同等收益，且不改变 MIT 单二进制发布形态 |
 | 2026-11-10 | Windows 默认 shell 由「PATH 中 bash 优先」改为 PowerShell（`DetectShell` 直接返回 powershell，`powershellExecutable()` 优先 pwsh）；`ResolveShell` 识别 `powershell.exe` / `pwsh.exe`；bash 路径仅在显式配置时使用 | 用户裁决：Windows 上模型写 PowerShell 更稳定，避免 Git Bash 与 WSL 两套路径语义；shell 环境在进程边缘不可控（PATH 顺序、WSL launcher），自动探测的价值低于显式默认。代价：Windows 上要用 bash 需显式写 `shell = "bash"` |
+| 2026-11-11 | M6 立项（第 9 章）：M5 收尾（T12-T14 冒烟）+ M5 二期通知（job/completed 即时通知滚动区，触发条件已满足）+ 文档治理收尾；调研稿 PLAN-NEXT.md 重写为 docs/PLAN-20261111.md | M5 二期是第 9 章既定声明，前置 T9 修复已于 2026-11-04 解除；验收欠账清零后项目回到「无未完成交付物」状态 |
+| 2026-11-11 | 否决引入 agent-context-manager（acm）替换 compaction 及 compress/decompress/search_context/acp_status 四工具；「可恢复压缩（decompress = 按会话日志重建被压缩段投影）」与「search_context」转条件触发候选（首个「压缩丢失关键细节」实际痛点时原生实现，见 docs/PLAN-20261111.md §2） | 实测 acm 为独立 CLI 二进制（面向 Claude Code/Codex，`.acm/` SQLite 存储，1 star），非可导入 Go 库；SQLite 外部状态与 I3 事件溯源相抵（压缩事件必须落会话 JSONL）；sammal 日志无损保留原文，恢复能力天然存在；四工具违反工具 schema <1500 token 预算（6.3），acp_status 与状态栏 ctx%/缓存命中率重复 |
+| 2026-11-11 | 否决引入 headroom-go 作为 ContentRouter；「软阈值 StatusEvent」并入条件触发（与既有 DEBT「turn 内不自动压缩」共用触发器：首个实际上下文溢出） | 实测 headroom-go 核心逻辑在 internal/ 包不可导入（CLI/proxy 形态）；状态栏 ctx% ≥70% 变黄已是现存软信号 |
