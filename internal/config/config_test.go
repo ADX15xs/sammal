@@ -10,6 +10,7 @@ func TestLoadDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	toml := `
 default_model = "local"
+shell = "bash"
 
 [models.local]
 base_url = "http://localhost:11434/v1"
@@ -27,6 +28,9 @@ editor = "nvim"
 	}
 	if c.Models["local"].ContextWindow != DefaultContextWindow {
 		t.Errorf("context_window = %d, 默认值未填充", c.Models["local"].ContextWindow)
+	}
+	if c.Shell != "bash" {
+		t.Errorf("shell = %q, 未解析", c.Shell)
 	}
 	name, m, err := c.Resolve("")
 	if err != nil || name != "local" || m.Model != "qwen3:32b" {

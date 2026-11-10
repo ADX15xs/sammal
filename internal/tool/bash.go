@@ -21,9 +21,10 @@ import (
 // 命令超时不杀、晋升为后台 job（promoteOnTimeout）。Jobs 为 nil（测试裸
 // 构造）保持旧语义：超时即杀。
 type BashTool struct {
-	WorkDir string
-	Shell   string // "bash" 或 "powershell"，会话创建时探测定格
-	Jobs    *JobRegistry
+	WorkDir   string
+	Shell     string // "bash"、"sh" 或 "powershell"，会话创建时定格
+	ShellPath string // 非空 = 用该可执行文件跑 bash 类命令（配置的 shell，如 niu.exe）
+	Jobs      *JobRegistry
 }
 
 const (
@@ -120,17 +121,25 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (Result, e
 	return t.executeLegacy(ctx, a.Command, a.TimeoutSec), nil
 }
 
+// shellExecutable 返回 bash 类命令的可执行文件：配置显式指定优先，
+// 否则 bash 走平台探测（避开 WSL launcher），sh 用字面名。
+func (t *BashTool) shellExecutable() string {
+	if t.ShellPath != "" {
+		return t.ShellPath
+	}
+	if t.Shell == "bash" {
+		return bashExecutable()
+	}
+	return t.Shell
+}
+
 // buildCmd 构造命令（双 shell）。后台路径不使用 CommandContext——晋升后
 // 的 job 必须脱离 turn ctx 存活，击杀一律走 Process.Kill。
 func (t *BashTool) buildCmd(command string) *exec.Cmd {
 	var cmd *exec.Cmd
 	switch t.Shell {
 	case "bash", "sh":
-		shell := t.Shell
-		if shell == "bash" {
-			shell = bashExecutable()
-		}
-		cmd = exec.Command(shell, "-c", command)
+		cmd = exec.Command(t.shellExecutable(), "-c", command)
 	case "powershell":
 		ps := "powershell"
 		if _, err := exec.LookPath("pwsh"); err == nil {
@@ -252,11 +261,7 @@ func (t *BashTool) executeLegacy(ctx context.Context, command string, timeoutSec
 	var cmd *exec.Cmd
 	switch t.Shell {
 	case "bash", "sh":
-		shell := t.Shell
-		if shell == "bash" {
-			shell = bashExecutable()
-		}
-		cmd = exec.CommandContext(tctx, shell, "-c", command)
+		cmd = exec.CommandContext(tctx, t.shellExecutable(), "-c", command)
 	case "powershell":
 		ps := "powershell"
 		if _, err := exec.LookPath("pwsh"); err == nil {

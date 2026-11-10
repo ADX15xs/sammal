@@ -72,6 +72,23 @@ func BuildSystemPrompt(f PromptFacts) string {
 	return fmt.Sprintf(systemPromptTemplate, f.Cwd, f.OS, f.Shell, project, hint)
 }
 
+// ResolveShell 把配置的 shell 归一为「提示词用的类型」+「显式可执行文件」。
+// 空值自动探测；bash/sh/powershell（含 pwsh）走内置路径；其余值视为
+// bash 兼容 shell 的可执行文件（如 niu.exe），提示词按 bash 处理。
+func ResolveShell(configured string) (kind, executable string) {
+	v := strings.TrimSpace(configured)
+	switch strings.ToLower(v) {
+	case "":
+		return DetectShell(), ""
+	case "powershell", "pwsh":
+		return "powershell", ""
+	case "bash", "sh":
+		return strings.ToLower(v), ""
+	default:
+		return "bash", v
+	}
+}
+
 // DetectShell 探测 bash 工具将使用的 shell：PATH 中有 bash 用 bash；
 // Windows 上无 bash 则降级 PowerShell（第 6.3 节，Reasonix 验证过的降级）。
 func DetectShell() string {

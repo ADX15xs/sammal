@@ -349,7 +349,6 @@ func TestForTUIDuration(t *testing.T) {
 	}
 }
 
-
 // 失败命令的 stderr 必须进 Output：ForModel/ForTUI 只读 Output，否则
 // command not found 变成一片空白，模型只能反复重试或误装依赖。
 func TestBashStderrVisibleOnFailure(t *testing.T) {
@@ -399,6 +398,17 @@ func TestBashExecutableSkipsWSLLauncher(t *testing.T) {
 	}
 }
 
+// 配置的 shell 必须压过平台探测：显式可执行文件即最终解释器。
+func TestShellExecutableOverride(t *testing.T) {
+	bt := &BashTool{Shell: "bash", ShellPath: "/opt/niu"}
+	if got := bt.shellExecutable(); got != "/opt/niu" {
+		t.Errorf("shellExecutable() = %q，配置路径未生效", got)
+	}
+	// 未配置时 bash 走平台探测、sh 用字面名。
+	if got := (&BashTool{Shell: "sh"}).shellExecutable(); got != "sh" {
+		t.Errorf("sh 应使用字面名，得到 %q", got)
+	}
+}
 
 // 实机回归：修复前 bash 工具跑进 WSL 发行版，Windows PATH 里的 CLI 不可见。
 // 未安装该 CLI 的机器跳过，不影响 CI。

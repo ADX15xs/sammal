@@ -65,7 +65,16 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	if err != nil {
 		return err
 	}
+	// bash 工具的 shell：配置显式指定优先，空值按平台探测。可执行文件
+	// 启动时校验，配置错误在启动暴露而不是每次工具调用才发现。
+	shellKind, shellExecutable := agent.ResolveShell(cfg.Shell)
+	if shellExecutable != "" {
+		if _, err := exec.LookPath(shellExecutable); err != nil {
+			return fmt.Errorf("配置的 shell 不可用（shell = %q）：%w", shellExecutable, err)
+		}
+	}
 	facts := agent.FactsFromEnv(cwd)
+	facts.Shell = shellKind
 	root, err := session.DataRoot()
 	if err != nil {
 		return fmt.Errorf("定位数据目录失败：%w", err)
@@ -75,12 +84,12 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	defer cancelRoot()
 
 	sess, err := session.Create(root, session.Header{
-		ID:       session.NewID(),
-		Cwd:      cwd,
-		Model:    modelName,
+		ID:    session.NewID(),
+		Cwd:   cwd,
+		Model: modelName,
 		// Created 是 UTC 时刻，与 /new（agent.newSession）同格式。不能拿
 		// 本地日期拼 "Z"——那会伪造时区，落盘出未来时刻。
-		Created: time.Now().UTC().Format(time.RFC3339),
+		Created:  time.Now().UTC().Format(time.RFC3339),
 		OS:       facts.OS,
 		Shell:    facts.Shell,
 		AgentsMD: facts.Project,
@@ -106,7 +115,7 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 		&tool.ReadTool{WorkDir: cwd},
 		&tool.WriteTool{WorkDir: cwd},
 		&tool.EditTool{WorkDir: cwd},
-		&tool.BashTool{WorkDir: cwd, Shell: facts.Shell, Jobs: jobs},
+		&tool.BashTool{WorkDir: cwd, Shell: facts.Shell, ShellPath: shellExecutable, Jobs: jobs},
 		&tool.GrepTool{WorkDir: cwd},
 		&tool.GlobTool{WorkDir: cwd},
 		&tool.JobOutputTool{Jobs: jobs},

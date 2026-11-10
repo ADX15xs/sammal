@@ -123,6 +123,8 @@ go build ./cmd/sammal                # Windows 得 sammal.exe，Linux/macOS 得 
 
 ```toml
 default_model = "qwen3-local"        # 日常启动即用
+shell = ""                           # bash 工具的 shell：空=自动探测；bash / sh / powershell；
+                                     # 也可填 bash 兼容 shell 的可执行文件（如 niu.exe）
 
 [models.qwen3-local]                 # 本地 Ollama 主力
 base_url       = "http://localhost:11434/v1"
@@ -138,6 +140,8 @@ context_window = 131072
 [ui]
 editor = ""                          # Ctrl+E 默认 $VISUAL/$EDITOR，可强制指定
 ```
+
+`shell` 填路径时 Windows 请用单引号（如 `shell = 'C:\Tools\niu.exe'`），双引号里反斜杠是转义符；配置错误会在启动时报错，而非留到工具调用。shell 随会话定格，改完重启生效。
 
 密钥不必设成 Windows 全局环境变量——在配置同目录放一个 `.env` 即可：
 

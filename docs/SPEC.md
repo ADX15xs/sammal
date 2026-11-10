@@ -312,7 +312,7 @@ func ForTUI(r Result) string
 | `read` | 读文件，行号前缀；offset/limit 参数；canonical 含 `content` + `truncated` |
 | `write` | 整文件写入；父目录自动创建 |
 | `edit` | `old_string`/`new_string` 精确匹配且**必须唯一**；命中 0 或 >1 次都报错并回显命中数与上下文（不做 fuzzy 容错——YAGNI，模型自己会修正） |
-| `bash` | 命令 + 超时（默认 120s）；工作目录 = 会话根；**Windows shell 解析**：`bashExecutable()` 优先 Git/MSYS 的 `bash.exe`，跳过 `System32` / `WindowsApps` 的 WSL launcher；PATH 中确实没有 bash 时切 PowerShell，并向模型注入"写 PowerShell 语法，不要用 bash 语法、不要用 `&&`"提示（Reasonix 验证过的一行解决一类错误）；命令失败时 stderr 并入 `Result.Output`；`DetectShell()` 仍按 `exec.LookPath("bash")` 定格会话 shell |
+| `bash` | 命令 + 超时（默认 120s）；工作目录 = 会话根；**Windows shell 解析**：`bashExecutable()` 优先 Git/MSYS 的 `bash.exe`，跳过 `System32` / `WindowsApps` 的 WSL launcher；PATH 中确实没有 bash 时切 PowerShell，并向模型注入"写 PowerShell 语法，不要用 bash 语法、不要用 `&&`"提示（Reasonix 验证过的一行解决一类错误）；命令失败时 stderr 并入 `Result.Output`；`DetectShell()` 仍按 `exec.LookPath("bash")` 定格会话 shell；配置 `shell` 非空时优先（7.2）：`bash`/`sh`/`powershell` 选内置路径，其余值视为 bash 兼容 shell 的可执行文件（如 `niu.exe`） |
 | `grep` | 内容搜索；PATH 中有 ripgrep 则委托，否则纯 Go 实现（walk + regexp）；输出 `path:line:text`，上限截断 |
 | `glob` | 模式匹配文件列表，上限截断 |
 
@@ -446,6 +446,7 @@ M4 后增量（2026-08-29，见决策变更记录）。定位：skill 与项目�
 # ~/.config/sammal/config.toml（Windows: %APPDATA%\sammal\config.toml）
 
 default_model = "qwen3-local"        # 用户故事：日常启动即用，不想每次选
+shell = ""                           # 用户故事：Windows 上想换掉 Git Bash / 指定 niu.exe；空=自动探测
 
 [models.qwen3-local]                 # 用户故事：本地 Ollama 主力模型
 base_url      = "http://localhost:11434/v1"

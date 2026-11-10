@@ -40,6 +40,31 @@ func TestBuildSystemPromptPowerShellHint(t *testing.T) {
 	}
 }
 
+func TestResolveShell(t *testing.T) {
+	cases := []struct {
+		configured string
+		kind       string
+		executable string
+	}{
+		{"powershell", "powershell", ""},
+		{"pwsh", "powershell", ""},
+		{"bash", "bash", ""},
+		{"sh", "sh", ""},
+		{" NIU.EXE ", "bash", "NIU.EXE"},
+		{`C:\Tools\niu.exe`, "bash", `C:\Tools\niu.exe`},
+	}
+	for _, c := range cases {
+		kind, executable := ResolveShell(c.configured)
+		if kind != c.kind || executable != c.executable {
+			t.Errorf("ResolveShell(%q) = %q, %q；期望 %q, %q", c.configured, kind, executable, c.kind, c.executable)
+		}
+	}
+	// 空值 = 平台探测，可执行文件留空走自动解析。
+	if kind, executable := ResolveShell(""); kind != DetectShell() || executable != "" {
+		t.Errorf(`ResolveShell("") = %q, %q；期望 %q, ""`, kind, executable, DetectShell())
+	}
+}
+
 // I2：AGENTS.md 内容是 PromptFacts 事实之一，首拍后重建必字节一致；
 // 尾部换行不进入提示词（首拍读入与 header 重建共用同一裁剪）。
 func TestBuildSystemPromptProjectSection(t *testing.T) {

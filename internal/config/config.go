@@ -27,6 +27,10 @@ type Config struct {
 	DefaultModel string           `toml:"default_model"`
 	Models       map[string]Model `toml:"models"`
 	UI           UI               `toml:"ui"`
+	// Shell 是 bash 工具使用的 shell，空串 = 按平台自动探测。可写
+	// bash / sh / powershell（含 pwsh）；其余值视为 bash 兼容 shell 的
+	// 可执行文件（如 niu.exe），提示词按 bash 处理。
+	Shell string `toml:"shell"`
 }
 
 // DefaultPath 返回系统默认配置路径（~/.config/sammal/config.toml，
