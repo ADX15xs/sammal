@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"sammal/internal/human"
 )
 
 // JobRegistry 是后台 bash job 注册表（M5 第 6.3 节）：后台命令与被晋升
@@ -45,6 +47,22 @@ type JobInfo struct {
 	DurationMs int64
 }
 
+// FormatLine 渲染结算事实的人类可读单行（M5 二期）：TUI 即时通知与
+// /resume 转录共用，同一结算对用户恰好一行。模型侧注入走 session 的
+// jobNote（字节进请求前缀，I1/I2 golden），两者不可混用。
+func (info JobInfo) FormatLine() string {
+	dur := human.Duration(time.Duration(info.DurationMs) * time.Millisecond)
+	cmd := FirstLine(info.Command)
+	switch info.Status {
+	case JobFailed:
+		return fmt.Sprintf("[job %s] 失败（退出码 %d）：%s（耗时 %s）", info.ID, info.ExitCode, cmd, dur)
+	case JobKilled:
+		return fmt.Sprintf("[job %s] 已击杀：%s（耗时 %s）", info.ID, cmd, dur)
+	default:
+		return fmt.Sprintf("[job %s] 完成：%s（耗时 %s）", info.ID, cmd, dur)
+	}
+}
+
 // JobView 是 /jobs 与 job_output 列表的单行视图。
 type JobView struct {
 	ID      string
@@ -81,7 +99,7 @@ func NewJobRegistry() *JobRegistry {
 	return &JobRegistry{settled: make(chan JobInfo, 16)}
 }
 
-// Settled 返回结算通知通道（TUI 状态栏徽标的唤醒源）。
+// Settled 返回结算通知通道（TUI 即时通知与状态栏徽标的唤醒源）。
 func (r *JobRegistry) Settled() <-chan JobInfo { return r.settled }
 
 // ActiveCount 运行中的已入册 job 数（状态栏徽标与退出警告）。

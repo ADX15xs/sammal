@@ -119,14 +119,15 @@ func (m Model) Init() tea.Cmd {
 
 type agentEventMsg struct{ ev agent.Event }
 type agentClosedMsg struct{}
-type turnTickMsg struct{}   // 生成中的每秒心跳：刷新计时器/状态栏
-type jobSettledMsg struct{} // 后台 job 结算：刷新状态栏徽标
+type turnTickMsg struct{} // 生成中的每秒心跳：刷新计时器/状态栏
+type jobSettledMsg struct { // 后台 job 结算：即时通知滚动区（M5 二期）+ 徽标刷新
+	info tool.JobInfo
+}
 
 // listenJobs 等 job 结算通知；通道不关闭，程序退出即随进程终止。
 func listenJobs(ch <-chan tool.JobInfo) tea.Cmd {
 	return func() tea.Msg {
-		<-ch
-		return jobSettledMsg{}
+		return jobSettledMsg{info: <-ch}
 	}
 }
 
@@ -162,7 +163,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyAgentEvent(msg.ev)
 
 	case jobSettledMsg:
-		return m, listenJobs(m.deps.Jobs.Settled()) // 徽标随重渲染自动刷新
+		// M5 二期：结算即时通知滚动区，Settled 每 job 恰发一次（I7 单次），
+		// /resume 转录收敛同款行；徽标随重渲染自动刷新。
+		return m, tea.Batch(m.printScroll(dim("| "+msg.info.FormatLine())), listenJobs(m.deps.Jobs.Settled()))
 
 	case turnTickMsg:
 		return m.turnTick()

@@ -167,3 +167,20 @@ func TestJobBufferRing(t *testing.T) {
 		t.Fatalf("tail(4) = %q", got)
 	}
 }
+
+// M5 二期：结算单行的人类可读格式（TUI 即时通知与 /resume 转录共用）。
+func TestJobInfoFormatLine(t *testing.T) {
+	cases := []struct {
+		info JobInfo
+		want string
+	}{
+		{JobInfo{ID: "j1", Command: "npm run dev", Status: JobDone, DurationMs: 12000}, "[job j1] 完成：npm run dev（耗时 12s）"},
+		{JobInfo{ID: "j2", Command: "go build ./...", Status: JobFailed, ExitCode: 1, DurationMs: 62000}, "[job j2] 失败（退出码 1）：go build ./...（耗时 1m02s）"},
+		{JobInfo{ID: "j3", Command: "sleep 30", Status: JobKilled, DurationMs: 0}, "[job j3] 已击杀：sleep 30（耗时 0s）"},
+	}
+	for _, c := range cases {
+		if got := c.info.FormatLine(); got != c.want {
+			t.Errorf("FormatLine = %q, want %q", got, c.want)
+		}
+	}
+}

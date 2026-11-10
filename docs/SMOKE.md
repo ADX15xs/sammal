@@ -292,19 +292,25 @@ Linux/macOS 用：`printf '中%.0s' {1..1500} | xclip -selection clipboard`（�
 
 1. 对 agent 说：`用 bash 的 run_in_background 跑 sleep 30`
 2. 通过 = 立即返回 "background job j1 started"，输入框马上可用（终端不锁）；状态栏出现 `bg 1`
-3. 输入 `/jobs` = 看到 `[j1 running] sleep 30`；`/jobs kill j1` = 显示已击杀；`bg` 徽标消失
+3. 输入 `/jobs` = 看到 `[j1 running] sleep 30`；`/jobs kill j1` = 显示已击杀；`bg` 徽标消失；**（M5 二期）击杀结算后滚动区出现单行暗色 `[job j1] 已击杀：sleep 30（耗时 …）`**
 
 ### T13 前台晋升 + 注入（M5）
 
 1. 对 agent 说：`跑 sleep 5; echo done-marker，timeout_seconds=1`
-2. 通过 = 约 1 秒后返回 `[still running after 1s; moved to background job …]`（不是等满 5 秒）；job 结束后状态栏 `bg` 归零
+2. 通过 = 约 1 秒后返回 `[still running after 1s; moved to background job …]`（不是等满 5 秒）；job 结束后状态栏 `bg` 归零；**（M5 二期）结算时滚动区出现单行暗色通知 `[job jN] 完成：sleep 5; echo done-marker（耗时 5s）`——生成中随流落盘、与输出不互吞**
 3. 随便再发一句话（如「后台任务结果是什么」），通过 = 模型回答能引用 done-marker（job/completed 注入生效）；等满 5 秒才返回 = 晋升未生效（失败）
 
 ### T14 退出警告 + 结算（M5）
 
 1. 先起一个后台 job（同 T12），再按 ctrl+c
 2. 通过 = 第一次只出现警告「N 个后台 job 正在运行…」不退出；再按一次才退出；无警告直接退出 = 失败
-3. `/resume` 重开：通过 = 转录里能看到 killed 结算记录，无幽灵运行态
+3. `/resume` 重开：通过 = 转录里能看到 killed 结算记录，无幽灵运行态；**（M5 二期）每个 killed 结算收敛为一行暗色 `[job jN] 已击杀：…`——退出瞬间的结算不落屏（程序已退出），只在转录可见**
+
+### T16 空闲期结算通知（M5 二期）
+
+1. 对 agent 说：`用 bash 的 run_in_background 跑 sleep 3`，之后**不输入任何内容**干等
+2. 通过 = 约 3 秒后滚动区自行出现单行暗色 `[job jN] 完成：sleep 3（耗时 3s）`，`bg` 徽标同时消失；无通知 = 通知未接线，重复多行 = I7 违例，均判失败
+3. `/resume` 重开：通过 = 转录里同一 job 恰好一行 `[job jN] …`（与实况通知收敛，不重复轰炸）
 
 ---
 
@@ -354,6 +360,7 @@ Linux/macOS 用：`printf '中%.0s' {1..1500} | xclip -selection clipboard`（�
 | T12 后台立返+/jobs | ☐ 通过 ☐ 失败 ☐ 未测 | ☐ 通过 ☐ 失败 ☐ 未测 | ☐ 通过 ☐ 失败 ☐ 未测 |
 | T13 前台晋升+注入 | ☐ 通过 ☐ 失败 ☐ 未测 | ☐ 通过 ☐ 失败 ☐ 未测 | ☐ 通过 ☐ 失败 ☐ 未测 |
 | T14 退出警告+结算 | ☐ 通过 ☐ 失败 ☐ 未测 | ☐ 通过 ☐ 失败 ☐ 未测 | ☐ 通过 ☐ 失败 ☐ 未测 |
+| T16 空闲期结算通知 | ☐ 通过 ☐ 失败 ☐ 未测 | ☐ 通过 ☐ 失败 ☐ 未测 | ☐ 通过 ☐ 失败 ☐ 未测 |
 | 观察项 空行 artifact | ❌ 出现（见T6结果，历史登记予以保留）；2026-11-04 23:11 三轮复测未见成片空行，本轮不阻塞关闭 | ☐ 正常 ☐ 出现 ☐ 未测 | ☐ 正常 ☐ 出现 ☐ 未测 |
 
 登记时顺手记下测试时的窗口大致尺寸（列×行，或「最大化」）——错位是宽度折算问题，复测环境必须可还原。

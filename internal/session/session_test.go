@@ -459,3 +459,15 @@ func TestTranscriptTrimsBlankPadding(t *testing.T) {
 		t.Fatalf("转录 = %q, want 单条裁净 padding 的正文", lines)
 	}
 }
+
+// M5 二期：job/completed 在转录收敛为单行暗色历史（与实况通知同格式），
+// 每个结算事件恰好一行，不重复轰炸。
+func TestTranscriptJobCompleted(t *testing.T) {
+	s := newSession(t)
+	s.Append(TypeJobCompleted, JobCompletedData{ID: "j1", Command: "sleep 30", Status: "killed", DurationMs: 2000})
+	s.Append(TypeJobCompleted, JobCompletedData{ID: "j2", Command: "npm run dev", Status: "done", DurationMs: 62000})
+	lines := s.Transcript()
+	if len(lines) != 2 || lines[0] != "| [job j1] 已击杀：sleep 30（耗时 2s）" || lines[1] != "| [job j2] 完成：npm run dev（耗时 1m02s）" {
+		t.Fatalf("转录 job 行 = %q", lines)
+	}
+}

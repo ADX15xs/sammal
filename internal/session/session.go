@@ -695,6 +695,11 @@ func (s *Session) Transcript() []string {
 			lines = append(lines, dimLine("<- "+tool.ForTUI(d.Canonical)))
 		case TypeCompactionHappened:
 			lines = append(lines, dimLine("[compaction] 上下文已压缩"))
+		case TypeJobCompleted:
+			var d JobCompletedData
+			json.Unmarshal(env.Data, &d)
+			// M5 二期：转录与实况通知共用 FormatLine，同一结算回放恰好一行。
+			lines = append(lines, dimLine(tool.JobInfo{ID: d.ID, Command: d.Command, Status: d.Status, ExitCode: d.ExitCode, DurationMs: d.DurationMs}.FormatLine()))
 		}
 	}
 	return lines
