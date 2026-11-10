@@ -133,6 +133,14 @@ func (t *BashTool) shellExecutable() string {
 	return t.Shell
 }
 
+// powershellExecutable 优先 pwsh（PowerShell 7+），没有则用 Windows 内置。
+func powershellExecutable() string {
+	if _, err := exec.LookPath("pwsh"); err == nil {
+		return "pwsh"
+	}
+	return "powershell"
+}
+
 // buildCmd 构造命令（双 shell）。后台路径不使用 CommandContext——晋升后
 // 的 job 必须脱离 turn ctx 存活，击杀一律走 Process.Kill。
 func (t *BashTool) buildCmd(command string) *exec.Cmd {
@@ -141,11 +149,7 @@ func (t *BashTool) buildCmd(command string) *exec.Cmd {
 	case "bash", "sh":
 		cmd = exec.Command(t.shellExecutable(), "-c", command)
 	case "powershell":
-		ps := "powershell"
-		if _, err := exec.LookPath("pwsh"); err == nil {
-			ps = "pwsh"
-		}
-		cmd = exec.Command(ps, "-NoProfile", "-NonInteractive", "-Command", command)
+		cmd = exec.Command(powershellExecutable(), "-NoProfile", "-NonInteractive", "-Command", command)
 	}
 	if cmd != nil {
 		cmd.Dir = t.WorkDir
@@ -263,11 +267,7 @@ func (t *BashTool) executeLegacy(ctx context.Context, command string, timeoutSec
 	case "bash", "sh":
 		cmd = exec.CommandContext(tctx, t.shellExecutable(), "-c", command)
 	case "powershell":
-		ps := "powershell"
-		if _, err := exec.LookPath("pwsh"); err == nil {
-			ps = "pwsh"
-		}
-		cmd = exec.CommandContext(tctx, ps, "-NoProfile", "-NonInteractive", "-Command", command)
+		cmd = exec.CommandContext(tctx, powershellExecutable(), "-NoProfile", "-NonInteractive", "-Command", command)
 	default:
 		return Result{Err: fmt.Sprintf("unknown shell %q", t.Shell)}
 	}

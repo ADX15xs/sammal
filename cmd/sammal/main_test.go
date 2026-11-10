@@ -64,6 +64,26 @@ func TestEditorCommandResolution(t *testing.T) {
 	os.Unsetenv("VISUAL")
 }
 
+// 配置的 shell 不可用必须在启动时失败，而不是留到每次工具调用。
+func TestRunRejectsUnavailableShell(t *testing.T) {
+	toml := `
+default_model = "alpha"
+shell = "sammal-no-such-shell"
+
+[models.alpha]
+base_url = "http://localhost:1/v1"
+model = "model-a"
+`
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := run(strings.NewReader(""), io.Discard, path)
+	if err == nil || !strings.Contains(err.Error(), "配置的 shell 不可用") {
+		t.Fatalf("不可用 shell 应在启动报错，得到 %v", err)
+	}
+}
+
 func TestModelSpecsSorted(t *testing.T) {
 	cfg, _ := loadTestConfig(t)
 	specs := modelSpecs(cfg, nil)

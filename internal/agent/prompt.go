@@ -73,30 +73,32 @@ func BuildSystemPrompt(f PromptFacts) string {
 }
 
 // ResolveShell 把配置的 shell 归一为「提示词用的类型」+「显式可执行文件」。
-// 空值自动探测；bash/sh/powershell（含 pwsh）走内置路径；其余值视为
-// bash 兼容 shell 的可执行文件（如 niu.exe），提示词按 bash 处理。
+// 空值自动探测；bash/sh/powershell（含 pwsh、带 .exe 写法）走内置路径；
+// 其余值视为 bash 兼容 shell 的可执行文件（如 niu.exe），提示词按 bash 处理。
 func ResolveShell(configured string) (kind, executable string) {
 	v := strings.TrimSpace(configured)
 	switch strings.ToLower(v) {
 	case "":
 		return DetectShell(), ""
-	case "powershell", "pwsh":
+	case "powershell", "pwsh", "powershell.exe", "pwsh.exe":
 		return "powershell", ""
-	case "bash", "sh":
-		return strings.ToLower(v), ""
+	case "bash", "bash.exe":
+		return "bash", ""
+	case "sh", "sh.exe":
+		return "sh", ""
 	default:
 		return "bash", v
 	}
 }
 
-// DetectShell 探测 bash 工具将使用的 shell：PATH 中有 bash 用 bash；
-// Windows 上无 bash 则降级 PowerShell（第 6.3 节，Reasonix 验证过的降级）。
+// DetectShell 探测 bash 工具的默认 shell：Windows 默认 PowerShell
+// （buildCmd 优先 pwsh），其余平台 PATH 中有 bash 用 bash、否则 sh。
 func DetectShell() string {
-	if _, err := exec.LookPath("bash"); err == nil {
-		return "bash"
-	}
 	if runtime.GOOS == "windows" {
 		return "powershell"
+	}
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash"
 	}
 	return "sh"
 }

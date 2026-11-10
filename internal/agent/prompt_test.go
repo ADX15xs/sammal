@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -48,8 +49,12 @@ func TestResolveShell(t *testing.T) {
 	}{
 		{"powershell", "powershell", ""},
 		{"pwsh", "powershell", ""},
+		{"powershell.exe", "powershell", ""},
+		{"PWSH.EXE", "powershell", ""},
 		{"bash", "bash", ""},
+		{"BASH.EXE", "bash", ""},
 		{"sh", "sh", ""},
+		{"sh.exe", "sh", ""},
 		{" NIU.EXE ", "bash", "NIU.EXE"},
 		{`C:\Tools\niu.exe`, "bash", `C:\Tools\niu.exe`},
 	}
@@ -62,6 +67,16 @@ func TestResolveShell(t *testing.T) {
 	// 空值 = 平台探测，可执行文件留空走自动解析。
 	if kind, executable := ResolveShell(""); kind != DetectShell() || executable != "" {
 		t.Errorf(`ResolveShell("") = %q, %q；期望 %q, ""`, kind, executable, DetectShell())
+	}
+}
+
+// Windows 默认 PowerShell，不再因 PATH 中有 bash 而选用 bash。
+func TestDetectShellWindowsDefault(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("仅 Windows 有 PowerShell 默认行为")
+	}
+	if got := DetectShell(); got != "powershell" {
+		t.Errorf("Windows 默认 shell = %q，期望 powershell", got)
 	}
 }
 
