@@ -312,11 +312,11 @@ func ForTUI(r Result) string
 | `read` | 读文件，行号前缀；offset/limit 参数；canonical 含 `content` + `truncated` |
 | `write` | 整文件写入；父目录自动创建 |
 | `edit` | `old_string`/`new_string` 精确匹配且**必须唯一**；命中 0 或 >1 次都报错并回显命中数与上下文（不做 fuzzy 容错——YAGNI，模型自己会修正） |
-| `bash` | 命令 + 超时（默认 120s）；工作目录 = 会话根；**Windows shell 解析**：`bashExecutable()` 优先 Git/MSYS 的 `bash.exe`，跳过 `System32` / `WindowsApps` 的 WSL launcher；PATH 中确实没有 bash 时切 PowerShell，并向模型注入"写 PowerShell 语法，不要用 bash 语法、不要用 `&&`"提示（Reasonix 验证过的一行解决一类错误）；命令失败时 stderr 并入 `Result.Output`；`DetectShell()` 仍按 `exec.LookPath("bash")` 定格会话 shell；配置 `shell` 非空时优先（7.2）：`bash`/`sh`/`powershell` 选内置路径，其余值视为 bash 兼容 shell 的可执行文件（如 `niu.exe`） |
+| `bash` | 命令 + 超时（默认 120s）；工作目录 = 会话根；**shell 解析**：Windows 默认 PowerShell（`powershellExecutable()` 优先 `pwsh`，不再因 PATH 中有 bash 而选 bash），其余平台 PATH 中有 bash 用 bash、否则 sh；配置 `shell` 非空时优先（7.2）：`bash`/`sh`/`powershell`（含 `pwsh`、`.exe` 写法）选内置路径，其余值视为 bash 兼容 shell 的可执行文件（如 `niu.exe`）；PowerShell 下向模型注入"写 PowerShell 语法，不要用 bash 语法、不要用 `&&`"提示（Reasonix 验证过的一行解决一类错误）；命令失败时 stderr 并入 `Result.Output`；显式配置 bash 时 `bashExecutable()` 仍优先 Git/MSYS 的 `bash.exe`，跳过 `System32` / `WindowsApps` 的 WSL launcher |
 | `grep` | 内容搜索；PATH 中有 ripgrep 则委托，否则纯 Go 实现（walk + regexp）；输出 `path:line:text`，上限截断 |
 | `glob` | 模式匹配文件列表，上限截断 |
 
-> 📌 **实现说明（2026-11-04）**：上表已按现行实现更新。补充边界：`DetectShell()` 仍按 `exec.LookPath("bash")` 定格会话 shell；`bashExecutable()` 仅负责 `BashTool` 执行路径，优先 Git/MSYS `bash.exe`，跳过 WSL launcher；命令失败时 stderr 并入 `Result.Output`（见 `DEBT.md` 对应行、`docs/SMOKE.md` §6）。
+> 📌 **实现说明（2026-11-10）**：上表已按现行实现更新。补充边界：`DetectShell()` 在 Windows 返回 `powershell`（优先 pwsh），其余平台按 `exec.LookPath("bash")` 探测；配置 `shell`（7.2）非空时压过探测。`bashExecutable()` 仅服务 bash 类执行路径（显式配置或非 Windows 探测），优先 Git/MSYS `bash.exe`，跳过 WSL launcher；命令失败时 stderr 并入 `Result.Output`（见 `DEBT.md` 对应行、`docs/SMOKE.md` §6）。
 
 工具 schema 合计目标 < 1500 token（Pi 用 4 工具做到 <1000；六件套略宽，可观测后收窄描述）。
 
@@ -446,7 +446,7 @@ M4 后增量（2026-08-29，见决策变更记录）。定位：skill 与项目�
 # ~/.config/sammal/config.toml（Windows: %APPDATA%\sammal\config.toml）
 
 default_model = "qwen3-local"        # 用户故事：日常启动即用，不想每次选
-shell = ""                           # 用户故事：Windows 上想换掉 Git Bash / 指定 niu.exe；空=自动探测
+shell = ""                           # 用户故事：Windows 默认 PowerShell（优先 pwsh），想换 bash / 指定 niu.exe 时改这里
 
 [models.qwen3-local]                 # 用户故事：本地 Ollama 主力模型
 base_url      = "http://localhost:11434/v1"
@@ -626,3 +626,5 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-11-04 | 本轮明确不做项：不引入 steer 真打断（T15 预留）；`/resume` 不补思考；思考落盘不加时长抬头 | 用户约束「暂不做打断」；思考落盘与回放长度受约束②限制，保持最小改动 |
 | 2026-11-02 | 新增 I7「非请求不输出」（第 2 章六条→七条，README 同步）+ internal/specdoc 契约测试（不变量↔测试映射、I4 禁 alt-screen、I6 禁裸 TODO、文档交叉引用、800 行棘轮）+ I7 回放形状测试（agent_test）；superagent 启发 3a「bash 等待守卫」评估后**暂缓** | superagent 调研启发落地（3b/3c）：I1–I6 全是工程不变量，产品行为缺一条「对人的输出」约束；I4/I6 原为审查清单项，棘轮化后由机器把守。3a 暂缓理由：sammal 六件套无后台作业等「等待承接物」，照搬 noWait 拒绝文案（「结果会自己送达」）是空头承诺；待决定是否引入最小后台机制再动（superagent 参照 src/app/sessions.ts:77-86） |
 | 2026-11-02 | M5「后台 bash」立项（第 9 章，方案 A 惰性拾取）：bash `run_in_background` + promoteOnTimeout（前台超时晋升不杀）+ job_output/job_kill + `/jobs` 人侧直杀 + `job/completed` 事件按日志序归属下一个 user turn 尾部注入；六家调研（dsh/superagent/Reasonix/Claude Code/ZCode/Pi）证据落盘 `D:\\Temp\\sammal-3a-background-bash-research-2026-11-02.md`；红队压测修订：砍阻塞等待与 30min 自动上限、加幂等防御与并发上限 4、注入归属显式化为日志序纯函数 | superagent 启发 3a 复活为完整承接物：2026-10-23 bash 等待修复证实长命令阻塞是真实痛点；dsh 证明守卫与承接物可合一（晋升不杀）；Pi 列的四项成本 sammal 已有两项现成答案（I5 分离、WaitDelay 孤儿语义）。二期（空闲期滚动区通知，待 T9 修复）与三期（唤醒回合，按需）触发条件已在 M5 节声明 |
+| 2026-11-10 | 配置面新增 `shell` 键（7.2）：空 = 平台默认（Windows PowerShell，优先 pwsh），可填 bash/sh/powershell（含 pwsh 与 `.exe` 写法）或 bash 兼容 shell 的可执行文件（如 `niu.exe`）；启动时 `exec.LookPath` 校验，配置错误即时报错；**否决内置 niubash** | 用户故事：Windows 上要能绕开 PATH 顺序直接指定 shell（niu.exe 等），避免"命令到底跑在哪"不可控。内置否决理由：niubash Windows 载荷约 16MB/平台且携带 GPLv2 的 niu-git（再分发义务）、解压目录进 PATH 会换掉 agent 的 git、未签名二进制触发 SmartScreen/Defender、非 Windows 系统 bash 已足够；配置项 + 用户自行安装即可获得同等收益，且不改变 MIT 单二进制发布形态 |
+| 2026-11-10 | Windows 默认 shell 由「PATH 中 bash 优先」改为 PowerShell（`DetectShell` 直接返回 powershell，`powershellExecutable()` 优先 pwsh）；`ResolveShell` 识别 `powershell.exe` / `pwsh.exe`；bash 路径仅在显式配置时使用 | 用户裁决：Windows 上模型写 PowerShell 更稳定，避免 Git Bash 与 WSL 两套路径语义；shell 环境在进程边缘不可控（PATH 顺序、WSL launcher），自动探测的价值低于显式默认。代价：Windows 上要用 bash 需显式写 `shell = "bash"` |

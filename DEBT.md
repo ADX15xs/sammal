@@ -8,7 +8,8 @@
 | internal/tui/editor.go | 多行内联编辑已落地（字素级光标 + 大粘贴折叠 + 垂直窗口），但超宽逻辑行不做 word-wrap（沿用 clipLine 截断，与 Pi 的词级折行不同）；Ctrl+E 外部编辑器仍保留为逃生舱 | 若内联 word-wrap 成为实际痛点再补词级折行 + 光标列重定位 | 按需 |
 | internal/agent/agent.go | reasoning 增量已落盘（assistant/chunk kind=reasoning）并实时渲染为单行流式（dsh 方案）；结束时不撤走而是把该行下沉进滚动区（2026-11-04，只落 1 行、不落全文，`/resume` 不含思考）；DeepSeek 官方端点 thinking mode 要求 tools 请求回传 reasoning_content，sammal 尚不回传——本地端点（Ollama/vLLM/LM Studio）无此要求不受影响 | 接入 DeepSeek 官方端点跑工具环时：provider.Message 加 reasoning 字段 + 按端点开关的序列化回传 | 首个 DeepSeek 官方 thinking 端点接入时 |
 | 全项目 | CJK 预组合文本的 输入编辑 / 光标列计算 / 流式渲染 / 日志落盘 已全自动化（uniseg+runewidth 单测、E2E 断言中文回复渲染）。不可自动化的剩余部分：真实 IME 组合输入流程（候选窗、组合态光标）与三大终端产品（Windows Terminal / iTerm2 / Linux 终端）上的视觉效果、原生滚动复制 | 发布前实机冒烟：每端各过一遍「IME 敲中文 → 删除/移动光标 → Esc 中止 → 选区复制」 | 每次发版前（M4 时点已过且无入账证据，转为常设项） |
-| internal/tool/bash.go | PowerShell **执行路径**已自动化验证（powershell.exe/pwsh 端到端：输出、非零退出码、超时杀进程，见 TestBashToolPowerShellPath）。剩余未覆盖：本机 System32 存在 WSL bash.exe，exec.LookPath("bash") 恒命中，「PATH 无 bash → 降级」检测分支不可达 | 在无 bash 的 Windows 实机触发一次降级（或该分支由 3 行 fallback 与 prompt golden 互补覆盖，评估可接受） | 首个无 bash 的 Windows 实机出现时；⚠️ 部分过时：`BashTool` 执行路径已由 `bashExecutable()` 规避 WSL launcher（见下方新行），`DetectShell` 的会话 shell 定格仍按原文；是否改写本行待确认 |
+| internal/tool/bash.go | PowerShell **执行路径**已自动化验证（powershell.exe/pwsh 端到端：输出、非零退出码、超时杀进程，见 TestBashToolPowerShellPath）。剩余未覆盖：本机 System32 存在 WSL bash.exe，exec.LookPath("bash") 恒命中，「PATH 无 bash → 降级」检测分支不可达 | 在无 bash 的 Windows 实机触发一次降级（或该分支由 3 行 fallback 与 prompt golden 互补覆盖，评估可接受） | 首个无 bash 的 Windows 实机出现时；⚠️ 已过时（2026-11-10）：Windows 默认 shell 改为 PowerShell，`DetectShell` 不再探测 bash，「PATH 无 bash → 降级」分支已不存在（见 C1 与 SPEC 决策记录） |
+| internal/agent/commands.go switchSession | shell 在会话创建时定格进 header：`/resume` 旧会话时系统提示词按 `header.Shell` 重建，而 `BashTool` 与工具 schema 用本次启动的配置（2026-11-10 起 Windows 默认 PowerShell）——升级后恢复旧 bash 会话可能出现「提示词说 bash、工具跑 PowerShell」 | `switchSession` 时把工具注册表下沉到 Agent 并按 `header.Shell` 重建 BashTool，或 resume 时显式提示 shell 与当前配置不一致 | 按需（首个实际因此写错 Shell 语法的报告） |
 | internal/tool/grep.go | rg 委托与纯 Go 后备的正则方言存在细微差异（rg 为 Rust regex 语法，后备为 RE2）；常见模式两者一致 | 遇到实际分歧模式时在 schema description 中声明方言边界，或统一为仅 RE2 | 按需（首个实际分歧出现时） |
 | internal/agent/agent.go | 压缩只在 turn 开始触发：单个 turn 内多 step 工具环撑爆上下文时不自动恢复（请求会收到上下文溢出错误，turn 以 error 结束；下一 turn 开始时自动压缩后可重试） | 溢出分类（InterruptContextOverflow）已就绪；实测出现该场景再加「溢出 → turn 内压缩重试」 | 按需（首个实际溢出出现时） |
 | internal/provider/chunk.go | 限流信号识别面收敛：头部只认标准 Retry-After（整数秒/HTTP-date）与常见 x-ratelimit-reset（unix 秒/RFC3339），其余变体格式（如 Go duration 串 "6m30s"、各家自定义头）退化为盲指数退避；配额窗口判档依赖响应体英文特征串，非英文报错可能漏判成普通限流 | 遇到实际端点时按其格式扩展 parseRetryAfter / quotaMarkers | 按需（首个未识别格式实际影响重试效果时） |
@@ -41,7 +42,7 @@
 |---|---|---|
 | `internal/tui/editor.go` | 超宽逻辑行不做 word-wrap | 内联 word-wrap 成为实际痛点 |
 | `internal/agent/agent.go` | DeepSeek 官方 thinking 端点不回传 reasoning_content | 首个官方 thinking 端点接入 |
-| `internal/tool/bash.go` | 无 bash 的 Windows 降级分支不可达 | 首个无 bash 的 Windows 实机；⚠️ 见 C1 |
+| `internal/tool/bash.go` | 无 bash 的 Windows 降级分支不可达 | 首个无 bash 的 Windows 实机；⚠️ 已取消（2026-11-10）：Windows 默认 PowerShell，该分支不存在 |
 | `internal/tool/grep.go` | rg 与 RE2 正则方言差异 | 出现实际分歧模式 |
 | `internal/agent/agent.go` | turn 内多 step 工具环不自动压缩 | 首个实际上下文溢出 |
 | `internal/provider/chunk.go` | 限流信号识别面收敛 | 未识别格式实际影响重试 |
@@ -66,7 +67,7 @@
 
 | # | 条目 | 为什么待确认 |
 |---|---|---|
-| C1（已处理） | `docs/SPEC.md` 6.3「PATH 中无 bash 的 Windows 自动切 PowerShell」及 M1 验收条目 | 已按现行实现改写规格正文与 M1 验收注记；保留 `DetectShell()` 仍按 `exec.LookPath("bash")` 定格会话 shell 的边界 |
+| C1（已处理） | `docs/SPEC.md` 6.3「PATH 中无 bash 的 Windows 自动切 PowerShell」及 M1 验收条目 | 已按现行实现改写规格正文与 M1 验收注记；2026-11-10 复核：`DetectShell()` 在 Windows 恒返回 `powershell`、其余平台按 `exec.LookPath("bash")` 探测，配置 `shell` 可覆盖 |
 | C2（已处理） | `docs/SPEC.md` 思考行「定稿即整行撤出视窗」两处、`README.md` 旧特性描述 | 已按 2026-11-04 实现改写 SPEC 两处正文与 README 现行描述；旧行为仅在归档注记中保留 |
 | C3（已处理） | 未被引用的 3 张截图：`080457-d480fa8f1817cb8091f880887e5fbd2a.png`、`1793719821322.png`、`1793785744869.png` | 用户裁决删除（2026-11-05）；grep 全库确认除本条目自述外无引用，已 `git rm`（随本次治理提交）
 | C4（已处理） | 五份文档的换行符是否统一 | 用户裁决维持现状（2026-11-05）：README / PLAN / SMOKE 为 LF、SPEC / DEBT 主体为 CRLF 不做统一；统一会产生整文件 diff，`PLAN-20261104.md` §0.1 记录过该约束
