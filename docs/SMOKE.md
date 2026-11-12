@@ -292,7 +292,8 @@ Linux/macOS 用：`printf '中%.0s' {1..1500} | xclip -selection clipboard`（�
 
 1. 对 agent 说：`用 bash 的 run_in_background 跑 sleep 30`
 2. 通过 = 立即返回 "background job j1 started"，输入框马上可用（终端不锁）；状态栏出现 `bg 1`
-3. 输入 `/jobs` = 看到 `[j1 running] sleep 30`；`/jobs kill j1` = 显示已击杀；`bg` 徽标消失；**（M5 二期）击杀结算后滚动区出现单行暗色 `[job j1] 已击杀：sleep 30（耗时 …）`**
+3. **趁生成中输入** `/jobs`（步骤 1 之后模型仍在讲话时敲，这正是 2026-11-12 缺陷的触发条件）= 看到 `[j1 running] sleep 30`，且**不得**出现「（消息已发出，请等待模型响应）」、输入框内容不得出现在模型的对话上下文里；命令被当插话投给模型 = 失败。随后 `/jobs kill j1` = 显示已击杀；`bg` 徽标消失；**（M5 二期）击杀结算后滚动区出现单行暗色 `[job j1] 已击杀：sleep 30（耗时 …）`**
+   注：生成中敲 `/new`、`/compact` 等改状态命令，应答「生成中不能 …，请先 Esc 中止」，同样不得被当插话发出。
 
 ### T13 前台晋升 + 注入（M5）
 

@@ -493,6 +493,7 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | `/new` | 开新会话（频繁操作不值得退出重启） |
 | `/attach [path...]` | 图片输入入口：附加 / 列出 / `-clear` 清空待发送图片（TUI 侧管理，随下一条消息提交） |
 | `/skill [name] [任务]` | prompt 简化器：skill 正文 + 任务描述拼成一条消息提交；无参打开选择器（TUI 侧展开，6.10） |
+| `/jobs [kill <id>]` | 后台 job 人侧通道：无参列出注册表（id/状态/命令/时长/输出量），`kill <id>` 直杀 shell 不经模型（TUI 侧，M5） |
 | `/resume` | 恢复历史会话（I3 的用户入口） |
 | `/branch` | 从当前 turn 分叉探索（会话分支的用户入口） |
 | `/compact` | 手动触发压缩（自动触发之外的逃生门） |
@@ -500,6 +501,8 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | `/help` | 命令自述 |
 
 新增命令须在此表登记理由；不设别名、不做分组嵌套（避开 45+ 命令平铺的可达性灾难）。
+
+**分发次序（2026-11-12 修正）**：`/` 开头的输入一律先认作命令，生成中亦然——先 `slashSkill`（`/skill` 展开），再 TUI 本地命令（`/attach`、`/jobs`，直读本地状态、不经模型），最后 core 命令（`/model` `/new` `/resume` `/branch` `/compact` `/rewind` `/help`）。改 agent 状态的命令在生成中由各自 `idleGuard` 回「生成中不能 <cmd>，请先 Esc 中止」，**不得**被当作插话投给模型（否则用户敲的命令会被当话讲给模型，2026-11-12 实测缺陷）。只有非命令文本在生成中才走插话通道。
 
 ### 8.3 流式渲染行为
 
@@ -644,3 +647,4 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 | 2026-11-11 | M6 立项（第 9 章）：M5 收尾（T12-T14 冒烟）+ M5 二期通知（job/completed 即时通知滚动区，触发条件已满足）+ 文档治理收尾；调研稿 PLAN-NEXT.md 重写为 docs/PLAN-20261111.md | M5 二期是第 9 章既定声明，前置 T9 修复已于 2026-11-04 解除；验收欠账清零后项目回到「无未完成交付物」状态 |
 | 2026-11-11 | 否决引入 agent-context-manager（acm）替换 compaction 及 compress/decompress/search_context/acp_status 四工具；「可恢复压缩（decompress = 按会话日志重建被压缩段投影）」与「search_context」转条件触发候选（首个「压缩丢失关键细节」实际痛点时原生实现，见 docs/PLAN-20261111.md §2） | 实测 acm 为独立 CLI 二进制（面向 Claude Code/Codex，`.acm/` SQLite 存储，1 star），非可导入 Go 库；SQLite 外部状态与 I3 事件溯源相抵（压缩事件必须落会话 JSONL）；sammal 日志无损保留原文，恢复能力天然存在；四工具违反工具 schema <1500 token 预算（6.3），acp_status 与状态栏 ctx%/缓存命中率重复 |
 | 2026-11-11 | 否决引入 headroom-go 作为 ContentRouter；「软阈值 StatusEvent」并入条件触发（与既有 DEBT「turn 内不自动压缩」共用触发器：首个实际上下文溢出） | 实测 headroom-go 核心逻辑在 internal/ 包不可导入（CLI/proxy 形态）；状态栏 ctx% ≥70% 变黄已是现存软信号 |
+| 2026-11-12 | 修正 slash 分发次序：`/` 开头的输入先于 busy 判断按命令处理（slashSkill → TUI 本地命令 /attach、/jobs → core 命令）；生成中改状态的命令由 core 的 `idleGuard` 回「生成中不能 …」，不再被当插话投给模型。§8.2 表补登记 `/jobs`，core `/help` 同步补行 | 实测缺陷（会话 20261112-204834-2000）：生成中输入 `/job` `/jobs` 均回「（消息已发出，请等待模型响应）」并被 Send 进收件箱，命令被当话讲给模型。原 Enter 分支把 `if m.busy` 整段放在 slash 分发之前；只放行 /jobs 会让同一输入在忙闲两态语义分裂，故整段上移。SMOKE T12 步骤 3 同步改为「趁生成中输入 /jobs」并明确「出现消息已发出 = 失败」 |
