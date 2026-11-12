@@ -97,7 +97,18 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("创建会话失败：%w", err)
 	}
-	defer sess.Close()
+	// 关闭"当前活跃会话"而非初始句柄：/resume 会换出新的会话。注册在
+	// jobs.Close 之前，LIFO 顺序保证 job 结算先落盘、后关文件（T14）。
+	var ag *agent.Agent
+	defer func() {
+		if ag != nil {
+			if cur := ag.Session(); cur != nil {
+				_ = cur.Close()
+				return
+			}
+		}
+		_ = sess.Close()
+	}()
 
 	// 后台 job 注册表（M5）：结算回调在 job goroutine 落 job/completed
 	// 事件（Session.Append 并发安全），TUI 徽标与 /jobs 读同一份注册表。
@@ -129,7 +140,7 @@ func run(stdin io.Reader, stdout io.Writer, configPath string) error {
 	// 或不可读视为空。Scan 接收配置目录并自行拼 <configDir>/skills（SPEC 6.10）。
 	skills := func() []skill.Skill { return skill.Scan(filepath.Dir(configPath), cwd) }
 
-	ag := agent.New(agent.Config{
+	ag = agent.New(agent.Config{
 		Root:          rootCtx,
 		Provider:      provider.NewClient(modelCfg.BaseURL, config.ResolveSecret(modelCfg.APIKeyEnv, secrets)),
 		Session:       sess,

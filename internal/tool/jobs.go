@@ -92,7 +92,14 @@ type backgroundJob struct {
 	// registered 标记是否已入册：前台命令未被晋升就结束时从未属于注册表，
 	// 其结算不产生 job/completed、不通知 TUI。
 	registered bool
-	done       chan struct{}
+	// pending 暂存「进程先于入册结束」的结算快照：入册时补发，避免
+	// 秒退的后台命令永远收不到 job/completed。
+	pending *JobInfo
+	done    chan struct{} // 进程已退出、状态已定（不含日志落盘）
+	// settleDone 结算回调全部完成：Close 等的是它而不是 done——done 只
+	// 表示进程退出，append 可能还在路上，提前关会话就会丢事件。
+	settleDone chan struct{}
+	settleOnce sync.Once
 }
 
 func NewJobRegistry() *JobRegistry {
@@ -130,13 +137,14 @@ func (r *JobRegistry) List() []JobView {
 // 先 Spawn 再按需 Register；后台命令 Spawn 后立即 Register。
 func (r *JobRegistry) Spawn(command string, cmd *exec.Cmd, stdout, stderr *jobBuffer) *backgroundJob {
 	j := &backgroundJob{
-		command: command,
-		cmd:     cmd,
-		stdout:  stdout,
-		stderr:  stderr,
-		started: time.Now(),
-		status:  "running",
-		done:    make(chan struct{}),
+		command:    command,
+		cmd:        cmd,
+		stdout:     stdout,
+		stderr:     stderr,
+		started:    time.Now(),
+		status:     "running",
+		done:       make(chan struct{}),
+		settleDone: make(chan struct{}),
 	}
 	j.kill = func() { _ = j.cmd.Process.Kill() }
 	go r.wait(j)
@@ -152,8 +160,13 @@ func (r *JobRegistry) Register(j *backgroundJob) string {
 	j.mu.Lock()
 	j.id = fmt.Sprintf("j%d", r.counter)
 	j.registered = true
+	pending := j.pending
+	j.pending = nil
 	j.mu.Unlock()
 	r.jobs = append(r.jobs, j)
+	if pending != nil { // 进程先于入册结束：补发结算，别丢 job/completed
+		r.settle(j, *pending)
+	}
 	return j.id
 }
 
@@ -168,19 +181,30 @@ func (r *JobRegistry) wait(j *backgroundJob) {
 	info := JobInfo{ID: j.id, Command: j.command, Status: j.status, ExitCode: j.exitCode,
 		Tail: tailOf(j), TotalBytes: j.totalLocked(), DurationMs: time.Since(j.started).Milliseconds()}
 	registered := j.registered
+	if !registered {
+		j.pending = &info
+	}
 	j.mu.Unlock()
 	close(j.done)
 
-	if !registered {
-		return
+	if registered {
+		r.settle(j, info)
 	}
-	if r.OnComplete != nil {
-		r.OnComplete(info)
-	}
-	select {
-	case r.settled <- info:
-	default: // TUI 未消费时丢弃：状态栏徽标下次渲染直接读 List
-	}
+}
+
+// settle 是结算的唯一出口：OnComplete 落日志 → 通知 TUI → 关闭 settleDone。
+// 用 Once 收口，保证「进程先结束、后入册」的补发与 wait 的正常结算不会重复。
+func (r *JobRegistry) settle(j *backgroundJob, info JobInfo) {
+	j.settleOnce.Do(func() {
+		if r.OnComplete != nil {
+			r.OnComplete(info)
+		}
+		select {
+		case r.settled <- info:
+		default: // TUI 未消费时丢弃：状态栏徽标下次渲染直接读 List
+		}
+		close(j.settleDone)
+	})
 }
 
 func statusOf(j *backgroundJob, waitErr error) string {
@@ -283,21 +307,31 @@ func (r *JobRegistry) Kill(id string) (JobView, bool) {
 }
 
 // Close 击杀全部运行中 job 并等待结算（进程退出与测试清理）。
+//
+// 等 settleDone 而非 done：done 只表示进程退出，job/completed 的落盘
+// 发生在之后。提前返回会让会话文件先被关掉，事件静默丢失（T14 根因）。
 func (r *JobRegistry) Close() {
 	r.mu.Lock()
-	var running []*backgroundJob
+	var waitDone, waitSettled []*backgroundJob
 	for _, j := range r.jobs {
 		if j.statusLocked() == "running" {
 			j.mu.Lock()
 			j.status = JobKilled
 			j.mu.Unlock()
 			j.kill()
-			running = append(running, j)
+		}
+		if j.isRegistered() {
+			waitSettled = append(waitSettled, j)
+		} else {
+			waitDone = append(waitDone, j)
 		}
 	}
 	r.mu.Unlock()
-	for _, j := range running {
+	for _, j := range waitDone {
 		<-j.done
+	}
+	for _, j := range waitSettled {
+		<-j.settleDone
 	}
 }
 
@@ -309,6 +343,12 @@ func (j *backgroundJob) viewLocked() JobView {
 
 // statusLocked / totalLocked 在已持有或将要获取 j.mu 的调用方间共用；
 // 内部再取各自缓冲锁（锁序恒为 registry → job → buffer）。
+func (j *backgroundJob) isRegistered() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.registered
+}
+
 func (j *backgroundJob) statusLocked() string {
 	j.mu.Lock()
 	defer j.mu.Unlock()

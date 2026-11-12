@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -144,7 +145,7 @@ func TestJobOutputUnknownID(t *testing.T) {
 
 func TestJobBufferRing(t *testing.T) {
 	b := newJobBuffer()
-	pattern := strings.Repeat("x", 64 * 1024)
+	pattern := strings.Repeat("x", 64*1024)
 	for i := 0; i < 8; i++ {
 		b.Write([]byte(pattern))
 	}
@@ -182,5 +183,87 @@ func TestJobInfoFormatLine(t *testing.T) {
 		if got := c.info.FormatLine(); got != c.want {
 			t.Errorf("FormatLine = %q, want %q", got, c.want)
 		}
+	}
+}
+
+// 进程先于入册结束（秒退命令）：Register 必须补发结算，否则 job/completed
+// 丢失、/resume 转录里看不到这一行（T14 同类缺口）。
+func TestRegisterSettlesAlreadyExitedJob(t *testing.T) {
+	reg := NewJobRegistry()
+	settled := make(chan JobInfo, 4)
+	reg.OnComplete = func(i JobInfo) { settled <- i }
+	t.Cleanup(reg.Close)
+
+	cmd := exec.Command("sh", "-c", "echo quick-done")
+	out := newJobBuffer()
+	cmd.Stdout = out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	j := reg.Spawn("echo quick-done", cmd, out, newJobBuffer())
+	<-j.done // 进程已退出，但此时尚未入册
+
+	if id := reg.Register(j); id != "j1" {
+		t.Fatalf("id = %q", id)
+	}
+	select {
+	case info := <-settled:
+		if info.Status != JobDone || !strings.Contains(info.Tail, "quick-done") {
+			t.Fatalf("补发结算不符：%+v", info)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("秒退 job 入册后未补发结算")
+	}
+
+	reg.Close() // 已结算的 job 不应重复结算
+	select {
+	case extra := <-settled:
+		t.Fatalf("重复结算：%+v", extra)
+	default:
+	}
+}
+
+// Close 必须等结算回调跑完再返回：只等进程退出（done）会让会话文件先关，
+// job/completed 静默丢失——T14 根因，这里直接锁住等待目标。
+func TestCloseWaitsForSettlement(t *testing.T) {
+	reg := NewJobRegistry()
+	release := make(chan struct{})
+	settled := make(chan JobInfo, 1)
+	reg.OnComplete = func(i JobInfo) {
+		<-release // 模拟落盘慢：Close 不能抢先返回
+		settled <- i
+	}
+
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	out := newJobBuffer()
+	cmd.Stdout = out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	j := reg.Spawn("sleep 30", cmd, out, newJobBuffer())
+	reg.Register(j)
+
+	closed := make(chan struct{})
+	go func() { reg.Close(); close(closed) }()
+
+	select {
+	case <-closed:
+		t.Fatal("Close 在结算回调完成前就返回了")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 未返回")
+	}
+	select {
+	case info := <-settled:
+		if info.Status != JobKilled {
+			t.Fatalf("status = %q, 期望 killed", info.Status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("结算回调未跑完")
 	}
 }
