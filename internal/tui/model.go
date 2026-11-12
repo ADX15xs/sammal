@@ -203,6 +203,26 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		echo := text
 
+		// 斜杠命令先于 busy 分流：命令就是命令，生成中照常按命令处理——
+		// /jobs、/help 这类直读本地状态的照常执行，改 agent 状态的命令由
+		// 各自的 idleGuard 回「生成中不能 …」。若让命令落进下面的插话分支，
+		// 敲进去的命令就被当话讲给模型了（2026-11-12 实测：/jobs 被投成插话）。
+		if strings.HasPrefix(text, "/") {
+			switch cmd, expanded, out := m.slashSkill(text); cmd {
+			case skillPickerOpen:
+				return m, nil
+			case skillShow:
+				return m, m.printLines(out)
+			case skillSend:
+				text = expanded // 展开正文走普通发送路径，回显仍显示原命令
+			default:
+				if lines, handled := m.handleSlash(text); handled {
+					return m, m.printLines(lines)
+				}
+				return m, m.printLines(m.deps.Slash(text))
+			}
+		}
+
 		// 生成中：Enter 是插话——回显随流落盘（视觉），原文投收件箱（语义，
 		// agent.Submit 在 Running() 时转 Steering）。带图插话无承载者（DEBT），
 		// 丢弃时必须出声，否则用户以为图已发。
@@ -227,21 +247,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 
 		// 空闲中：正常提交新 turn
-		if strings.HasPrefix(text, "/") {
-			switch cmd, expanded, out := m.slashSkill(text); cmd {
-			case skillPickerOpen:
-				return m, nil
-			case skillShow:
-				return m, m.printLines(out)
-			case skillSend:
-				text = expanded // 展开正文走普通发送路径，回显仍显示原命令
-			default:
-				if lines, handled := m.handleSlash(text); handled {
-					return m, m.printLines(lines)
-				}
-				return m, m.printLines(m.deps.Slash(text))
-			}
-		}
 		imgs := m.pendingImages
 		m.pendingImages = nil
 		m.busy = true

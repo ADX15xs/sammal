@@ -223,15 +223,16 @@ func (a *Agent) Slash(input string) []string {
 	switch fields[0] {
 	case "/help":
 		return []string{
-			"/model [name] 切换模型；无参列出可用模型（Ctrl+P 打开选择器）",
-			"/new          开新会话",
+			"/model [name]  切换模型；无参列出可用模型（Ctrl+P 打开选择器）",
+			"/new           开新会话",
 			"/attach <path> 附加图片后提交；无参列出，-clear 清空",
-			"/skill [name] 展开 skill 与任务拼接提交；无参打开选择器",
-			"/resume [n]   恢复历史会话；无参列出",
-			"/branch       从当前 turn 分叉探索",
-			"/compact      手动触发上下文压缩",
-			"/rewind [n]   回滚代码与对话到 turn n 之前；无参列出可回滚的 turn",
-			"/help         命令自述",
+			"/skill [name]  展开 skill 与任务拼接提交；无参打开选择器",
+			"/jobs          列出后台 job；/jobs kill <id> 直杀，均不经模型",
+			"/resume [n]    恢复历史会话；无参列出",
+			"/branch        从当前 turn 分叉探索",
+			"/compact       手动触发上下文压缩",
+			"/rewind [n]    回滚代码与对话到 turn n 之前；无参列出可回滚的 turn",
+			"/help          命令自述",
 		}
 	case "/model":
 		if len(fields) == 1 {
