@@ -2,7 +2,7 @@
 
 > 本文档是 Sammal 的开发主文档。设计决策、不变量、模块规格与里程碑以此为准；README 只做导览。
 >
-> 状态：实现阶段——M0–M4 已全部交付（2026-08-23，git log 与第 9 章为证），此后特性增量以文末「决策变更记录」追加为准。决策记录格式：本章陈述为基线，后续变更在文末「决策变更记录」追加，不静默修改。
+> 状态：实现阶段——M0–M4 已全部交付（2026-08-23，git log 与第 9 章为证），此后特性增量以 `docs/DECISIONS.md`「决策变更记录」（2026-11-14 自本文迁出）追加为准。决策记录格式：本章陈述为基线，后续变更在该台账追加，不静默修改。
 
 ---
 
@@ -583,7 +583,7 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 
 设计约束：通知是 `job/completed` 既有事件的 TUI 投影，不新增日志事件；若实现中发现必须新增事件，须过 I1 golden 重放并在决策变更记录补登记。已落定（2026-11-11 实现）：单行格式由 `tool.JobInfo.FormatLine()` 统一——`[job <id>] <状态>：<命令首行>（耗时 …）`，实况通知与 `/resume` 转录共用；退出击杀发生在 TUI 退出后，通知不落屏、只落日志由转录呈现。
 
-里程碑之外的特性生长以「决策变更记录」为记录；修复与测试类提交见 git log。
+里程碑之外的特性生长以 `docs/DECISIONS.md`（2026-11-14 迁入）为记录；修复与测试类提交见 git log。
 
 ---
 
@@ -613,38 +613,4 @@ editor = ""                          # 用户故事：Ctrl+E 默认 $VISUAL/$EDI
 
 ## 决策变更记录
 
-| 日期 | 决策 | 理由 |
-|---|---|---|
-| 2026-08-22 | 基线建立（本文档） | 三方调研 + 逐层拷问 + 纯净原则收敛 |
-| 2026-08-23 | 勘误 1.1：撤销"Reasonix 缓存命中率不可控"的归因 | 代码调研证实其不可变前缀为早期设计铁律；Sammal 缓存纪律改为"继承 + 增量要求可观测性" |
-| 2026-08-23 | I2 测试表述细化：「相邻请求公共前缀 = 上一请求全长」改为「system、工具目录与历史消息逐条序列化字节一致 + 请求体序列化确定性」 | JSON 嵌套结构（messages 数组闭括号）使整请求字节前缀按字面必然分叉；逐消息稳定才是服务端 token 前缀（KV 缓存）覆盖的内容，不变量本身不变 |
-| 2026-08-23 | request/header 事件数据增加 model 字段（规格 6.5.2 最小示例之外） | 会话中途切模型（M3）后重放逐字节比对需要当时请求所用的模型名；I1 要求的必然推论 |
-| 2026-08-23 | 配置面新增 secrets 能力（7.2 之外）：config.toml 同目录 `.env`（Windows `%APPDATA%\sammal\.env`）作为 `api_key_env` 的值兜底；同名进程环境变量优先 | 用户故事：Windows 调全局环境变量成本高；`.env` 跟随配置目录、不入日志、不占会话。优先序沿 dotenv 惯例（显式注入不被覆盖），本地端点不受影响 |
-| 2026-08-24 | 断流分类扩展与限流应对：新增限流（429）/服务端错误（5xx）/配额窗口三档分类，429/5xx 纳入 step 边界重连（1s 指数退避、尊重 Retry-After、单次等待上限 60s）；配额特征或超限等待快速失败并注明恢复时间点；配置面每模型新增可选 `retry_max`（缺省 3） | 用户故事：线上 API 与免费端点 429 太常见，固定 1s×3 盲等熬不过分钟级配额窗口；coding/token plan 类订阅有 5 小时用量窗口，小时级等待循环重试无意义，应报恢复时间让用户自行重发。曲线常量不进配置（收敛原则），仅次数随端点差异可调 |
-| 2026-08-25 | 日志写失败快速失败：全部落盘点统一经 appendFatal，首个写失败即上报并终止当前 turn；emit 在 root 取消后允许丢弃事件 | 日志已坏时继续执行只会产出不可重放的状态（I1）；磁盘满等持久性故障无法在 turn 内自愈，快速失败优于带病续跑。emit 防阻塞：消费端停止后 Submit/Slash 等同步调用方不能冻死在事件发送上 |
-| 2026-08-26 | 思考链单行流式渲染与状态栏可观测：思考行 = 计时 + 最新一行，按 token 到达增量刷新，后移植 dsh 尾部跟随（超宽保留最新 token）；状态栏可观测增强（ctx 分级变色、负优先级段不可裁剪） | reasoning 落日志不投影的设计不变；渲染层只是把「等待中」做成最小的活性口子。省略号截断丢失最新 token，尾部跟随让推理流始终可见 |
-| 2026-08-27 | session/header 的 model 字段改存配置键（用户可见名），不再存端点 model 字符串 | 同一端点 model 字符串可被多个配置复用（多个中转站转发同一模型），按端点字符串反查当前模型必然歧义；配置键才是唯一身份。I1 重放不受影响（request/header 仍存端点 model） |
-| 2026-08-28 | 多模态图片输入：Message.Content 改多模态数组，TUI `/attach` 附加图片随消息提交；字节内容寻址落会话 assets/、日志只存引用；图片只进请求尾部不进投影，request/header 记录 images 引用（新增 6.9 节、I2 附图片放置规则） | 缓存纪律要求图片不进投影前缀（带图请求前缀与无图会话逐字节一致）；资产外置避免 JSONL 膨胀；尾部放置 + 引用留痕使 I1 重放可完整还原带图请求 |
-| 2026-08-29 | 断流重连参数全部内置化：重试上限 5 次、同一 step 连续 429 超 1 次后基础退避 1s→5s（两段式）；移除 2026-08-24 引入的 `retry_max` 配置键，旧配置中的键被忽略 | 撤销上一次「仅次数可调」的让步：次数与曲线是端点无关的耐心策略，实测无需按端点调参，内置常量更符合 7.2 收敛原则；两段式退避把分钟级限流窗口的总耐心提升到约 131s |
-| 2026-08-29 | AGENTS.md 注入与 /skill prompt 简化器（新增 6.10 节、internal/skill 包、TUI 弹窗枚举新增 skillPicker）：AGENTS.md 内容会话首拍存入 SessionHeader.agentsMd 并渲染进系统提示词（/new 从磁盘重读）；/skill 唯一命中时把「skill 正文 + 任务」展开为一条 user 消息，无参打开选择器且 Enter 回填不发送 | skill/项目指令定位为 prompt 简化器：明确调用优于自动触发。正文骑 user turn 尾部（I2 明文豁免区），系统提示词除 agentsMd 首拍外零改动、工具目录零改动，I1 自动满足；不做 .agents/rules、hooks、项目级 config（4.3 避开清单与 7.2 收敛原则），模型主动加载留待「反复需要模型自读 skill」的实际需求出现 |
-| 2026-08-30 | 回合耗时标记：turn 正常完成后在回答末尾追加一行暗色「（耗时 1m30s）」（TUI 侧 turnStart 起算、覆盖工具环全程；中止/出错回合不打） | 生成中已有思考行与状态栏双计时，但定稿即消失——滚动区缺一个「这轮跑了多久」的持久落款。session 日志逐条带时间戳、重放可推导时长，故纯 TUI 呈现不动 core |
-| 2026-09-02 | 当天日期结构化落盘 + 时长渲染统一：新增 internal/human 包统一时长格式（tui/agent/provider/tool 共用）；「今天」由 agent 随每条 user 消息以独立 `date` 字段落盘（UserMessageData.Date），模型投影时展开为消息头部 `Today: YYYY-MM-DD` 前缀（系统提示词恢复纯静态、I2 前缀缓存全程命中；正文无注记，转录回放等人类消费面不泄漏）；回合耗时落款追加本地完成时刻（HH:MM）；等待期 spinner 防静止误判；状态栏丢弃优先级重排（计时器降至与 in/out 同级、平级丢更靠左、晚于 cache）；工具结果投影追加耗时（≥1s）；main 会话 Created 改用真实 UTC 时刻（time.Now().UTC()） | 「今天」须是用户本地当日（UTC 日期在 UTC+8 凌晨差一天），但不能进系统提示词否则前缀缓存失效——date 字段落盘使日期成为固定历史事实、投影时注入使正文保持纯净（拼接进 Text 会把内部注记泄漏给 /resume 转录等所有读者），两者兼得；时长格式三处重复须单一真相；等待期无 spinner 易被误读为卡死；原 Created 拼 "Z" 伪造时区会落盘未来时刻 |
-| 2026-09-04 | 明确不做思考控制参数：provider 不传 `reasoning_effort` / thinking 开关类参数，思考强度随端点默认（6.1 关键设计登记翻案条件） | 多家端点实测：各家思考控制参数形态互不兼容（`reasoning_effort` / `thinking.type` / `chat_template_kwargs` / `think`），透传适配成本高且收益不明；档位差异的既有出路是注册多个模型条目走 Ctrl+P（零新增代码，与缓存纪律无冲突） |
-| 2026-09-05 | 滚动缓冲区渐进落盘（新增 internal/tui/scroll.go、8.3 改写）：assistant 回答由「定稿一次性 Println」改为「流式期间闭合行超 6 行即落盘 + 定稿补余」；所有落盘统一走 printScroll——宽度归一化（整数倍宽度行补尾空格）、按视口预算分批、超预算巨行硬拆；流中断重连对已落盘部分追加暗色作废标记；用户回显与 slash 输出同通道 | 实机确认长回答定稿时「半截窜到屏顶 + 中部大片空白」：bubbletea v2.0.9 内联渲染器 insertAbove 在打印块折行总行数超视口余量时 CursorUp/InsertLine 被钳制、光标永久失步（main 未修，已知问题类 #1666/#1567），且对「宽度恰为终端宽整数倍」的行多算一行。渐进落盘从源头保证任何一次 Println 都不超视口（打印单位 = 行），宽度归一化对齐估算公式（与 ultraviolet 自身 PrependString 修正公式同公共区），二者都与公式实现解耦、上游修复落地后零改动受益。副产品：流式期间滚动缓冲可搜索可复制。替代方案逐一否决：fork / 自写渲染器——v2 无 WithRenderer 注入点且 renderer 接口方法未导出、包外不可实现；降级 v1——移植 API 成本换另一套内联 artifact；alt-screen 虚拟滚动——击穿 I4；定稿分批 + 预折行补丁——与 insertAbove 内部公式永久耦合，属给缺陷写适配层。上游缺陷按外部事实记录，不提 issue、不跟随其修复节奏（对策与公式实现解耦，上游行为变化不影响正确性）。事件契约登记：MessageFinal.Text 与 TextDelta 累积逐字节一致（agent 定稿处与 8.3 双侧注明），TUI 渐进落盘依赖之。残余风险（tab 宽度、\r、Println 与 ticker flush 交错频率等）入 DEBT 账本 |
-| 2026-09-03 | **核销：Usage 落日志（会话级/跨轮缓存命中审计）：** assistant/message 与 turn/end 事件写入 `*provider.Usage`（`PromptTokens`、`CompletionTokens`、缓存命中率、`CachedTokens`）。落到 session 侧：`AssistantMessageData.Usage` 与 `TurnEndData.Usage`（均 omitempty 保旧日志向后兼容），agent 定稿处把当前 step 的 usage 一并写入；TUI 事件通道已就绪，改读事件即可重建缓存命中率段。理由：补满成功标准 #3 会话级/跨轮缓存命中审计；I1「模型可见 = 已写入日志」对 usage 的自然延伸。DEBT 对应条目核销 |
-| 2026-10-23 | bash 工具超时/后台任务立即返回：CommandContext 加 WaitDelay=1s——进程被杀或 shell 先退后，持有输出管道的后代进程不再拖住 cmd.Run，管道 1s 内强关、孤儿进程留后台；退出码改读 ProcessState，ErrWaitDelay（仅在进程等待结果为成功时返回）即退出码 0 不报错。孤儿语义声明：修复前工具事实上等所有后代进程结束才返回（副作用被串行化），修复后立即返回、孤儿进程继续跑——bash 副作用不入快照的既有边界覆盖之；测试以耗时上界断言（>10s 即失败）+ bash 后台任务用例锁死回归 | 实测 TestBashTimeout 30.06s：timeout_seconds=1 只杀直接子进程，持有 stdout 管道的后代进程不退出则 cmd.Run 阻塞至管道关闭，schema 承诺的 "Kill after N seconds" 未约束实际返回延迟；后台进程命令（`sleep 30 &`）同理被拖到管道关闭为止。机制只记症状（kill 后管道不关），进程拓扑不写死（本机 WSL / Git Bash 形态不同）。tool 包测试 33.65s→5.6s，DEBT tool_test 条目随之核销 |
-| 2026-11-02 | IME 行中插入显示失步对策：handleKey 文本键（msg.Text≠""）后返回 tea.ClearScreen 强制整屏重绘；ime_commit_test 以真实 ultraviolet EventDecoder 锁定输入链路四种到达形态 + 重绘 Cmd；诊断探针 cmd/imeprobe 用后即删。代价声明：每个文本键一次全帧重绘（实机无闪烁感）；后续若 ultraviolet 出现定向脏行 API 可替换，未出现不追踪 | WT（1.24.12741.0）组合态期间终端自行改写行单元，哈希渲染器的行状态模型与终端现实失步且不自愈——探针矩阵实机实锤（a/b 变体错乱一致=光标锚点无关，c 变体每键重绘干净；纯中文/纯英文不乱、中英混合才乱；缓冲恒正确、回显与复制无损）。整屏重绘是应用侧唯一不依赖未公开 API 的可靠对策；SMOKE T10 手动回归通过（2026-11-02 03:21），DEBT handleKey 行核销 |
-| 2026-11-04 | 思考行下沉保留 1 行：reasoning 结束后不再整行撤出，而是把当前显示行追加进滚动区并保留 1 行暗色摘要（`closeThinking` / R1）；落盘增量恒 1 行，`/resume` 不含思考 | 用户约束「不加落盘体积、不加 `/resume` 长度」；长回答与工具边界之间不得出现成片空行，旧「整行撤出」造成滚动区空洞 |
-| 2026-11-04 | 同批插话合并 + 删除 500ms 去重：`absorbInbox` 把 ≥2 条插话合并为一条带抬头与序号的 user 消息，相同内容不折叠；删除原去重逻辑（`db40684`）；插话提示随回显落盘 | 三条几乎相同 user 消息会被模型读成重复指令；合并保留条数与顺序、把是否逐条回应交给模型，去重判据会随机吞消息 |
-| 2026-11-04 | Windows `bash` 执行路径修正：`BashTool` 通过 `bashExecutable()` 跳过 `System32` / `WindowsApps` 的 WSL launcher，优先 Git/MSYS `bash.exe`；无 bash 时仍降级 PowerShell；命令失败时把 stderr 并入 `Result.Output` | 实机 `keenable search` 因 `exec.LookPath("bash")` 命中 WSL launcher 而看不到 Windows CLI，stderr 缺失使模型误判未安装 |
-| 2026-11-04 | 显示层空行过滤：`printScroll` 与 `Transcript` 跳过纯空白 assistant 文本，并对正文首尾换行 padding 做 `strings.Trim(text, "\n")`；日志与模型投影保留原文 | 模型在「只调工具、不写正文」的 step 吐纯换行，工具边界 flush 后污染滚动区与回放；只改显示层，不动 I1「写什么发什么」 |
-| 2026-11-04 | `↑` / `↓` 输入历史召回修复：`loadHistory` 改指针接收者；KeyUp 允许已召回后连续上翻，`↓` 回到实时输入；输入框有草稿时不召回 | 原值接收者导致历史写入副本而失效；连续上翻需要保持草稿边界，避免吞掉正在编辑内容 |
-| 2026-11-04 | 本轮明确不做项：不引入 steer 真打断（T15 预留）；`/resume` 不补思考；思考落盘不加时长抬头 | 用户约束「暂不做打断」；思考落盘与回放长度受约束②限制，保持最小改动 |
-| 2026-11-02 | 新增 I7「非请求不输出」（第 2 章六条→七条，README 同步）+ internal/specdoc 契约测试（不变量↔测试映射、I4 禁 alt-screen、I6 禁裸 TODO、文档交叉引用、800 行棘轮）+ I7 回放形状测试（agent_test）；superagent 启发 3a「bash 等待守卫」评估后**暂缓** | superagent 调研启发落地（3b/3c）：I1–I6 全是工程不变量，产品行为缺一条「对人的输出」约束；I4/I6 原为审查清单项，棘轮化后由机器把守。3a 暂缓理由：sammal 六件套无后台作业等「等待承接物」，照搬 noWait 拒绝文案（「结果会自己送达」）是空头承诺；待决定是否引入最小后台机制再动（superagent 参照 src/app/sessions.ts:77-86） |
-| 2026-11-02 | M5「后台 bash」立项（第 9 章，方案 A 惰性拾取）：bash `run_in_background` + promoteOnTimeout（前台超时晋升不杀）+ job_output/job_kill + `/jobs` 人侧直杀 + `job/completed` 事件按日志序归属下一个 user turn 尾部注入；六家调研（dsh/superagent/Reasonix/Claude Code/ZCode/Pi）证据落盘 `D:\\Temp\\sammal-3a-background-bash-research-2026-11-02.md`；红队压测修订：砍阻塞等待与 30min 自动上限、加幂等防御与并发上限 4、注入归属显式化为日志序纯函数 | superagent 启发 3a 复活为完整承接物：2026-10-23 bash 等待修复证实长命令阻塞是真实痛点；dsh 证明守卫与承接物可合一（晋升不杀）；Pi 列的四项成本 sammal 已有两项现成答案（I5 分离、WaitDelay 孤儿语义）。二期（空闲期滚动区通知，待 T9 修复）与三期（唤醒回合，按需）触发条件已在 M5 节声明 |
-| 2026-11-10 | 配置面新增 `shell` 键（7.2）：空 = 平台默认（Windows PowerShell，优先 pwsh），可填 bash/sh/powershell（含 pwsh 与 `.exe` 写法）或 bash 兼容 shell 的可执行文件（如 `niu.exe`）；启动时 `exec.LookPath` 校验，配置错误即时报错；**否决内置 niubash** | 用户故事：Windows 上要能绕开 PATH 顺序直接指定 shell（niu.exe 等），避免"命令到底跑在哪"不可控。内置否决理由：niubash Windows 载荷约 16MB/平台且携带 GPLv2 的 niu-git（再分发义务）、解压目录进 PATH 会换掉 agent 的 git、未签名二进制触发 SmartScreen/Defender、非 Windows 系统 bash 已足够；配置项 + 用户自行安装即可获得同等收益，且不改变 MIT 单二进制发布形态 |
-| 2026-11-10 | Windows 默认 shell 由「PATH 中 bash 优先」改为 PowerShell（`DetectShell` 直接返回 powershell，`powershellExecutable()` 优先 pwsh）；`ResolveShell` 识别 `powershell.exe` / `pwsh.exe`；bash 路径仅在显式配置时使用 | 用户裁决：Windows 上模型写 PowerShell 更稳定，避免 Git Bash 与 WSL 两套路径语义；shell 环境在进程边缘不可控（PATH 顺序、WSL launcher），自动探测的价值低于显式默认。代价：Windows 上要用 bash 需显式写 `shell = "bash"` |
-| 2026-11-11 | M6 立项（第 9 章）：M5 收尾（T12-T14 冒烟）+ M5 二期通知（job/completed 即时通知滚动区，触发条件已满足）+ 文档治理收尾；调研稿 PLAN-NEXT.md 重写为 docs/PLAN-20261111.md | M5 二期是第 9 章既定声明，前置 T9 修复已于 2026-11-04 解除；验收欠账清零后项目回到「无未完成交付物」状态 |
-| 2026-11-11 | 否决引入 agent-context-manager（acm）替换 compaction 及 compress/decompress/search_context/acp_status 四工具；「可恢复压缩（decompress = 按会话日志重建被压缩段投影）」与「search_context」转条件触发候选（首个「压缩丢失关键细节」实际痛点时原生实现，见 docs/PLAN-20261111.md §2） | 实测 acm 为独立 CLI 二进制（面向 Claude Code/Codex，`.acm/` SQLite 存储，1 star），非可导入 Go 库；SQLite 外部状态与 I3 事件溯源相抵（压缩事件必须落会话 JSONL）；sammal 日志无损保留原文，恢复能力天然存在；四工具违反工具 schema <1500 token 预算（6.3），acp_status 与状态栏 ctx%/缓存命中率重复 |
-| 2026-11-11 | 否决引入 headroom-go 作为 ContentRouter；「软阈值 StatusEvent」并入条件触发（与既有 DEBT「turn 内不自动压缩」共用触发器：首个实际上下文溢出） | 实测 headroom-go 核心逻辑在 internal/ 包不可导入（CLI/proxy 形态）；状态栏 ctx% ≥70% 变黄已是现存软信号 |
-| 2026-11-12 | 修正 slash 分发次序：`/` 开头的输入先于 busy 判断按命令处理（slashSkill → TUI 本地命令 /attach、/jobs → core 命令）；生成中改状态的命令由 core 的 `idleGuard` 回「生成中不能 …」，不再被当插话投给模型。§8.2 表补登记 `/jobs`，core `/help` 同步补行 | 实测缺陷（会话 20261112-204834-2000）：生成中输入 `/job` `/jobs` 均回「（消息已发出，请等待模型响应）」并被 Send 进收件箱，命令被当话讲给模型。原 Enter 分支把 `if m.busy` 整段放在 slash 分发之前；只放行 /jobs 会让同一输入在忙闲两态语义分裂，故整段上移。SMOKE T12 步骤 3 同步改为「趁生成中输入 /jobs」并明确「出现消息已发出 = 失败」 |
+> 本章节已于 2026-11-14 文档治理整体迁出为 [DECISIONS.md](DECISIONS.md)（append-only 唯一实时台账，既有条目原文保留）；本文其余位置「见决策变更记录 / 决策记录」的指称一律理解为该文件。此后设计裁决一律追加至该文件，本节不再增长。
