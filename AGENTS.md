@@ -20,7 +20,7 @@ sammal 既有裁决（2026-11-04）继续有效：历史判读、失败登记与
 | 冒烟用例与结果登记 | `docs/SMOKE.md` | — |
 | 迭代 / 发展计划 | 新建 `docs/PLAN-YYYYMMDD.md`；完结后状态改 📌 历史归档 | — |
 | 用户可见功能交付 | 代码 + 测试；CHANGELOG 留到 tag 发布时从 git log 与 DECISIONS 编纂 | `CHANGELOG.md` 实时节 |
-| 发版 | 打 annotated tag `vX.Y.Z` 并推送 → CI 流水线构建 GitHub Release；`CHANGELOG.md` 补版本节 | 已发布版本节 |
+| 发版 | 打 annotated tag `vX.Y.Z` 并推送（tag message 首行 `release: vX.Y.Z`，正文按新增/修复/变更归类记要点）→ CI 流水线构建 GitHub Release；`CHANGELOG.md` 补版本节 | 已发布版本节；已推送 tag |
 | 文档增删 / 移动 | 本文件 §0.4 文档地图同步一行 | 禁止旁路新建第二份索引 |
 
 ### 0.3 写作红线
