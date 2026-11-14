@@ -120,10 +120,15 @@ func TestI6NoBareTODO(t *testing.T) {
 	}
 }
 
-// 文档交叉引用一致性：README/DEBT/docs/*.md 的本地相对链接必须可解析
+// 文档交叉引用一致性：README/DEBT/AGENTS/CHANGELOG 与 docs/*.md 的本地相对链接必须可解析
 //（superagent docs.spec.ts：编号文档只引更早文档、本地链接可解析）。
 func TestDocCrossReferences(t *testing.T) {
-	files := []string{filepath.Join(repoRoot, "README.md"), filepath.Join(repoRoot, "DEBT.md")}
+	files := []string{
+		filepath.Join(repoRoot, "README.md"),
+		filepath.Join(repoRoot, "DEBT.md"),
+		filepath.Join(repoRoot, "AGENTS.md"),
+		filepath.Join(repoRoot, "CHANGELOG.md"),
+	}
 	docs, err := filepath.Glob(filepath.Join(repoRoot, "docs", "*.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -148,6 +153,28 @@ func TestDocCrossReferences(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(filepath.Dir(file), filepath.FromSlash(target))); err != nil {
 				t.Errorf("%s 链接目标不存在：%s", file, target)
 			}
+		}
+	}
+}
+
+// 文档地图唯一索引（AGENTS.md §0.4，superagent docs-index.spec.ts 范式）：
+// docs/ 下每个 .md 与四个根文档必须登记进 AGENTS.md——旁路新建文档绕过唯一索引即红。
+func TestDocMapIndex(t *testing.T) {
+	agents, err := os.ReadFile(filepath.Join(repoRoot, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs, err := filepath.Glob(filepath.Join(repoRoot, "docs", "*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"README.md", "DEBT.md", "CHANGELOG.md", "AGENTS.md"}
+	for _, d := range docs {
+		names = append(names, filepath.ToSlash(filepath.Join("docs", filepath.Base(d))))
+	}
+	for _, name := range names {
+		if !strings.Contains(string(agents), name) {
+			t.Errorf("%s 未登记进 AGENTS.md §0.4 文档地图：新增 / 移动文档必须同步唯一索引", name)
 		}
 	}
 }
