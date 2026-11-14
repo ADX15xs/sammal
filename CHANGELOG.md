@@ -4,7 +4,11 @@
 
 ## Unreleased
 
-> 空——2026-11-14 文档治理（治理文本迁出 README 设根目录 `AGENTS.md`、决策台账迁出 SPEC 设 `docs/DECISIONS.md`、本文件设立、`internal/specdoc` 契约测试扩面）随 v1.0.0 一并入库，不计独立条目。
+> 2026-11-14 之后的变更（下次 tag 发布时编入版本节）。
+
+### Added — 发布 CI 化（2026-11-14）
+
+- 新增 `.github/workflows/release.yml`：push tag `v*` 触发 ubuntu 全量测试 → goreleaser-action 出六目标 GitHub Release；`GITHUB_TOKEN` 走 CI 注入，本地零配置。范式取自 llm-eyes-mcp `publish.yml`，build/release 段升级为 goreleaser-action 保留六目标与 changelog 过滤；不照搬其 `prerelease: true`。副产品：每次 tag 自动产出 Linux 全量回归补证（此前 DEBT 登记的 Linux 复跑条件触发项，其证据自此由 CI 供给）。
 
 ## 1.0.0 (2026-11-14) — 首个正式版：M0–M5 全量交付（tag v1.0.0）
 

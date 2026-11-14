@@ -20,7 +20,7 @@ sammal 既有裁决（2026-11-04）继续有效：历史判读、失败登记与
 | 冒烟用例与结果登记 | `docs/SMOKE.md` | — |
 | 迭代 / 发展计划 | 新建 `docs/PLAN-YYYYMMDD.md`；完结后状态改 📌 历史归档 | — |
 | 用户可见功能交付 | 代码 + 测试；CHANGELOG 留到 tag 发布时从 git log 与 DECISIONS 编纂 | `CHANGELOG.md` 实时节 |
-| 发版 | 打 annotated tag `vX.Y.Z` 并推送 → goreleaser 六目标构建；`CHANGELOG.md` 补版本节 | 已发布版本节 |
+| 发版 | 打 annotated tag `vX.Y.Z` 并推送 → CI 流水线构建 GitHub Release；`CHANGELOG.md` 补版本节 | 已发布版本节 |
 | 文档增删 / 移动 | 本文件 §0.4 文档地图同步一行 | 禁止旁路新建第二份索引 |
 
 ### 0.3 写作红线
@@ -66,6 +66,7 @@ sammal 既有裁决（2026-11-04）继续有效：历史判读、失败登记与
 - 构建：`go build ./cmd/sammal`；全量回归：`go build ./... && go test ./... -count=1`（推前必跑，见 `DEBT.md` C6）。
 - 已知环境性失败：Windows 主机 PATH 首个 bash 为 niubash（MSYS）时，`TestBashTimeout` / `TestBashBackgroundProcess` 两例可红——niubash 对后台孤儿有驻留语义，5s ctx 超时击杀 shell 后叠加 1s WaitDelay 凑出约 6s / exitCode=1 签名；生产 `executeWithJobs` 路径不受影响，语义由 Linux 锁定。基线判定：Windows 列除这两例外全绿即通过（详见 `DEBT.md` 对应行）。
 - 版本：`cmd/sammal/main.go` 的 `version` 变量缺省 `dev`，由 goreleaser 以 tag 注入（`.goreleaser.yaml` ldflags）；`.goreleaser.yaml` 的 changelog 过滤 `docs:` / `test:` / `chore:` 前缀提交（仅影响 GitHub release notes，不影响 `CHANGELOG.md`）。
+- 发版经 CI：push tag `v*` 触发 `.github/workflows/release.yml`（ubuntu：全量测试 → goreleaser 六目标 GitHub Release）；`GITHUB_TOKEN` 由 CI 注入，本地无需配置。每次 tag 自动产出 Linux 全量回归补证（DEBT 常设项的证据来源）。本地手动出包用 `goreleaser release --snapshot --clean`。
 
 ## 2. 里程碑收尾例程
 
