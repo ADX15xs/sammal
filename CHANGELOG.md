@@ -9,6 +9,7 @@
 ### Added — 发布 CI 化（2026-11-14）
 
 - 新增 `.github/workflows/release.yml`：push tag `v*` 触发 ubuntu 全量测试 → goreleaser-action 出六目标 GitHub Release；`GITHUB_TOKEN` 走 CI 注入，本地零配置。范式取自 llm-eyes-mcp `publish.yml`，build/release 段升级为 goreleaser-action 保留六目标与 changelog 过滤；不照搬其 `prerelease: true`。副产品：每次 tag 自动产出 Linux 全量回归补证（此前 DEBT 登记的 Linux 复跑条件触发项，其证据自此由 CI 供给）。
+  - 注记：该提交（`2cfebe4`）因 v1.0.0 tag 重推已实际包含于 v1.0.0 快照（重推晚于本条编纂）；下次发布编纂时按此归并。
 
 ## 1.0.0 (2026-11-14) — 首个正式版：M0–M5 全量交付（tag v1.0.0）
 
